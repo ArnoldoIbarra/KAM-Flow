@@ -89,4 +89,9 @@ namespace State {
     extern float mouseSensitivity;
     /// Character representing the emergency hotkey (default 'M').
     extern char emergencyHotkey;
+
+    /// Toggle to prevent cursor transitions to clients when gaming.
+    extern bool enableGameMode;
+    /// Character representing the game mode toggle hotkey (default 'G').
+    extern char gameModeHotkey;
 }

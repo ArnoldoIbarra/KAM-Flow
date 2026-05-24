@@ -143,6 +143,9 @@ namespace Input {
      */
     LRESULT CALLBACK MouseHookCallback(int nCode, WPARAM wParam, LPARAM lParam) {
         if (nCode >= 0) {
+            // Absolute Fast-Path: Instantly return to OS scheduler if Game Mode is active
+            if (State::enableGameMode) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
+
             if (!Network::HasAuthenticatedClients()) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
 
             MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
@@ -214,6 +217,9 @@ namespace Input {
      * @return true if the hook was successfully installed, false otherwise.
      */
     bool StartMouseCapture() {
+        if (globalMouseHook != NULL) {
+            return true; // Prevent handle leaking from double-hooks
+        }
         globalMouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookCallback, NULL, 0);
         return (globalMouseHook != NULL);
     }
@@ -223,6 +229,9 @@ namespace Input {
      * @return void
      */
     void StopMouseCapture() {
-        if (globalMouseHook) UnhookWindowsHookEx(globalMouseHook);
+        if (globalMouseHook) {
+            UnhookWindowsHookEx(globalMouseHook);
+            globalMouseHook = NULL;
+        }
     }
 }

@@ -33,6 +33,9 @@
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+extern std::atomic<DWORD> g_HookThreadId;
+#define WM_TOGGLE_GAMEMODE (WM_APP + 1)
+
 namespace UI {
     /// Win32 Window Handle.
     HWND hwnd = nullptr;
@@ -201,6 +204,18 @@ namespace UI {
                         if (State::globalDebugMode) std::cout << "[KAM-Flow UI] Emergency Override. Disconnecting Client.\n";
                         Network::StopClient();
                     }
+                } else if (wParam == 2) {
+                    if (State::currentRole == State::AppRole::SERVER) {
+                        State::enableGameMode = !State::enableGameMode;
+                        if (State::enableGameMode) {
+                            if (State::globalDebugMode) std::cout << "[KAM-Flow UI] Game Mode ENABLED. Forcing LOCAL.\n";
+                            State::SetMode(State::ControlMode::LOCAL); // Instantly pull control back if remote
+                            if (g_HookThreadId != 0) ::PostThreadMessage(g_HookThreadId.load(), WM_TOGGLE_GAMEMODE, 1, 0);
+                        } else {
+                            if (State::globalDebugMode) std::cout << "[KAM-Flow UI] Game Mode DISABLED.\n";
+                            if (g_HookThreadId != 0) ::PostThreadMessage(g_HookThreadId.load(), WM_TOGGLE_GAMEMODE, 0, 0);
+                        }
+                    }
                 }
                 return 0;
     case WM_MOVE:
@@ -277,6 +292,7 @@ namespace UI {
 
         // Register the Global Hotkey for Emergency Override
         ::RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::emergencyHotkey);
+        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey);
 
         InitTrayIcon(hwnd);
 
@@ -903,6 +919,32 @@ namespace UI {
                 }
                 DrawWrappedTooltip("Customize the global OS hotkey used to instantly regain local control or sever a connection.");
 
+                if (State::currentRole == State::AppRole::SERVER) {
+                    ImGui::Spacing();
+                    
+                    if (ImGui::Checkbox("Enable Game Mode", &State::enableGameMode)) {
+                        if (State::enableGameMode) {
+                            State::SetMode(State::ControlMode::LOCAL);
+                            if (g_HookThreadId != 0) ::PostThreadMessage(g_HookThreadId.load(), WM_TOGGLE_GAMEMODE, 1, 0);
+                        } else {
+                            if (g_HookThreadId != 0) ::PostThreadMessage(g_HookThreadId.load(), WM_TOGGLE_GAMEMODE, 0, 0);
+                        }
+                    }
+                    DrawWrappedTooltip("When active, the mouse will not transition to Client screens, preventing games from losing focus.");
+                    
+                    int gmCurrentItem = State::gameModeHotkey - 'A';
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("Game Mode Toggle Hotkey (Ctrl+Alt+)");
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(60.0f);
+                    if (ImGui::Combo("##GameModeHotkey", &gmCurrentItem, hotkeyOptions)) {
+                        State::gameModeHotkey = 'A' + gmCurrentItem;
+                        ::UnregisterHotKey(hwnd, 2);
+                        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey);
+                    }
+                    DrawWrappedTooltip("Customize the global OS hotkey used to toggle Game Mode on/off.");
+                }
+
                 ImGui::Spacing(); ImGui::Spacing();
                 ImGui::Text("Engine & Debug");
                 ImGui::Separator();
@@ -1123,6 +1165,7 @@ namespace UI {
         if (pd3dDevice) { pd3dDevice->Release(); pd3dDevice = nullptr; }
         if (hwnd) { 
             ::UnregisterHotKey(hwnd, 1);
+            ::UnregisterHotKey(hwnd, 2);
             ::DestroyWindow(hwnd); 
             ::UnregisterClass("KAMFlowUIClass", GetModuleHandle(nullptr)); 
             hwnd = nullptr; 

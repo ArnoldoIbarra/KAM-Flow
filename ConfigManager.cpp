@@ -88,6 +88,11 @@ namespace Config {
         char hotkeyBuf[8];
         GetPrivateProfileStringA("Control", "EmergencyHotkey", "M", hotkeyBuf, sizeof(hotkeyBuf), fullPath.c_str());
         State::emergencyHotkey = (hotkeyBuf[0] >= 'A' && hotkeyBuf[0] <= 'Z') ? hotkeyBuf[0] : 'M';
+        
+        State::enableGameMode = GetPrivateProfileIntA("Control", "EnableGameMode", 0, fullPath.c_str()) != 0;
+        char gmHotkeyBuf[8];
+        GetPrivateProfileStringA("Control", "GameModeHotkey", "G", gmHotkeyBuf, sizeof(gmHotkeyBuf), fullPath.c_str());
+        State::gameModeHotkey = (gmHotkeyBuf[0] >= 'A' && gmHotkeyBuf[0] <= 'Z') ? gmHotkeyBuf[0] : 'G';
 
         // Load audio subsystem toggles.
         State::enableServerAudioMix = GetPrivateProfileIntA("Audio", "EnableServerAudioMix", 1, fullPath.c_str()) != 0;
@@ -126,6 +131,10 @@ namespace Config {
         WritePrivateProfileStringA("Control", "MouseSensitivity", std::to_string(State::mouseSensitivity).c_str(), fullPath.c_str());
         std::string hkStr(1, State::emergencyHotkey);
         WritePrivateProfileStringA("Control", "EmergencyHotkey", hkStr.c_str(), fullPath.c_str());
+
+        WritePrivateProfileStringA("Control", "EnableGameMode", State::enableGameMode ? "1" : "0", fullPath.c_str());
+        std::string gmHkStr(1, State::gameModeHotkey);
+        WritePrivateProfileStringA("Control", "GameModeHotkey", gmHkStr.c_str(), fullPath.c_str());
 
         WritePrivateProfileStringA("Audio", "EnableServerAudioMix", State::enableServerAudioMix ? "1" : "0", fullPath.c_str());
         WritePrivateProfileStringA("Audio", "EnableServerMicBroadcast", State::enableServerMicBroadcast ? "1" : "0", fullPath.c_str());

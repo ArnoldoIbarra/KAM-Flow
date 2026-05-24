@@ -41,6 +41,8 @@ namespace State {
     int edgeDeadzonePercent = 5;
     float mouseSensitivity = 1.0f;
     char emergencyHotkey = 'M';
+    bool enableGameMode = false;
+    char gameModeHotkey = 'G';
     bool enableClientAutoReconnect = true;
 
     std::string clientConnectionStatus = "Idle";

@@ -35,6 +35,8 @@
 /// Stores the Thread ID of the KVM Hook loop so we can post WM_QUIT safely.
 std::atomic<DWORD> g_HookThreadId(0);
 
+#define WM_TOGGLE_GAMEMODE (WM_APP + 1)
+
 /**
  * @brief Background thread dedicated solely to processing low-level KVM hooks.
  * Isolating this prevents DirectX VSync from causing input latency.
@@ -47,12 +49,25 @@ void KVMHookThreadLoop() {
     // Elevate the KVM hook thread to prevent starvation from OS scheduler during heavy/full-screen workloads
     ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     
-    if (!Input::StartMouseCapture() || !Input::StartKeyboardCapture()) {
-        std::cerr << "[Error] Failed to install KVM Hooks!" << std::endl;
+    if (!State::enableGameMode) {
+        if (!Input::StartMouseCapture()) {
+            std::cerr << "[Error] Failed to install Mouse Hook!" << std::endl;
+        }
+    }
+    if (!Input::StartKeyboardCapture()) {
+        std::cerr << "[Error] Failed to install Keyboard Hook!" << std::endl;
         return;
     }
     
     while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_TOGGLE_GAMEMODE) {
+            if (msg.wParam == 1) {
+                Input::StopMouseCapture();
+            } else {
+                Input::StartMouseCapture();
+            }
+            continue;
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
