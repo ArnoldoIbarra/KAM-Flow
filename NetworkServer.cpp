@@ -531,12 +531,16 @@ namespace Network {
         listen(serverSocket, SOMAXCONN);
 
         isRunning = true;
-        serverThread = std::thread(AcceptClientsLoop);
+        serverThread = std::thread([]() {
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            AcceptClientsLoop();
+        });
 
         isBeaconRunning = true;
         beaconThread = std::thread(UDPBeaconLoop, port);
 
         serverHeartbeatThread = std::thread([]() {
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             while (isRunning) {
                 for (int i = 0; i < 20 && isRunning; ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));

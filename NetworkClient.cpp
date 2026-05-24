@@ -236,7 +236,10 @@ namespace Network {
         if (isDiscoveryRunning) return;
         WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
         isDiscoveryRunning = true;
-        discoveryThread = std::thread(DiscoveryLoop);
+        discoveryThread = std::thread([]() {
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            DiscoveryLoop();
+        });
     }
 
     /**
@@ -561,6 +564,7 @@ namespace Network {
             ClientLoop();
         });
         clientHeartbeatThread = std::thread([]() {
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             bool wasLocked = false;
             while (isClientRunning) {
                 // Sleep in short intervals to allow instant thread teardown on shutdown.

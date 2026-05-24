@@ -65,6 +65,8 @@ namespace UI {
 
     // System tray state variables.
     #define WM_TRAYICON (WM_USER + 1)
+    #define ID_TRAY_SHOW 2001
+    #define ID_TRAY_EXIT 2002
     NOTIFYICONDATAA g_nid = {};
     bool g_isMinimizedToTray = false;
 
@@ -164,6 +166,29 @@ namespace UI {
                     ::ShowWindow(hWnd, SW_RESTORE);
                     ::SetForegroundWindow(hWnd);
                     g_isMinimizedToTray = false;
+                } else if (lParam == WM_RBUTTONUP) {
+                    POINT pt;
+                    ::GetCursorPos(&pt);
+                    HMENU hMenu = ::CreatePopupMenu();
+                    ::InsertMenuA(hMenu, 0, MF_BYPOSITION | MF_STRING, ID_TRAY_SHOW, "Show KAM-Flow");
+                    ::InsertMenuA(hMenu, 1, MF_BYPOSITION | MF_STRING, ID_TRAY_EXIT, "Exit");
+                    
+                    // Required to fix a Windows behavior where popup menus from tray icons don't dismiss when clicking away
+                    ::SetForegroundWindow(hWnd);
+                    
+                    int cmd = ::TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hWnd, nullptr);
+                    ::DestroyMenu(hMenu);
+                    
+                    if (cmd == ID_TRAY_SHOW) {
+                        ::Shell_NotifyIconA(NIM_DELETE, &g_nid);
+                        ::ShowWindow(hWnd, SW_SHOW);
+                        ::ShowWindow(hWnd, SW_RESTORE);
+                        ::SetForegroundWindow(hWnd);
+                        g_isMinimizedToTray = false;
+                    } else if (cmd == ID_TRAY_EXIT) {
+                        ::PostQuitMessage(0);
+                        isAppRunning = false;
+                    }
                 }
                 return 0;
             case WM_HOTKEY:
@@ -217,7 +242,7 @@ namespace UI {
     bool Initialize() {
         // Ensure KAM-Flow survives extreme system load by elevating the entire process priority.
         // This guarantees KVM inputs and audio streams don't stutter when minimized during heavy gaming/workloads.
-        ::SetPriorityClass(::GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
+        ::SetPriorityClass(::GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
         // Prevent Windows 11 from putting the minimized/tray process into Efficiency Mode (EcoQoS)
         PROCESS_POWER_THROTTLING_STATE PowerThrottling;
