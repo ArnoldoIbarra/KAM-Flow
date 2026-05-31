@@ -162,11 +162,22 @@ namespace Input {
             }
 
             if (wParam == WM_MOUSEMOVE) {
+                static HMONITOR cachedMonitor = NULL;
+                static MONITORINFO cachedMi = { sizeof(cachedMi) };
+                
                 HMONITOR hMon = MonitorFromPoint(ms->pt, MONITOR_DEFAULTTONEAREST);
-                MONITORINFO mi = { sizeof(mi) };
-                if (GetMonitorInfo(hMon, &mi)) {
-                    int monWidth = mi.rcMonitor.right - mi.rcMonitor.left;
-                    int monHeight = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                if (hMon != cachedMonitor) {
+                    cachedMi.cbSize = sizeof(cachedMi);
+                    if (GetMonitorInfo(hMon, &cachedMi)) {
+                        cachedMonitor = hMon;
+                    } else {
+                        cachedMonitor = NULL;
+                    }
+                }
+                
+                if (cachedMonitor) {
+                    int monWidth = cachedMi.rcMonitor.right - cachedMi.rcMonitor.left;
+                    int monHeight = cachedMi.rcMonitor.bottom - cachedMi.rcMonitor.top;
                     
                     int deadzoneX = (monWidth * State::edgeDeadzonePercent) / 100;
                     int deadzoneY = (monHeight * State::edgeDeadzonePercent) / 100;
@@ -175,36 +186,46 @@ namespace Input {
                     uint8_t exitEdge = 0;
                     float normX = 0.0f, normY = 0.0f;
 
-                    bool safeY = ms->pt.y > (mi.rcMonitor.top + deadzoneY) && ms->pt.y < (mi.rcMonitor.bottom - deadzoneY);
-                    bool safeX = ms->pt.x > (mi.rcMonitor.left + deadzoneX) && ms->pt.x < (mi.rcMonitor.right - deadzoneX);
+                    bool safeY = ms->pt.y > (cachedMi.rcMonitor.top + deadzoneY) && ms->pt.y < (cachedMi.rcMonitor.bottom - deadzoneY);
+                    bool safeX = ms->pt.x > (cachedMi.rcMonitor.left + deadzoneX) && ms->pt.x < (cachedMi.rcMonitor.right - deadzoneX);
 
-                    if (ms->pt.x <= mi.rcMonitor.left && safeY) {
-                        exitEdge = 0; normX = 0.0f; normY = (float)(ms->pt.y - mi.rcMonitor.top) / monHeight; hitEdge = true;
-                    } else if (ms->pt.x >= mi.rcMonitor.right - 1 && safeY) {
-                        exitEdge = 1; normX = 1.0f; normY = (float)(ms->pt.y - mi.rcMonitor.top) / monHeight; hitEdge = true;
-                    } else if (ms->pt.y <= mi.rcMonitor.top && safeX) {
-                        exitEdge = 2; normX = (float)(ms->pt.x - mi.rcMonitor.left) / monWidth; normY = 0.0f; hitEdge = true;
-                    } else if (ms->pt.y >= mi.rcMonitor.bottom - 1 && safeX) {
-                        exitEdge = 3; normX = (float)(ms->pt.x - mi.rcMonitor.left) / monWidth; normY = 1.0f; hitEdge = true;
+                    if (ms->pt.x <= cachedMi.rcMonitor.left && safeY) {
+                        exitEdge = 0; normX = 0.0f; normY = (float)(ms->pt.y - cachedMi.rcMonitor.top) / monHeight; hitEdge = true;
+                    } else if (ms->pt.x >= cachedMi.rcMonitor.right - 1 && safeY) {
+                        exitEdge = 1; normX = 1.0f; normY = (float)(ms->pt.y - cachedMi.rcMonitor.top) / monHeight; hitEdge = true;
+                    } else if (ms->pt.y <= cachedMi.rcMonitor.top && safeX) {
+                        exitEdge = 2; normX = (float)(ms->pt.x - cachedMi.rcMonitor.left) / monWidth; normY = 0.0f; hitEdge = true;
+                    } else if (ms->pt.y >= cachedMi.rcMonitor.bottom - 1 && safeX) {
+                        exitEdge = 3; normX = (float)(ms->pt.x - cachedMi.rcMonitor.left) / monWidth; normY = 1.0f; hitEdge = true;
                     }
                         
+                    static int consecutiveEdgeHits = 0;
                     if (hitEdge && !isTransitionedOut) {
-                        POINT testPt = ms->pt;
-                        if (exitEdge == 0) testPt.x -= 2;
-                        else if (exitEdge == 1) testPt.x += 2;
-                        else if (exitEdge == 2) testPt.y -= 2;
-                        else if (exitEdge == 3) testPt.y += 2;
+                        consecutiveEdgeHits++;
+                        
+                        // Require 15 consecutive edge-push events to prevent 3D games from triggering 
+                        // accidental transitions during single-frame cursor recentering.
+                        if (consecutiveEdgeHits >= 15) {
+                            POINT testPt = ms->pt;
+                            if (exitEdge == 0) testPt.x -= 2;
+                            else if (exitEdge == 1) testPt.x += 2;
+                            else if (exitEdge == 2) testPt.y -= 2;
+                            else if (exitEdge == 3) testPt.y += 2;
 
-                        if (MonitorFromPoint(testPt, MONITOR_DEFAULTTONULL) == NULL) {
-                            if (Network::RouteCursorTransition(0, 0, exitEdge, normX, normY)) {
-                                isTransitionedOut = true;
-                                entryPoint = ms->pt;
-                                lockedPoint = { (mi.rcMonitor.left + mi.rcMonitor.right) / 2, (mi.rcMonitor.top + mi.rcMonitor.bottom) / 2 };
-                                SetCursorPos(lockedPoint.x, lockedPoint.y);
-                                ignorePackets = 3;
-                                return 1;
+                            if (MonitorFromPoint(testPt, MONITOR_DEFAULTTONULL) == NULL) {
+                                if (Network::RouteCursorTransition(0, 0, exitEdge, normX, normY)) {
+                                    isTransitionedOut = true;
+                                    entryPoint = ms->pt;
+                                    lockedPoint = { (cachedMi.rcMonitor.left + cachedMi.rcMonitor.right) / 2, (cachedMi.rcMonitor.top + cachedMi.rcMonitor.bottom) / 2 };
+                                    SetCursorPos(lockedPoint.x, lockedPoint.y);
+                                    ignorePackets = 3;
+                                    consecutiveEdgeHits = 0;
+                                    return 1;
+                                }
                             }
                         }
+                    } else {
+                        consecutiveEdgeHits = 0;
                     }
                 }
             }

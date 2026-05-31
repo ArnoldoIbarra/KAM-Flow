@@ -35,6 +35,7 @@
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <memory>
 
 namespace Audio {
 
@@ -139,7 +140,7 @@ namespace Audio {
         std::mutex mtx;
         bool isBuffering = true;
     };
-    std::map<uintptr_t, ClientAudioQueue> g_clientAudioQueues;
+    std::map<uintptr_t, std::shared_ptr<ClientAudioQueue>> g_clientAudioQueues;
     std::mutex g_queuesMutex; // Protects the map itself during additions/removals.
 
     // --- CLIENT MIC RECEIVER THREAD ---
@@ -533,28 +534,39 @@ namespace Audio {
                 size_t bytesPerFrame = (format.bitDepth / 8) * format.channels;
                 size_t bytesToProcess = numFramesAvailable * bytesPerFrame;
 
-                // Lock the map to prevent modification while we iterate.
-                std::lock_guard<std::mutex> mapLock(g_queuesMutex);
+                std::vector<std::shared_ptr<ClientAudioQueue>> activeQueues;
+                std::vector<float> activeVolumes;
 
-                for (const auto& client : clients) {
-                    if (!client.isAudioEnabled || g_clientAudioQueues.find(client.socket) == g_clientAudioQueues.end()) {
-                        continue;
+                {
+                    // Lock the map just long enough to safely grab the smart pointers.
+                    // This prevents the network thread from blocking while audio is being mixed!
+                    std::lock_guard<std::mutex> mapLock(g_queuesMutex);
+                    for (const auto& client : clients) {
+                        if (!client.isAudioEnabled || g_clientAudioQueues.find(client.socket) == g_clientAudioQueues.end()) {
+                            continue;
+                        }
+                        activeQueues.push_back(g_clientAudioQueues[client.socket]);
+                        activeVolumes.push_back(client.audioVolume);
                     }
+                }
 
-                    auto& queue = g_clientAudioQueues.at(client.socket);
-                    std::lock_guard<std::mutex> queueLock(queue.mtx);
+                for (size_t i = 0; i < activeQueues.size(); ++i) {
+                    auto& queue = activeQueues[i];
+                    float vol = activeVolumes[i];
 
-                    if (queue.isBuffering) {
+                    std::lock_guard<std::mutex> queueLock(queue->mtx);
+
+                    if (queue->isBuffering) {
                         continue; // Wait for the jitter buffer to build a safe latency margin
                     }
 
-                    size_t availableBytes = queue.buffer.Size();
+                    size_t availableBytes = queue->buffer.Size();
                     
                     if (availableBytes < bytesToProcess) {
                         // We didn't have enough data to fill the entire WASAPI request perfectly.
                         // Play pure silence for this specific client to prevent chopping the waveform in half,
                         // and fall back to buffering mode to heal the stream continuously.
-                        queue.isBuffering = true;
+                        queue->isBuffering = true;
                         if (State::globalDebugMode) {
                             static int starveLogCounter = 0;
                             if (starveLogCounter++ % 15 == 0) { // Throttle log to prevent console lag
@@ -570,7 +582,7 @@ namespace Audio {
                     if (linearBuffer.size() < bytesToMix) {
                         linearBuffer.resize(bytesToMix);
                     }
-                    queue.buffer.Pop(linearBuffer.data(), bytesToMix);
+                    queue->buffer.Pop(linearBuffer.data(), bytesToMix);
                     
                     size_t framesToMix = bytesToMix / bytesPerFrame;
                     size_t samplesToMix = framesToMix * pMixFormat->nChannels;
@@ -578,12 +590,12 @@ namespace Audio {
                     if (format.bitDepth == 16) {
                         const int16_t* pcmData = reinterpret_cast<const int16_t*>(linearBuffer.data());
                         for (size_t i = 0; i < samplesToMix; ++i) {
-                            mixBuffer[i] += (static_cast<float>(pcmData[i]) / 32768.0f) * client.audioVolume;
+                            mixBuffer[i] += (static_cast<float>(pcmData[i]) / 32768.0f) * vol;
                         }
                     } else if (format.bitDepth == 32) {
                         const float* pcmData = reinterpret_cast<const float*>(linearBuffer.data());
                         for (size_t i = 0; i < samplesToMix; ++i) {
-                            mixBuffer[i] += pcmData[i] * client.audioVolume;
+                            mixBuffer[i] += pcmData[i] * vol;
                         }
                     }
                 }
@@ -960,7 +972,9 @@ namespace Audio {
                 g_clientMicQueue.isBuffering = false;
             }
 
-            const float LATENCY_TARGET_MS = jitterTargetMs * 2.0f;
+            // Target latency maximum: Provide a massive burst ceiling to gracefully absorb network spikes
+            // or CPU contention without forcefully dropping audio packets.
+            const float LATENCY_TARGET_MS = (static_cast<float>(jitterTargetMs) * 3.0f) + 150.0f;
             size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (LATENCY_TARGET_MS / 1000.0f));
 
             if (g_clientMicQueue.buffer.Size() > maxBufferSize) {
@@ -996,15 +1010,20 @@ namespace Audio {
         }
         if (isMuted) return;
 
-        std::lock_guard<std::mutex> mapLock(g_queuesMutex);
-        
         // Find or create a queue for this client.
-        auto& queue = g_clientAudioQueues[clientIdentifier];
+        std::shared_ptr<ClientAudioQueue> pQueue;
+        {
+            std::lock_guard<std::mutex> mapLock(g_queuesMutex);
+            if (g_clientAudioQueues.find(clientIdentifier) == g_clientAudioQueues.end()) {
+                g_clientAudioQueues[clientIdentifier] = std::make_shared<ClientAudioQueue>();
+            }
+            pQueue = g_clientAudioQueues[clientIdentifier];
+        }
         
         // Lock the individual queue and push the new data.
-        std::lock_guard<std::mutex> queueLock(queue.mtx);
+        std::lock_guard<std::mutex> queueLock(pQueue->mtx);
         const uint8_t* pBytes = static_cast<const uint8_t*>(pcmData);
-        queue.buffer.Push(pBytes, dataSize);
+        pQueue->buffer.Push(pBytes, dataSize);
 
         // Bounded buffer logic.
         if (g_hasRenderFormat) {
@@ -1014,17 +1033,18 @@ namespace Audio {
             
             // Turn off buffering mode once we have a healthy margin
             size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (jitterTargetMs / 1000.0f));
-            if (queue.isBuffering && queue.buffer.Size() >= minBufferThreshold) {
-                queue.isBuffering = false;
+            if (pQueue->isBuffering && pQueue->buffer.Size() >= minBufferThreshold) {
+                pQueue->isBuffering = false;
             }
 
-            // Target latency maximum (allow double the jitter target before forcefully dropping packets)
-            const float LATENCY_TARGET_MS = jitterTargetMs * 2.0f; 
+            // Target latency maximum: Provide a massive burst ceiling to gracefully absorb network spikes
+            // or CPU contention without forcefully dropping audio packets.
+            const float LATENCY_TARGET_MS = (static_cast<float>(jitterTargetMs) * 3.0f) + 150.0f; 
             
             size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (LATENCY_TARGET_MS / 1000.0f));
 
-            if (queue.buffer.Size() > maxBufferSize) {
-                size_t excess = queue.buffer.Size() - maxBufferSize;
+            if (pQueue->buffer.Size() > maxBufferSize) {
+                size_t excess = pQueue->buffer.Size() - maxBufferSize;
                 
                 // Align to frame boundaries to prevent static/clipping from split samples
                 size_t frameSize = g_serverRenderFormat.channels * (g_serverRenderFormat.bitDepth / 8);
@@ -1034,12 +1054,12 @@ namespace Audio {
                     if (State::globalDebugMode) {
                         static int overrunLogCounter = 0;
                         // Throttle the log output
-                        if (overrunLogCounter++ % 15 == 0) {
-                            std::cerr << "[Audio Debug] OVERRUN! Dropping " << excess 
-                                      << " oldest bytes to maintain " << LATENCY_TARGET_MS << "ms latency target.\n";
+                        if (overrunLogCounter++ % 150 == 0) {
+                            std::cerr << "[Audio Debug] Clock drift compensation: Dropping " << excess 
+                                      << " oldest bytes to maintain real-time sync.\n";
                         }
                     }
-                    queue.buffer.Drop(excess);
+                    pQueue->buffer.Drop(excess);
                 }
             }
         }

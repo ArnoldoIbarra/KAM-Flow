@@ -15,7 +15,6 @@
 
 #include <winsock2.h>
 #include <windows.h>
-#include <cstdio> 
 #include "StateManager.h"
 #include "NetworkServer.h"   
 #include "NetworkMessages.h" 
@@ -108,32 +107,7 @@ namespace State {
      * @return void
      */
     void UpdateConsoleVisibility() {
-        if (globalDebugMode) {
-            AllocConsole();
-            FILE* fDummy;
-            freopen_s(&fDummy, "CONOUT$", "w", stdout);
-            freopen_s(&fDummy, "CONOUT$", "w", stderr);
-            std::cout.clear();
-            std::clog.clear();
-            std::cerr.clear();
-
-            HWND consoleWnd = ::GetConsoleWindow();
-            if (consoleWnd) {
-                ::SetForegroundWindow(consoleWnd);
-            }
-            
-            // Disable QuickEdit Mode so clicking the console doesn't pause the application thread
-            HANDLE hInput = ::GetStdHandle(STD_INPUT_HANDLE);
-            DWORD consoleMode;
-            if (::GetConsoleMode(hInput, &consoleMode)) {
-                ::SetConsoleMode(hInput, consoleMode & ~ENABLE_QUICK_EDIT_MODE);
-            }
-        } else {
-            HWND consoleWnd = ::GetConsoleWindow();
-            FreeConsole();
-            if (consoleWnd) {
-                ::PostMessage(consoleWnd, WM_CLOSE, 0, 0);
-            }
-        }
+        // No-op: The console view is now handled natively via the internal ImGui "Debug Log" Tab.
+        // This prevents the Windows Host Terminal from intercepting clicks and pausing the application execution.
     }
 }

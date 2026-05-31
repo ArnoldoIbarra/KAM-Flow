@@ -64,6 +64,21 @@ namespace Network {
     uint64_t connectionStartTime = 0;
 
     /**
+     * @brief Injects KEYUP events for modifier keys to prevent them from getting stuck
+     *        when the Server suddenly revokes control or disconnects.
+     */
+    void ReleaseStuckModifiers() {
+        const WORD modifiers[] = { VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LSHIFT, VK_RSHIFT, VK_LWIN, VK_RWIN };
+        for (WORD vk : modifiers) {
+            INPUT i = { 0 };
+            i.type = INPUT_KEYBOARD;
+            i.ki.wVk = vk;
+            i.ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(1, &i, sizeof(INPUT));
+        }
+    }
+
+    /**
      * @brief Packages a payload with a header, optionally encrypts it, and sends it to the Server.
      * @param type The MessageType identifier.
      * @param payload Pointer to the raw payload structure.
@@ -297,7 +312,7 @@ namespace Network {
                 // Ensure full payload is received to avoid processing corrupted state data.
                 int pBytes = recv(clientSocket, (char*)rawPayload.data(), h.payloadSize, MSG_WAITALL);
                 if (pBytes != static_cast<int>(h.payloadSize)) {
-                    if (State::globalDebugMode) std::cerr << "[Network Client] WARNING: Partial payload received. Dropping packet.\n";
+                    if (State::globalDebugMode) std::cerr << "[Network Client] WARNING: Partial payload received. (Got " << pBytes << " of " << h.payloadSize << " bytes, Error: " << WSAGetLastError() << "). Dropping connection.\n";
                     break; 
                 }
             }
@@ -393,6 +408,9 @@ namespace Network {
             else if (h.type == MessageType::EVENT_STATE) {
                 if (finalSize == sizeof(StatePayload)) {
                     StatePayload p; memcpy(&p, finalPayload, sizeof(p));
+                    if (p.mode == 0) { // 0 represents ControlMode::LOCAL
+                        ReleaseStuckModifiers();
+                    }
                 }
             }
             else if (h.type == MessageType::EVENT_AUDIO_FORMAT) {
@@ -442,6 +460,7 @@ namespace Network {
             }
         }
         isClientRunning = false;
+        ReleaseStuckModifiers(); // Catch all hard disconnects or timeouts
         if (State::globalDebugMode) std::cout << "[Network Client] Listener Thread exiting.\n";
 
         uint64_t sessionDuration = GetTickCount64() - connectionStartTime;
@@ -538,7 +557,7 @@ namespace Network {
 
         DWORD timeout = 5000;
         setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-        DWORD sndTimeout = 1000;
+        DWORD sndTimeout = 5000;
         setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeout, sizeof(sndTimeout));
 
         isClientRunning = true; 

@@ -35,6 +35,8 @@ namespace Network {
     std::vector<ConnectedClientInfo> activeClients;
     /// Mutex protecting the active clients list.
     std::mutex clientsMutex;
+    /// Mutex to prevent interleaved sends and deadlocks when broadcasting.
+    std::mutex serverSendMutex;
     /// Background thread for accepting incoming TCP connections.
     std::thread serverThread;   
     /// Control flag for the TCP server lifecycle.
@@ -260,7 +262,7 @@ namespace Network {
                     // Ensure full payload is received to avoid processing corrupted state data.
                     int pBytes = recv(clientSocket, (char*)rawPayload.data(), header.payloadSize, MSG_WAITALL);
                     if (pBytes != static_cast<int>(header.payloadSize)) {
-                        if (State::globalDebugMode) std::cerr << "[Network Server] WARNING: Partial payload received. Dropping packet.\n";
+                        if (State::globalDebugMode) std::cerr << "[Network Server] WARNING: Partial payload received. (Got " << pBytes << " of " << header.payloadSize << " bytes, Error: " << WSAGetLastError() << "). Dropping connection.\n";
                         break; 
                     }
                 }
@@ -427,7 +429,7 @@ namespace Network {
                                 
                                 timeout = 5000; 
                                 setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-                                DWORD sndTimeout = 1000; 
+                                DWORD sndTimeout = 5000; 
                                 setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeout, sizeof(sndTimeout));
 
                                 int flag = 1;
@@ -599,8 +601,12 @@ namespace Network {
      * @return true if data was sent to at least one client.
      */
     bool BroadcastMessage(MessageType type, const void* payload, size_t payloadSize) {
-        std::lock_guard<std::mutex> lock(clientsMutex);
-        if (activeClients.empty()) return false;
+        std::vector<SOCKET> targets;
+        {
+            std::lock_guard<std::mutex> lock(clientsMutex);
+            if (activeClients.empty()) return false;
+            for (const auto& c : activeClients) targets.push_back(c.socket);
+        }
 
         PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
         std::vector<uint8_t> buffer;
@@ -621,11 +627,11 @@ namespace Network {
             memcpy(buffer.data() + sizeof(h), payload, payloadSize);
         }
 
-        for (auto it = activeClients.begin(); it != activeClients.end(); ) {
-            if (send(it->socket, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
-                shutdown(it->socket, SD_BOTH); // Force the listener loop to sever the dead socket.
+        std::lock_guard<std::mutex> sendLock(serverSendMutex);
+        for (SOCKET s : targets) {
+            if (send(s, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
+                shutdown(s, SD_BOTH); // Force the listener loop to sever the dead socket.
             }
-            ++it;
         }
         return true;
     }
@@ -637,8 +643,15 @@ namespace Network {
      * @return true if data was sent to at least one client.
      */
     bool BroadcastClipboardMessage(const void* payload, size_t payloadSize) {
-        std::lock_guard<std::mutex> lock(clientsMutex);
-        if (activeClients.empty()) return false;
+        std::vector<SOCKET> targets;
+        {
+            std::lock_guard<std::mutex> lock(clientsMutex);
+            if (activeClients.empty()) return false;
+            for (const auto& c : activeClients) {
+                if (c.isClipboardEnabled) targets.push_back(c.socket);
+            }
+        }
+        if (targets.empty()) return false;
 
         PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_CLIPBOARD, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
         std::vector<uint8_t> buffer;
@@ -653,19 +666,16 @@ namespace Network {
             return false;
         }
 
-        for (auto it = activeClients.begin(); it != activeClients.end(); ) {
-            if (it->isClipboardEnabled) {
-                if (send(it->socket, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
-                    shutdown(it->socket, SD_BOTH);
-                }
+        std::lock_guard<std::mutex> sendLock(serverSendMutex);
+        for (SOCKET s : targets) {
+            if (send(s, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
+                shutdown(s, SD_BOTH);
             }
-            ++it;
         }
         return true;
     }
 
     bool SendToClient(SOCKET clientSocket, MessageType type, const void* payload, size_t payloadSize) {
-        std::lock_guard<std::mutex> lock(clientsMutex);
         PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
         std::vector<uint8_t> buffer;
 
@@ -675,6 +685,8 @@ namespace Network {
             buffer.resize(sizeof(h) + ciphertext.size());
             memcpy(buffer.data(), &h, sizeof(h));
             memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
+            
+            std::lock_guard<std::mutex> sendLock(serverSendMutex);
             return send(clientSocket, (const char*)buffer.data(), (int)buffer.size(), 0) != SOCKET_ERROR;
         }
         return false;

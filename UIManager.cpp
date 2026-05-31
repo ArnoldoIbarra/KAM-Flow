@@ -28,6 +28,8 @@
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <streambuf>
+#include <mutex>
 #include <commdlg.h>
 #include "resource.h"
 
@@ -54,6 +56,53 @@ namespace UI {
     bool showServerPin = false;
     bool focusPairingTab = false;
     
+    // --- IN-ENGINE DEBUG CONSOLE ---
+    std::mutex g_logMutex;
+    std::vector<char> g_logBufferVec; // Starts entirely empty to save memory
+    size_t g_logBufferLen = 0;
+
+    class ImGuiLogStreamBuf : public std::streambuf {
+    public:
+        std::streambuf* oldCout;
+        std::streambuf* oldCerr;
+        std::streambuf* oldClog;
+        
+        ImGuiLogStreamBuf() {
+            oldCout = std::cout.rdbuf(this);
+            oldCerr = std::cerr.rdbuf(this);
+            oldClog = std::clog.rdbuf(this);
+        }
+        ~ImGuiLogStreamBuf() {
+            std::cout.rdbuf(oldCout);
+            std::cerr.rdbuf(oldCerr);
+            std::clog.rdbuf(oldClog);
+        }
+    protected:
+        virtual std::streamsize xsputn(const char* s, std::streamsize count) override {
+            if (!State::globalDebugMode) return count; // Instant short-circuit! CPU cost is 0.
+
+            std::lock_guard<std::mutex> lock(g_logMutex);
+            if (g_logBufferVec.empty()) g_logBufferVec.resize(1024 * 1024, 0); // Lazy allocation
+            if (count > g_logBufferVec.size() - 1) return count; // Protect against massive single inputs
+            if (g_logBufferLen + count > g_logBufferVec.size() - 1) {
+                size_t shift = (g_logBufferLen + count) - (g_logBufferVec.size() - 1);
+                std::memmove(g_logBufferVec.data(), g_logBufferVec.data() + shift, g_logBufferLen - shift);
+                g_logBufferLen -= shift;
+            }
+            std::memcpy(g_logBufferVec.data() + g_logBufferLen, s, count);
+            g_logBufferLen += count;
+            g_logBufferVec[g_logBufferLen] = '\0';
+            return count;
+        }
+        virtual int_type overflow(int_type c) override {
+            if (!State::globalDebugMode) return c;
+            if (c != EOF) { char ch = static_cast<char>(c); xsputn(&ch, 1); }
+            return c;
+        }
+    };
+
+    ImGuiLogStreamBuf* g_logInterceptor = nullptr;
+
     // File transfer state variables.
     std::string g_pendingDropFile = "";
     bool g_showDropModal = false;
@@ -255,6 +304,8 @@ namespace UI {
      * @return true if initialization succeeded, false if any subsystem failed.
      */
     bool Initialize() {
+        g_logInterceptor = new ImGuiLogStreamBuf();
+
         // Ensure KAM-Flow survives extreme system load by elevating the entire process priority.
         // This guarantees KVM inputs and audio streams don't stutter when minimized during heavy gaming/workloads.
         ::SetPriorityClass(::GetCurrentProcess(), HIGH_PRIORITY_CLASS);
@@ -949,12 +1000,42 @@ namespace UI {
                 ImGui::Text("Engine & Debug");
                 ImGui::Separator();
                 
-                if (ImGui::Checkbox("Show Debug Console", &State::globalDebugMode)) {
+                if (ImGui::Checkbox("Show Debug Console Tab", &State::globalDebugMode)) {
                     State::UpdateConsoleVisibility();
                 }
-                DrawWrappedTooltip("Show or hide the real-time diagnostic console window for troubleshooting.");
+                DrawWrappedTooltip("Show or hide the real-time diagnostic console tab for troubleshooting.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
+            }
+
+            if (State::globalDebugMode) {
+                bool tabDebug = ImGui::BeginTabItem("Debug Log");
+                if (tabDebug) {
+                    if (ImGui::Button("Clear Log")) {
+                        std::lock_guard<std::mutex> lock(g_logMutex);
+                        g_logBufferLen = 0;
+                        if (!g_logBufferVec.empty()) g_logBufferVec[0] = '\0';
+                    }
+                    DrawWrappedTooltip("Clear all current debug messages.");
+                    ImGui::Separator();
+                    
+                    static std::vector<char> localLogCopy;
+                    static size_t lastLen = static_cast<size_t>(-1);
+                    {
+                        // Briefly lock to copy to prevent stalling time-critical audio/network threads while ImGui renders!
+                        std::lock_guard<std::mutex> lock(g_logMutex);
+                        if (localLogCopy.empty()) localLogCopy.resize(1024 * 1024, 0);
+                        if (g_logBufferLen != lastLen && !g_logBufferVec.empty()) {
+                            std::memcpy(localLogCopy.data(), g_logBufferVec.data(), g_logBufferLen + 1);
+                            lastLen = g_logBufferLen;
+                        }
+                    }
+                    
+                    if (!localLogCopy.empty()) {
+                        ImGui::InputTextMultiline("##Log", localLogCopy.data(), localLogCopy.size(), ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+                    }
+                    ImGui::EndTabItem();
+                }
             }
 
             ImGui::EndTabBar();
@@ -1169,6 +1250,11 @@ namespace UI {
             ::DestroyWindow(hwnd); 
             ::UnregisterClass("KAMFlowUIClass", GetModuleHandle(nullptr)); 
             hwnd = nullptr; 
+        }
+
+        if (g_logInterceptor) {
+            delete g_logInterceptor;
+            g_logInterceptor = nullptr;
         }
     }
 
