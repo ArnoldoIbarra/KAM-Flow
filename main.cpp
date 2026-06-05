@@ -51,11 +51,11 @@ void KVMHookThreadLoop() {
     
     if (!State::enableGameMode) {
         if (!Input::StartMouseCapture()) {
-            std::cerr << "[Error] Failed to install Mouse Hook!" << std::endl;
+            UI::LogDebug("[Error] Failed to install Mouse Hook!");
         }
     }
     if (!Input::StartKeyboardCapture()) {
-        std::cerr << "[Error] Failed to install Keyboard Hook!" << std::endl;
+        UI::LogDebug("[Error] Failed to install Keyboard Hook!");
         return;
     }
     
@@ -101,7 +101,7 @@ int main(int argc, char* argv[]) {
     FileTransfer::Initialize();
 
     if (State::globalDebugMode) {
-        std::cout << "KAM-Flow Engine Booting...\n";
+        UI::LogDebug("KAM-Flow Engine Booting...");
     }
     
     char savedIp[256];
@@ -137,11 +137,11 @@ int main(int argc, char* argv[]) {
             // Deferred Ignition: Start threads immediately once the UI sets the role
             if (!subsystemsStarted && State::currentRole != State::AppRole::NONE) {
                 if (State::currentRole == State::AppRole::CLIENT) {
-                    if (State::globalDebugMode) std::cout << "[Role] CLIENT MODE locked in. Starting UDP Discovery.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Role] CLIENT MODE locked in. Starting UDP Discovery.");
                     Network::StartDiscoveryListener();
                     ClipboardManager::Start();
                 } else if (State::currentRole == State::AppRole::SERVER) {
-                    if (State::globalDebugMode) std::cout << "[Role] SERVER MODE locked in.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Role] SERVER MODE locked in.");
                     Network::StartServer(port);
                     // If audio mixing is enabled in the config, start the renderer now.
                     if (State::enableServerAudioMix) {
@@ -181,7 +181,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (State::globalDebugMode) {
-        std::cout << "[KAM-Flow Engine] Terminated cleanly.\n";
+        UI::LogDebug("[KAM-Flow Engine] Terminated cleanly.");
     }
 
     Audio::Shutdown();

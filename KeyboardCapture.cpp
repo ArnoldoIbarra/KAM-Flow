@@ -14,6 +14,7 @@
 #include "StateManager.h"
 #include "NetworkMessages.h" 
 #include "NetworkServer.h"   
+#include "UIManager.h"
 #include <iostream>
 
 namespace Input {
@@ -55,7 +56,7 @@ namespace Input {
             }
 
             if (isKeyDown && kbd->vkCode == State::emergencyHotkey && isCtrlDown && isAltDown) {
-                if (State::globalDebugMode) std::cout << "[KAM-Flow] Emergency Override Triggered. Returning control to Server.\n";
+                if (State::globalDebugMode) UI::LogDebug("[KAM-Flow] Emergency Override Triggered. Returning control to Server.");
                 State::SetMode(State::ControlMode::LOCAL);
                 return 1;
             }

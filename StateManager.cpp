@@ -18,6 +18,7 @@
 #include "StateManager.h"
 #include "NetworkServer.h"   
 #include "NetworkMessages.h" 
+#include "UIManager.h"
 #include <iostream>
 #include <mutex>
 
@@ -61,9 +62,9 @@ namespace State {
         Network::BroadcastMessage(Network::MessageType::EVENT_STATE, &payload, sizeof(payload));
 
         if (currentMode == ControlMode::REMOTE) {
-            if (globalDebugMode) std::cout << "[KAM-Flow State] Entered REMOTE mode.\n";
+            if (globalDebugMode) UI::LogDebug("[KAM-Flow State] Entered REMOTE mode.");
         } else {
-            if (globalDebugMode) std::cout << "[KAM-Flow State] Returned to LOCAL mode.\n";
+            if (globalDebugMode) UI::LogDebug("[KAM-Flow State] Returned to LOCAL mode.");
         }
     }
 

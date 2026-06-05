@@ -31,6 +31,7 @@
 #include <streambuf>
 #include <mutex>
 #include <commdlg.h>
+#include <cstdio>
 #include "resource.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -59,7 +60,9 @@ namespace UI {
     // --- IN-ENGINE DEBUG CONSOLE ---
     std::mutex g_logMutex;
     std::vector<char> g_logBufferVec; // Starts entirely empty to save memory
+    std::string g_lineBuffer;
     size_t g_logBufferLen = 0;
+    std::atomic<bool> g_logDirty(false); // Tracks if new data was written
 
     class ImGuiLogStreamBuf : public std::streambuf {
     public:
@@ -80,18 +83,35 @@ namespace UI {
     protected:
         virtual std::streamsize xsputn(const char* s, std::streamsize count) override {
             if (!State::globalDebugMode) return count; // Instant short-circuit! CPU cost is 0.
+            
+            g_lineBuffer.append(s, count);
+            size_t newline_pos;
+            while ((newline_pos = g_lineBuffer.find('\n')) != std::string::npos) {
+                std::string line = g_lineBuffer.substr(0, newline_pos);
+                g_lineBuffer.erase(0, newline_pos + 1);
 
-            std::lock_guard<std::mutex> lock(g_logMutex);
-            if (g_logBufferVec.empty()) g_logBufferVec.resize(1024 * 1024, 0); // Lazy allocation
-            if (count > g_logBufferVec.size() - 1) return count; // Protect against massive single inputs
-            if (g_logBufferLen + count > g_logBufferVec.size() - 1) {
-                size_t shift = (g_logBufferLen + count) - (g_logBufferVec.size() - 1);
-                std::memmove(g_logBufferVec.data(), g_logBufferVec.data() + shift, g_logBufferLen - shift);
-                g_logBufferLen -= shift;
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                char time_buf[64];
+                sprintf_s(time_buf, sizeof(time_buf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+                
+                std::string final_line = std::string(time_buf) + line + "\n";
+
+                std::lock_guard<std::mutex> lock(g_logMutex);
+                if (g_logBufferVec.empty()) g_logBufferVec.resize(1024 * 1024, 0); // Lazy allocation
+                
+                if (final_line.length() > g_logBufferVec.size() - 1) continue;
+
+                if (g_logBufferLen + final_line.length() > g_logBufferVec.size() - 1) {
+                    size_t shift = (g_logBufferLen + final_line.length()) - (g_logBufferVec.size() - 1);
+                    std::memmove(g_logBufferVec.data(), g_logBufferVec.data() + shift, g_logBufferLen - shift);
+                    g_logBufferLen -= shift;
+                }
+                std::memcpy(g_logBufferVec.data() + g_logBufferLen, final_line.c_str(), final_line.length());
+                g_logBufferLen += final_line.length();
+                g_logBufferVec[g_logBufferLen] = '\0';
+                g_logDirty = true;
             }
-            std::memcpy(g_logBufferVec.data() + g_logBufferLen, s, count);
-            g_logBufferLen += count;
-            g_logBufferVec[g_logBufferLen] = '\0';
             return count;
         }
         virtual int_type overflow(int_type c) override {
@@ -102,6 +122,39 @@ namespace UI {
     };
 
     ImGuiLogStreamBuf* g_logInterceptor = nullptr;
+
+    /**
+     * @brief Blazing fast, thread-safe, atomic logger for time-critical threads.
+     * Bypasses std::ostream overhead and locks the mutex exactly once per line.
+     */
+    void LogDebug(const char* fmt, ...) {
+        if (!State::globalDebugMode) return;
+        
+        char buf[1024];
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(buf, sizeof(buf), fmt, args);
+        va_end(args);
+
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char time_buf[64];
+        int timeLen = sprintf_s(time_buf, sizeof(time_buf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+
+        std::string finalLine = std::string(time_buf) + buf + "\n";
+
+        std::lock_guard<std::mutex> lock(g_logMutex);
+        if (g_logBufferVec.empty()) g_logBufferVec.resize(1024 * 1024, 0); // Lazy allocation
+        if (g_logBufferLen + finalLine.length() > g_logBufferVec.size() - 1) {
+            size_t shift = (g_logBufferLen + finalLine.length()) - (g_logBufferVec.size() - 1);
+            std::memmove(g_logBufferVec.data(), g_logBufferVec.data() + shift, g_logBufferLen - shift);
+            g_logBufferLen -= shift;
+        }
+        std::memcpy(g_logBufferVec.data() + g_logBufferLen, finalLine.c_str(), finalLine.length());
+        g_logBufferLen += finalLine.length();
+        g_logBufferVec[g_logBufferLen] = '\0';
+        g_logDirty = true;
+    }
 
     // File transfer state variables.
     std::string g_pendingDropFile = "";
@@ -198,7 +251,7 @@ namespace UI {
                     g_showDropModal = true;
                     g_triggerDropModal = true;
                     g_selectedTransferClients.clear(); // Reset selections
-                    if (State::globalDebugMode) std::cout << "[UI] File dropped: " << filePath << "\n";
+                    if (State::globalDebugMode) UI::LogDebug("[UI] File dropped: %s", filePath);
                 }
                 ::DragFinish(hDrop);
                 return 0;
@@ -247,21 +300,21 @@ namespace UI {
                 // Universal Safety Override (Ctrl+Alt+M) caught at the OS level
                 if (wParam == 1) {
                     if (State::currentRole == State::AppRole::SERVER) {
-                        if (State::globalDebugMode) std::cout << "[KAM-Flow UI] Emergency Override. Reverting to LOCAL.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[KAM-Flow UI] Emergency Override. Reverting to LOCAL.");
                         State::SetMode(State::ControlMode::LOCAL);
                     } else if (State::currentRole == State::AppRole::CLIENT) {
-                        if (State::globalDebugMode) std::cout << "[KAM-Flow UI] Emergency Override. Disconnecting Client.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[KAM-Flow UI] Emergency Override. Disconnecting Client.");
                         Network::StopClient();
                     }
                 } else if (wParam == 2) {
                     if (State::currentRole == State::AppRole::SERVER) {
                         State::enableGameMode = !State::enableGameMode;
                         if (State::enableGameMode) {
-                            if (State::globalDebugMode) std::cout << "[KAM-Flow UI] Game Mode ENABLED. Forcing LOCAL.\n";
+                            if (State::globalDebugMode) UI::LogDebug("[KAM-Flow UI] Game Mode ENABLED. Forcing LOCAL.");
                             State::SetMode(State::ControlMode::LOCAL); // Instantly pull control back if remote
                             if (g_HookThreadId != 0) ::PostThreadMessage(g_HookThreadId.load(), WM_TOGGLE_GAMEMODE, 1, 0);
                         } else {
-                            if (State::globalDebugMode) std::cout << "[KAM-Flow UI] Game Mode DISABLED.\n";
+                            if (State::globalDebugMode) UI::LogDebug("[KAM-Flow UI] Game Mode DISABLED.");
                             if (g_HookThreadId != 0) ::PostThreadMessage(g_HookThreadId.load(), WM_TOGGLE_GAMEMODE, 0, 0);
                         }
                     }
@@ -1020,15 +1073,12 @@ namespace UI {
                     ImGui::Separator();
                     
                     static std::vector<char> localLogCopy;
-                    static size_t lastLen = static_cast<size_t>(-1);
-                    {
-                        // Briefly lock to copy to prevent stalling time-critical audio/network threads while ImGui renders!
+                    
+                    // Only lock and copy if new text was actually appended to the buffer
+                    if (g_logDirty.exchange(false)) {
                         std::lock_guard<std::mutex> lock(g_logMutex);
                         if (localLogCopy.empty()) localLogCopy.resize(1024 * 1024, 0);
-                        if (g_logBufferLen != lastLen && !g_logBufferVec.empty()) {
-                            std::memcpy(localLogCopy.data(), g_logBufferVec.data(), g_logBufferLen + 1);
-                            lastLen = g_logBufferLen;
-                        }
+                        if (!g_logBufferVec.empty()) std::memcpy(localLogCopy.data(), g_logBufferVec.data(), g_logBufferLen + 1);
                     }
                     
                     if (!localLogCopy.empty()) {
@@ -1074,7 +1124,7 @@ namespace UI {
             ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
             
             if (ImGui::Button("Send", ImVec2(120, 0))) {
-                if (State::globalDebugMode) std::cout << "[UI] Initiating transfer for: " << g_pendingDropFile << "\n";
+                if (State::globalDebugMode) UI::LogDebug("[UI] Initiating transfer for: %s", g_pendingDropFile.c_str());
                 
                 if (State::currentRole == State::AppRole::CLIENT) {
                     g_selectedTransferClients.clear();

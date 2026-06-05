@@ -18,6 +18,9 @@
 /// Namespace managing the user interface, DirectX 11 swap chain, and ImGui context.
 namespace UI {
     
+    /// Blazing fast, thread-safe, atomic logger for time-critical threads.
+    void LogDebug(const char* fmt, ...);
+
     /// Initializes the Win32 window, DirectX 11 device, and Dear ImGui context.
     bool Initialize();
 

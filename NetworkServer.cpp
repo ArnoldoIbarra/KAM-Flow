@@ -19,6 +19,7 @@
 #include "ClipboardManager.h"
 #include "FileTransferManager.h"
 #include "CredentialManager.h"
+#include "UIManager.h"
 #include <iostream>
 #include <ws2tcpip.h>
 #include <thread>
@@ -183,6 +184,21 @@ namespace Network {
         }
     }
 
+    /**
+     * @brief Retrieves the audio state for a specific client without deep-copying structures.
+     * @param clientSocket The socket of the client.
+     */
+    bool GetClientAudioState(SOCKET clientSocket, bool& isEnabled, float& volume) {
+        std::lock_guard<std::mutex> lock(clientsMutex);
+        for (const auto& c : activeClients) {
+            if (c.socket == clientSocket) {
+                isEnabled = c.isAudioEnabled;
+                volume = c.audioVolume;
+                return true;
+            }
+        }
+        return false;
+    }
 
     /**
      * @brief Background loop that broadcasts the Server's IP and Port to the local subnet.
@@ -244,8 +260,11 @@ namespace Network {
             PacketHeader header;
             int bytes = recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL);
             if (bytes <= 0) {
-                if (WSAGetLastError() == WSAETIMEDOUT) {
-                    if (State::globalDebugMode) std::cout << "[Network Server] Client timed out (No Heartbeat).\n";
+                int wsaErr = WSAGetLastError();
+                if (wsaErr == WSAETIMEDOUT) {
+                    if (State::globalDebugMode) UI::LogDebug("[Network Server] Client timed out (No Heartbeat received). WSA Error: %d", wsaErr);
+                } else {
+                    if (State::globalDebugMode) UI::LogDebug("[Network Server] Client socket severed. WSA Error: %d", wsaErr);
                 }
                 break; 
             }
@@ -253,7 +272,7 @@ namespace Network {
             if (header.magic == PACKET_MAGIC) {
                 // CRITICAL GUARD: Prevent memory allocation attacks (CWE-400)
                 if (header.payloadSize > MAX_PAYLOAD_SIZE) {
-                    if (State::globalDebugMode) std::cerr << "[Network Server] CRITICAL: Payload size exceeds safety bounds! Dropping connection.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Network Server] CRITICAL: Payload size exceeds safety bounds! Dropping connection.");
                     break;
                 }
 
@@ -262,13 +281,13 @@ namespace Network {
                     // Ensure full payload is received to avoid processing corrupted state data.
                     int pBytes = recv(clientSocket, (char*)rawPayload.data(), header.payloadSize, MSG_WAITALL);
                     if (pBytes != static_cast<int>(header.payloadSize)) {
-                        if (State::globalDebugMode) std::cerr << "[Network Server] WARNING: Partial payload received. (Got " << pBytes << " of " << header.payloadSize << " bytes, Error: " << WSAGetLastError() << "). Dropping connection.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[Network Server] WARNING: Partial payload received. (Got %d of %u bytes, Error: %d). Dropping connection.", pBytes, header.payloadSize, WSAGetLastError());
                         break; 
                     }
                 }
 
                 if (header.sequenceNumber <= rxSequence && header.sequenceNumber != 0) {
-                    if (State::globalDebugMode) std::cerr << "[Security] Replay attack detected. Dropping packet.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Security] Replay attack detected. Dropping packet.");
                     continue;
                 }
                 rxSequence = header.sequenceNumber;
@@ -281,7 +300,7 @@ namespace Network {
 
                 if (isEncrypted) {
                     if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &header, sizeof(header), decrypted)) {
-                        if (State::globalDebugMode) std::cerr << "[Security] Failed to decrypt client packet.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[Security] Failed to decrypt client packet.");
                         continue;
                     }
                     finalPayload = decrypted.data();
@@ -289,6 +308,10 @@ namespace Network {
                 }
 
                 if (header.type == MessageType::EVENT_HEARTBEAT) {
+                    static int rxHbCount = 0;
+                    if (++rxHbCount % 10 == 0 && State::globalDebugMode) {
+                        UI::LogDebug("[Network Server] Received Keep-Alive Heartbeat from Client.");
+                    }
                     continue; // Keep-alive heartbeat acknowledged.
                 }
 
@@ -318,7 +341,7 @@ namespace Network {
                     }
                 } else if (header.type == MessageType::EVENT_CLIENT_LOCKED) {
                     if (State::IsRemote()) {
-                        if (State::globalDebugMode) std::cout << "[Network Server] Client locked by UAC/Secure Desktop. Auto-reverting control.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[Network Server] Client locked by UAC/Secure Desktop. Auto-reverting control.");
                         State::SetMode(State::ControlMode::LOCAL);
                     }
                 } else if (header.type == MessageType::EVENT_FILE_OFFER) {
@@ -340,7 +363,7 @@ namespace Network {
             }
         }
 
-        if (State::globalDebugMode) std::cout << "[Network Server] Client disconnected.\n";
+        if (State::globalDebugMode) UI::LogDebug("[Network Server] Client disconnected.");
         
         std::lock_guard<std::mutex> lock(clientsMutex);
         for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
@@ -398,7 +421,7 @@ namespace Network {
                             if (strncmp(auth.pin, activeServerPin.c_str(), 8) == 0) {
 
 
-                                if (State::globalDebugMode) std::cout << "[Network Server] Client Authenticated.\n";
+                                if (State::globalDebugMode) UI::LogDebug("[Network Server] Client Authenticated.");
 
                                 // Immediately send the server's native audio format directly to the newly authenticated client.
                                 // This is a critical handshake step that establishes the format standard for all network audio streams.
@@ -512,11 +535,11 @@ namespace Network {
             srand((unsigned int)time(NULL));
             activeServerPin = std::to_string(10000000 + (rand() % 90000000));
             CredentialManager::SaveSecret("KAMFlow_LocalServer", activeServerPin);
-            if (State::globalDebugMode) std::cout << "[Security] Generated new Master PIN: " << activeServerPin << "\n";
+            if (State::globalDebugMode) UI::LogDebug("[Security] Generated new Master PIN: %s", activeServerPin.c_str());
         }
 
         if (!Security::Initialize(activeServerPin.c_str())) {
-            if (State::globalDebugMode) std::cerr << "[Security] FATAL: Cryptography Engine failed to initialize.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Security] FATAL: Cryptography Engine failed to initialize.");
             return false;
         }
 
@@ -547,7 +570,13 @@ namespace Network {
                 for (int i = 0; i < 20 && isRunning; ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
-                if (isRunning) BroadcastMessage(MessageType::EVENT_HEARTBEAT, nullptr, 0);
+                if (isRunning) {
+                    BroadcastMessage(MessageType::EVENT_HEARTBEAT, nullptr, 0);
+                    static int txHbCount = 0;
+                    if (++txHbCount % 10 == 0 && State::globalDebugMode) {
+                        UI::LogDebug("[Network Server] Sent Keep-Alive Heartbeat to Clients.");
+                    }
+                }
             }
         });
 
@@ -628,11 +657,17 @@ namespace Network {
         }
 
         std::lock_guard<std::mutex> sendLock(serverSendMutex);
+        uint64_t tStart = GetTickCount64();
         for (SOCKET s : targets) {
             if (send(s, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
                 shutdown(s, SD_BOTH); // Force the listener loop to sever the dead socket.
             }
         }
+        uint64_t tEnd = GetTickCount64();
+        if (State::globalDebugMode && (tEnd - tStart) > 50) {
+            UI::LogDebug("[Network Server] WARNING: BroadcastMessage blocked for %llu ms! TCP Window congested.", (unsigned long long)(tEnd - tStart));
+        }
+
         return true;
     }
 
@@ -687,7 +722,13 @@ namespace Network {
             memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
             
             std::lock_guard<std::mutex> sendLock(serverSendMutex);
-            return send(clientSocket, (const char*)buffer.data(), (int)buffer.size(), 0) != SOCKET_ERROR;
+            uint64_t tStart = GetTickCount64();
+            int res = send(clientSocket, (const char*)buffer.data(), (int)buffer.size(), 0);
+            uint64_t tEnd = GetTickCount64();
+            if (State::globalDebugMode && (tEnd - tStart) > 50) {
+                UI::LogDebug("[Network Server] WARNING: SendToClient blocked for %llu ms! TCP Window congested.", (unsigned long long)(tEnd - tStart));
+            }
+            return res != SOCKET_ERROR;
         }
         return false;
     }

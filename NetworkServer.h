@@ -66,6 +66,9 @@ namespace Network {
     /// Toggles clipboard sync for a specific client.
     void ToggleClientClipboard(SOCKET clientSocket, bool enabled);
 
+    /// Retrieves the audio state for a specific client to avoid heavy vector copies.
+    bool GetClientAudioState(SOCKET clientSocket, bool& isEnabled, float& volume);
+
     /// Packages clipboard data and broadcasts it to all enabled clients.
     bool BroadcastClipboardMessage(const void* payload, size_t payloadSize);
 

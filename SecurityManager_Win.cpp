@@ -19,12 +19,17 @@
 #include <ntstatus.h>
 #include <bcrypt.h>
 #include <iostream>
+#include <mutex>
+#include "UIManager.h"
 
 namespace Security {
 
     BCRYPT_ALG_HANDLE hAesAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
     std::vector<uint8_t> keyObjectBuffer;
+    
+    /// Mutex to prevent AES-GCM internal state corruption during heavy bi-directional data flow.
+    std::mutex cryptoMutex;
 
     /**
      * @brief Initializes CNG, sets the AES-GCM chaining mode, and hashes the PIN to a 256-bit key.
@@ -35,7 +40,7 @@ namespace Security {
         if (hAesAlg != NULL) return true;
 
         if (BCryptOpenAlgorithmProvider(&hAesAlg, BCRYPT_AES_ALGORITHM, NULL, 0) != STATUS_SUCCESS) {
-            if (State::globalDebugMode) std::cerr << "[Security] Failed to open CNG AES Provider.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to open CNG AES Provider.");
             return false;
         }
 
@@ -60,13 +65,13 @@ namespace Security {
         keyObjectBuffer.resize(cbKeyObject);
 
         if (BCryptGenerateSymmetricKey(hAesAlg, &hKey, keyObjectBuffer.data(), cbKeyObject, derivedKey, sizeof(derivedKey), 0) != STATUS_SUCCESS) {
-            if (State::globalDebugMode) std::cerr << "[Security] Failed to generate Symmetric Key.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to generate Symmetric Key.");
             return false;
         }
 
         SecureZeroMemory(derivedKey, sizeof(derivedKey));
         
-        if (State::globalDebugMode) std::cout << "[Security] Hardware AES-GCM Provider Initialized.\n";
+        if (State::globalDebugMode) UI::LogDebug("[Security] Hardware AES-GCM Provider Initialized.");
         return true;
     }
 
@@ -80,6 +85,7 @@ namespace Security {
      * @return true if successful.
      */
     bool EncryptPayload(const void* plaintext, size_t plainSize, const void* aad, size_t aadSize, std::vector<uint8_t>& outCiphertext) {
+        std::lock_guard<std::mutex> lock(cryptoMutex);
         if (!hKey) return false;
 
         uint8_t iv[12];
@@ -131,6 +137,7 @@ namespace Security {
      * @return true if decryption succeeds.
      */
     bool DecryptPayload(const void* ciphertext, size_t cipherSize, const void* aad, size_t aadSize, std::vector<uint8_t>& outPlaintext) {
+        std::lock_guard<std::mutex> lock(cryptoMutex);
         if (!hKey || cipherSize < 28) return false; // 12 (IV) + 16 (Tag) minimum
 
         const uint8_t* cipherData = static_cast<const uint8_t*>(ciphertext);

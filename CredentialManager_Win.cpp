@@ -11,6 +11,7 @@
 
 #include "CredentialManager.h"
 #include "StateManager.h"
+#include "UIManager.h"
 #include <windows.h>
 #include <wincred.h>
 #include <iostream>
@@ -32,7 +33,7 @@ namespace CredentialManager {
         cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
 
         if (!CredWriteA(&cred, 0)) {
-            if (State::globalDebugMode) std::cerr << "[CredManager] Failed to save credential for " << targetName << "\n";
+            if (State::globalDebugMode) UI::LogDebug("[CredManager] Failed to save credential for %s", targetName.c_str());
             return false;
         }
         return true;

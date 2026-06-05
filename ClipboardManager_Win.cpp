@@ -13,6 +13,7 @@
 #include "StateManager.h"
 #include "NetworkServer.h"
 #include "NetworkClient.h"
+#include "UIManager.h"
 #include <windows.h>
 #include <thread>
 #include <atomic>
@@ -116,7 +117,7 @@ namespace ClipboardManager {
      * @return true if initialization succeeds.
      */
     bool Initialize() {
-        if (State::globalDebugMode) std::cout << "[Clipboard] Manager Initialized.\n";
+        if (State::globalDebugMode) UI::LogDebug("[Clipboard] Manager Initialized.");
         return true;
     }
 

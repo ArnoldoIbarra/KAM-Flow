@@ -15,6 +15,9 @@
 #include "NetworkServer.h"
 #include <iostream>
 #include <algorithm>
+#include <thread>
+#include <chrono>
+#include <atomic>
 
 namespace Input {
     /// Global handle for the low-level mouse hook.
@@ -24,12 +27,10 @@ namespace Input {
     POINT entryPoint = { 0, 0 };
     /// Coordinates where the mouse is locked during Remote Mode.
     POINT lockedPoint = { 0, 0 };
-    /// Frames to skip to avoid self-triggering from SetCursorPos.
-    int ignorePackets = 0;
     
     /// Flags indicating which edge was breached.
     bool isTransitionedOut = false;
-
+    
     /**
      * @brief Teleports the cursor deterministically prior to returning to LOCAL control.
      * @param entryEdge The edge the cursor is entering from.
@@ -62,7 +63,6 @@ namespace Input {
             } else {
                 SetCursorPos(entryPoint.x + 30, entryPoint.y); 
             }
-            ignorePackets = 2; 
         }
     }
 
@@ -81,15 +81,29 @@ namespace Input {
         static float fracY = 0.0f;
 
         if (wParam == WM_MOUSEMOVE) {
-            if (ignorePackets > 0) { ignorePackets--; return; }
+            int rawDx = ms->pt.x - lockedPoint.x;
+            int rawDy = ms->pt.y - lockedPoint.y;
 
-            dx = ms->pt.x - lockedPoint.x;
-            dy = ms->pt.y - lockedPoint.y;
-            if (dx == 0 && dy == 0) return;
+            // Failsafe: Re-anchor the cursor if a background app forcefully moved the OS cursor
+            if (abs(rawDx) > 300 || abs(rawDy) > 300) {
+                SetCursorPos(lockedPoint.x, lockedPoint.y);
+                return;
+            }
 
-            flags = MOUSEEVENTF_MOVE;
-            SetCursorPos(lockedPoint.x, lockedPoint.y);
-            ignorePackets = 2;
+            if (rawDx != 0 || rawDy != 0) {
+                float sx = rawDx * State::mouseSensitivity + fracX;
+                float sy = rawDy * State::mouseSensitivity + fracY;
+                dx = static_cast<int>(sx);
+                dy = static_cast<int>(sy);
+                fracX = sx - dx;
+                fracY = sy - dy;
+
+                if (dx != 0 || dy != 0) {
+                    Network::MousePayload p = { dx, dy, 0, MOUSEEVENTF_MOVE };
+                    Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
+                }
+            }
+            return; 
         } else {
             switch (wParam) {
                 case WM_LBUTTONDOWN: flags = MOUSEEVENTF_LEFTDOWN; break;
@@ -118,20 +132,8 @@ namespace Input {
             }
         }
 
-        if (flags & MOUSEEVENTF_MOVE) {
-            float sx = dx * State::mouseSensitivity + fracX;
-            float sy = dy * State::mouseSensitivity + fracY;
-            dx = static_cast<int>(sx);
-            dy = static_cast<int>(sy);
-            fracX = sx - dx;
-            fracY = sy - dy;
-            if (dx == 0 && dy == 0) flags &= ~MOUSEEVENTF_MOVE;
-        }
-
-        if (flags != 0) {
-            Network::MousePayload p = { dx, dy, mouseData, flags };
-            Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
-        }
+        Network::MousePayload p = { 0, 0, mouseData, flags };
+        Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
     }
 
     /**
@@ -218,7 +220,6 @@ namespace Input {
                                     entryPoint = ms->pt;
                                     lockedPoint = { (cachedMi.rcMonitor.left + cachedMi.rcMonitor.right) / 2, (cachedMi.rcMonitor.top + cachedMi.rcMonitor.bottom) / 2 };
                                     SetCursorPos(lockedPoint.x, lockedPoint.y);
-                                    ignorePackets = 3;
                                     consecutiveEdgeHits = 0;
                                     return 1;
                                 }

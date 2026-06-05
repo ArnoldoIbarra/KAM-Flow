@@ -18,6 +18,7 @@
 #include "AudioManager.h"
 #include "ClipboardManager.h"
 #include "FileTransferManager.h"
+#include "UIManager.h"
 #include <iostream>
 #include <ws2tcpip.h>
 #include <thread>
@@ -109,7 +110,14 @@ namespace Network {
             memcpy(buffer.data() + sizeof(h), payload, payloadSize);
         }
 
-        return send(clientSocket, (const char*)buffer.data(), (int)buffer.size(), 0) != SOCKET_ERROR;
+        uint64_t tStart = GetTickCount64();
+        int res = send(clientSocket, (const char*)buffer.data(), (int)buffer.size(), 0);
+        uint64_t tEnd = GetTickCount64();
+        
+        if (State::globalDebugMode && (tEnd - tStart) > 50) {
+            UI::LogDebug("[Network Client] WARNING: send() blocked for %llu ms! TCP Window may be congested.", (unsigned long long)(tEnd - tStart));
+        }
+        return res != SOCKET_ERROR;
     }
 
     /**
@@ -168,7 +176,7 @@ namespace Network {
     void DiscoveryLoop() {
         udpListenerSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (udpListenerSocket == INVALID_SOCKET) {
-            if (State::globalDebugMode) std::cerr << "[Network Client] UDP Socket creation failed.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Network Client] UDP Socket creation failed.");
             return;
         }
         
@@ -181,13 +189,13 @@ namespace Network {
         localAddr.sin_addr.s_addr = INADDR_ANY;
 
         if (bind(udpListenerSocket, (sockaddr*)&localAddr, sizeof(localAddr)) == SOCKET_ERROR) {
-            if (State::globalDebugMode) std::cerr << "[Network Client] UDP Bind failed. Port 8081 may be blocked.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Network Client] UDP Bind failed. Port 8081 may be blocked.");
         }
 
         DWORD timeout = 500;
         setsockopt(udpListenerSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
 
-        if (State::globalDebugMode) std::cout << "[Network Client] Listening for UDP Beacons on port 8081...\n";
+        if (State::globalDebugMode) UI::LogDebug("[Network Client] Listening for UDP Beacons on port 8081...");
 
         while (isDiscoveryRunning) {
             char buffer[1024];
@@ -223,11 +231,11 @@ namespace Network {
                     }
                         if (!found) {
                                 discoveredServers.push_back({ipStr, safeServerName, payload->tcpPort, currentTick});
-                                if (State::globalDebugMode) std::cout << "[Network Client] Discovered Server: " << safeServerName << " at " << ipStr << "\n";
+                                if (State::globalDebugMode) UI::LogDebug("[Network Client] Discovered Server: %s at %s", safeServerName, ipStr);
                         }
                     }
                 } else {
-                    if (State::globalDebugMode) std::cerr << "[Network Client] UDP RX Size Mismatch. Got " << bytes << " bytes.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Network Client] UDP RX Size Mismatch. Got %d bytes.", bytes);
                 }
             }
 
@@ -277,33 +285,34 @@ namespace Network {
         const int PULL_BACK_THRESHOLD = 150; 
         uint32_t rxSequence = 0;
 
-        if (State::globalDebugMode) std::cout << "[Network Client] TCP Listener Thread active.\n";
+        if (State::globalDebugMode) UI::LogDebug("[Network Client] TCP Listener Thread active.");
 
         while (isClientRunning) {
             PacketHeader h;
             int bytes = recv(clientSocket, (char*)&h, sizeof(h), MSG_WAITALL);
             
             if (bytes <= 0) {
+                int wsaErr = WSAGetLastError();
                 if (WSAGetLastError() == WSAETIMEDOUT) {
                     State::SetClientStatus("Disconnected (Timeout).");
-                    if (State::globalDebugMode) std::cout << "[Network Client] Connection timed out (No Heartbeat).\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Network Client] Connection timed out (No Heartbeat received). WSA Error: %d", wsaErr);
                 } else {
                     State::SetClientStatus("Disconnected (Connection Severed).");
-                    if (State::globalDebugMode) std::cout << "[Network Client] Connection severed by remote host.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Network Client] Connection severed. WSA Error: %d", wsaErr);
                 }
                 break;
             }
             
             if (h.magic != PACKET_MAGIC) { 
                 State::SetClientStatus("Disconnected (Packet Desync).");
-                if (State::globalDebugMode) std::cerr << "[Network Client] FATAL: Packet desync detected!\n"; 
+                if (State::globalDebugMode) UI::LogDebug("[Network Client] FATAL: Packet desync detected!"); 
                 break; 
             }
 
             // Enforce payload size limits to prevent memory allocation attacks (CWE-400).
             if (h.payloadSize > MAX_PAYLOAD_SIZE) {
                 State::SetClientStatus("Disconnected (Payload Size Violation).");
-                if (State::globalDebugMode) std::cerr << "[Network Client] CRITICAL: Payload size exceeds safety bounds! Dropping connection.\n";
+                if (State::globalDebugMode) UI::LogDebug("[Network Client] CRITICAL: Payload size exceeds safety bounds! Dropping connection.");
                 break;
             }
 
@@ -312,13 +321,13 @@ namespace Network {
                 // Ensure full payload is received to avoid processing corrupted state data.
                 int pBytes = recv(clientSocket, (char*)rawPayload.data(), h.payloadSize, MSG_WAITALL);
                 if (pBytes != static_cast<int>(h.payloadSize)) {
-                    if (State::globalDebugMode) std::cerr << "[Network Client] WARNING: Partial payload received. (Got " << pBytes << " of " << h.payloadSize << " bytes, Error: " << WSAGetLastError() << "). Dropping connection.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Network Client] WARNING: Partial payload received. (Got %d of %u bytes, Error: %d). Dropping connection.", pBytes, h.payloadSize, WSAGetLastError());
                     break; 
                 }
             }
 
             if (h.sequenceNumber <= rxSequence && h.sequenceNumber != 0) {
-                if (State::globalDebugMode) std::cerr << "[Security] Replay attack detected. Dropping packet.\n";
+                if (State::globalDebugMode) UI::LogDebug("[Security] Replay attack detected. Dropping packet.");
                 continue; // Safe to continue since the raw payload was already cleared from the socket buffer.
             }
             rxSequence = h.sequenceNumber;
@@ -331,18 +340,22 @@ namespace Network {
 
             if (isEncrypted) {
                 if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &h, sizeof(h), decrypted)) {
-                    if (State::globalDebugMode) std::cerr << "[Security] Failed to decrypt server packet. Dropping.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Security] Failed to decrypt server packet. Dropping.");
                     continue; 
                 }
                 finalPayload = decrypted.data();
                 finalSize = decrypted.size();
                 
                 if (State::globalDebugMode && h.type != MessageType::EVENT_MOUSE) {
-                    std::cout << "[Network Client] RX Decrypted -> Type: " << (int)h.type << " | Size: " << finalSize << "b\n";
+                    UI::LogDebug("[Network Client] RX Decrypted -> Type: %d | Size: %zu b", (int)h.type, finalSize);
                 }
             }
 
             if (h.type == MessageType::EVENT_HEARTBEAT) {
+                static int rxHbCount = 0;
+                if (++rxHbCount % 10 == 0 && State::globalDebugMode) {
+                    UI::LogDebug("[Network Client] Received Keep-Alive Heartbeat from Server.");
+                }
                 continue; // Keep-alive heartbeat acknowledged.
             }
 
@@ -417,7 +430,7 @@ namespace Network {
                 if (finalSize == sizeof(AudioFormatPayload)) {
                     memcpy(&g_serverAudioFormat, finalPayload, sizeof(AudioFormatPayload));
                     g_hasServerAudioFormat = true;
-                    if (State::globalDebugMode) std::cout << "[Audio] Received Server Audio Format: " << g_serverAudioFormat.sampleRate << "Hz, " << g_serverAudioFormat.bitDepth << "-bit, " << g_serverAudioFormat.channels << "ch\n";
+                    if (State::globalDebugMode) UI::LogDebug("[Audio] Received Server Audio Format: %uHz, %u-bit, %uch", g_serverAudioFormat.sampleRate, g_serverAudioFormat.bitDepth, g_serverAudioFormat.channels);
 
                     // Now that we have the format, start capturing if the user has it enabled.
                     if (State::enableClientAudioStream) {
@@ -461,7 +474,7 @@ namespace Network {
         }
         isClientRunning = false;
         ReleaseStuckModifiers(); // Catch all hard disconnects or timeouts
-        if (State::globalDebugMode) std::cout << "[Network Client] Listener Thread exiting.\n";
+        if (State::globalDebugMode) UI::LogDebug("[Network Client] Listener Thread exiting.");
 
         uint64_t sessionDuration = GetTickCount64() - connectionStartTime;
 
@@ -471,12 +484,12 @@ namespace Network {
             } else {
                 isAutoReconnecting = true;
                 State::SetClientStatus("Connection dropped. Auto-reconnecting in 5s...");
-                if (State::globalDebugMode) std::cout << "[Network Client] Connection dropped unintentionally. Preparing to auto-reconnect...\n";
+                if (State::globalDebugMode) UI::LogDebug("[Network Client] Connection dropped unintentionally. Preparing to auto-reconnect...");
                 
                 std::thread([]() {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     if (!isIntentionalDisconnect && State::enableClientAutoReconnect) {
-                        if (State::globalDebugMode) std::cout << "[Network Client] Attempting auto-reconnect to " << lastConnectedIp << ":" << lastConnectedPort << "...\n";
+                        if (State::globalDebugMode) UI::LogDebug("[Network Client] Attempting auto-reconnect to %s:%u...", lastConnectedIp.c_str(), lastConnectedPort);
                         if (!StartClient(lastConnectedIp, lastConnectedPort, true)) {
                             State::SetClientStatus("Auto-reconnect failed. Server unreachable.");
                         }
@@ -508,7 +521,7 @@ namespace Network {
         clientTxSequence = 0; // Reset monotonic counter for new connection
 
         if (clientThread.joinable()) {
-            if (State::globalDebugMode) std::cout << "[Network Client] Reaping zombie thread from previous connection attempt...\n";
+            if (State::globalDebugMode) UI::LogDebug("[Network Client] Reaping zombie thread from previous connection attempt...");
             clientThread.join();
         }
         if (clientHeartbeatThread.joinable()) {
@@ -520,19 +533,19 @@ namespace Network {
             clientSocket = INVALID_SOCKET;
         }
 
-        if (State::globalDebugMode) std::cout << "[Network Client] Attempting TCP Connection to " << ip << ":" << port << "...\n";
+        if (State::globalDebugMode) UI::LogDebug("[Network Client] Attempting TCP Connection to %s:%u...", ip.c_str(), port);
 
         std::string targetPin;
         std::string targetName = "KAMFlow_Server_" + ip;
         if (!CredentialManager::LoadSecret(targetName, targetPin)) {
             State::SetClientStatus("Authentication Failed (No PIN).");
-            if (State::globalDebugMode) std::cerr << "[Security] No paired PIN found for " << ip << ". Please pair via UI.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Security] No paired PIN found for %s. Please pair via UI.", ip.c_str());
             return false;
         }
 
         if (!Security::Initialize(targetPin.c_str())) {
             State::SetClientStatus("Security Initialization Failed.");
-            if (State::globalDebugMode) std::cerr << "[Security] FATAL: Cryptography Engine failed to initialize.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Security] FATAL: Cryptography Engine failed to initialize.");
             return false;
         }
 
@@ -548,7 +561,7 @@ namespace Network {
 
         if (connect(clientSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
             State::SetClientStatus("Connection Failed. Server is offline or blocked.");
-            if (State::globalDebugMode) std::cerr << "[Network Client] Connection Failed. Server is offline or blocked by firewall.\n";
+            if (State::globalDebugMode) UI::LogDebug("[Network Client] Connection Failed. Server is offline or blocked by firewall.");
             closesocket(clientSocket);
             return false;
         }
@@ -570,7 +583,7 @@ namespace Network {
         GetComputerNameA(hostname, &size);
         strncpy_s(p.clientName, sizeof(p.clientName), hostname, _TRUNCATE);
 
-        if (State::globalDebugMode) std::cout << "[Network Client] Handshake Sent. AES-GCM Active.\n";
+        if (State::globalDebugMode) UI::LogDebug("[Network Client] Handshake Sent. AES-GCM Active.");
         
         State::SetClientStatus("Authenticating...");
         SendToServer(MessageType::EVENT_AUTH, &p, sizeof(p));
@@ -592,6 +605,10 @@ namespace Network {
                 }
                 if (isClientRunning) {
                     SendToServer(MessageType::EVENT_HEARTBEAT, nullptr, 0);
+                    static int txHbCount = 0;
+                    if (++txHbCount % 10 == 0 && State::globalDebugMode) {
+                        UI::LogDebug("[Network Client] Sent Keep-Alive Heartbeat to Server.");
+                    }
                     
                     // Secure desktop and UAC prompt failsafe.
                     bool isLocked = false;
@@ -608,7 +625,7 @@ namespace Network {
                     }
 
                     if (isLocked && !wasLocked) {
-                        if (State::globalDebugMode) std::cout << "[Network Client] UAC/Secure Desktop detected. Triggering Server Auto-Revert.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[Network Client] UAC/Secure Desktop detected. Triggering Server Auto-Revert.");
                         SendToServer(MessageType::EVENT_CLIENT_LOCKED, nullptr, 0);
                     }
                     wasLocked = isLocked;
@@ -637,6 +654,6 @@ namespace Network {
         if (clientThread.joinable()) clientThread.join();
         if (clientHeartbeatThread.joinable()) clientHeartbeatThread.join();
         Security::Shutdown();
-        if (State::globalDebugMode) std::cout << "[Network Client] Client successfully stopped.\n";
+        if (State::globalDebugMode) UI::LogDebug("[Network Client] Client successfully stopped.");
     }
 }

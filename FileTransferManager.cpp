@@ -17,6 +17,7 @@
 #include "SecurityManager.h"
 #include "ConfigManager.h"
 #include "CredentialManager.h"
+#include "UIManager.h"
 #include <iostream>
 #include <fstream>
 #include <mutex>
@@ -77,7 +78,7 @@ namespace FileTransfer {
         if (ctx.isSender) {
             std::ifstream file(ctx.filePath, std::ios::binary);
             if (!file.is_open()) {
-                if (State::globalDebugMode) std::cerr << "[FileTransfer] Failed to open source file.\n";
+                if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Failed to open source file.");
                 return;
             }
 
@@ -105,7 +106,7 @@ namespace FileTransfer {
                     }
 
                     if (send(sock, (const char*)packet.data(), (int)packet.size(), 0) == SOCKET_ERROR) {
-                        if (State::globalDebugMode) std::cerr << "[FileTransfer] Connection dropped during send.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Connection dropped during send.");
                         break;
                     }
                     {
@@ -113,18 +114,18 @@ namespace FileTransfer {
                         if (g_transfers.find(transferId) != g_transfers.end()) {
                             g_transfers[transferId].transferredSize += bytesRead;
                         } else {
-                            if (State::globalDebugMode) std::cout << "[FileTransfer] Transfer " << transferId << " aborted by user.\n";
+                            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u aborted by user.", transferId);
                             break;
                         }
                     }
                 }
                 if (isEOF) break;
             }
-            if (State::globalDebugMode) std::cout << "[FileTransfer] File sent completely.\n";
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] File sent completely.");
         } else {
             std::ofstream file(ctx.filePath, std::ios::binary);
             if (!file.is_open()) {
-                if (State::globalDebugMode) std::cerr << "[FileTransfer] Failed to open destination file.\n";
+                if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Failed to open destination file.");
                 return;
             }
 
@@ -132,21 +133,21 @@ namespace FileTransfer {
                 FileChunkHeader header;
                 int b = recv(sock, (char*)&header, sizeof(header), MSG_WAITALL);
                 if (b <= 0 || header.magic != Network::PACKET_MAGIC || header.transferId != transferId) {
-                    if (State::globalDebugMode) std::cerr << "[FileTransfer] Error or connection closed during receive.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Error or connection closed during receive.");
                     break;
                 }
 
                 if (header.chunkSize > 0) {
                     // Enforce payload bounds to prevent OOM std::bad_alloc attacks (CWE-400)
                     if (header.chunkSize > Network::MAX_PAYLOAD_SIZE) {
-                        if (State::globalDebugMode) std::cerr << "[FileTransfer] CRITICAL: Chunk size exceeds safety bounds! Aborting.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] CRITICAL: Chunk size exceeds safety bounds! Aborting.");
                         break;
                     }
                     
                     std::vector<uint8_t> ciphertext(header.chunkSize);
                     int cb = recv(sock, (char*)ciphertext.data(), (int)ciphertext.size(), MSG_WAITALL);
                     if (cb != (int)ciphertext.size()) {
-                        if (State::globalDebugMode) std::cerr << "[FileTransfer] Partial chunk receive.\n";
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Partial chunk receive.");
                         break;
                     }
 
@@ -158,18 +159,18 @@ namespace FileTransfer {
                             if (g_transfers.find(transferId) != g_transfers.end()) {
                                 g_transfers[transferId].transferredSize += plaintext.size();
                             } else {
-                                if (State::globalDebugMode) std::cout << "[FileTransfer] Transfer " << transferId << " aborted by user.\n";
+                                if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u aborted by user.", transferId);
                                 break;
                             }
                         }
                     } else {
-                        if (State::globalDebugMode) std::cerr << "[FileTransfer] Chunk decryption failed!\n";
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Chunk decryption failed!");
                         break;
                     }
                 }
 
                 if (header.isEOF) {
-                    if (State::globalDebugMode) std::cout << "[FileTransfer] File received and saved completely.\n";
+                    if (State::globalDebugMode) UI::LogDebug("[FileTransfer] File received and saved completely.");
                     break;
                 }
             }
@@ -197,7 +198,7 @@ namespace FileTransfer {
         addr.sin_family = AF_INET; addr.sin_port = htons(port); addr.sin_addr.s_addr = INADDR_ANY;
 
         if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-            if (State::globalDebugMode) std::cerr << "[FileTransfer] OOB Bind failed on port " << port << "\n";
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Bind failed on port %u", port);
             closesocket(listenSock); return;
         }
         listen(listenSock, 1);
@@ -251,7 +252,7 @@ namespace FileTransfer {
             setsockopt(oobSock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
             ExecuteTransferIO(oobSock, transferId);
         } else {
-            if (State::globalDebugMode) std::cerr << "[FileTransfer] OOB Client failed to connect to " << serverIp << ":" << port << "\n";
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Client failed to connect to %s:%u", serverIp.c_str(), port);
         }
         closesocket(oobSock);
     }
@@ -261,7 +262,7 @@ namespace FileTransfer {
      * @return true if initialized successfully.
      */
     bool Initialize() {
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Manager Initialized.\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Manager Initialized.");
         return true;
     }
 
@@ -272,7 +273,7 @@ namespace FileTransfer {
     void Shutdown() {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_pendingOffers.clear();
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Manager Shutdown.\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Manager Shutdown.");
     }
 
     /**
@@ -287,7 +288,7 @@ namespace FileTransfer {
         
         std::ifstream file(absoluteFilePath, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
-            if (State::globalDebugMode) std::cerr << "[FileTransfer] Error: Could not open file for reading: " << absoluteFilePath << "\n";
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Error: Could not open file for reading: %s", absoluteFilePath.c_str());
             return;
         }
         uint64_t fileSize = file.tellg();
@@ -315,7 +316,7 @@ namespace FileTransfer {
             } else {
                 Network::SendToServer(Network::MessageType::EVENT_FILE_OFFER, &offer, sizeof(offer));
             }
-            if (State::globalDebugMode) std::cout << "[FileTransfer] Sent File Offer for '" << fileName << "' (ID: " << offer.transferId << ")\n";
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Sent File Offer for '%s' (ID: %u)", fileName.c_str(), offer.transferId);
         }
     }
 
@@ -384,7 +385,7 @@ namespace FileTransfer {
             std::thread(OOB_ClientTask, transferId, acceptPayload.tcpPort).detach();
             Network::SendToServer(Network::MessageType::EVENT_FILE_ACCEPT, &acceptPayload, sizeof(acceptPayload));
         }
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Transfer " << transferId << " Accepted. Will save to: " << saveDirectory << "\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u Accepted. Will save to: %s", transferId, saveDirectory.c_str());
     }
 
     /**
@@ -408,7 +409,7 @@ namespace FileTransfer {
         } else {
             Network::SendToServer(Network::MessageType::EVENT_FILE_DECLINE, &decline, sizeof(decline));
         }
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Transfer " << transferId << " Declined.\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u Declined.", transferId);
     }
 
     /**
@@ -419,7 +420,7 @@ namespace FileTransfer {
     void CancelTransfer(uint32_t transferId) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_transfers.erase(transferId);
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Cancelling active transfer " << transferId << "...\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Cancelling active transfer %u...", transferId);
     }
 
     /**
@@ -441,7 +442,7 @@ namespace FileTransfer {
         }
         std::lock_guard<std::mutex> lock(g_mutex);
         g_pendingOffers.push_back({ payload.transferId, payload.fileSize, std::string(payload.fileName), senderSocket });
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Received File Offer: " << payload.fileName << "\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Received File Offer: %s", payload.fileName);
     }
 
     /**
@@ -456,7 +457,7 @@ namespace FileTransfer {
         } else {
             std::thread(OOB_ClientTask, payload.transferId, payload.tcpPort).detach();
         }
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Transfer " << payload.transferId << " Accepted by remote host. Establishing OOB stream.\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u Accepted by remote host. Establishing OOB stream.", payload.transferId);
     }
 
     /**
@@ -466,6 +467,6 @@ namespace FileTransfer {
      * @return void
      */
     void HandleFileDecline(SOCKET senderSocket, const Network::FileDeclinePayload& payload) {
-        if (State::globalDebugMode) std::cout << "[FileTransfer] Transfer " << payload.transferId << " was declined by receiver.\n";
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u was declined by receiver.", payload.transferId);
     }
 }
