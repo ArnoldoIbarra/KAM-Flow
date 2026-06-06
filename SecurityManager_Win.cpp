@@ -180,9 +180,9 @@ namespace Security {
         // Preserve the original IV since BCryptDecrypt mutates the passed buffer during execution.
         memcpy(ivTemp, iv, sizeof(iv));
         
-        std::vector<uint8_t> tempPlaintext(actualCipherSize);
+        outPlaintext.resize(actualCipherSize);
         PUCHAR ctBuffer = actualCipherSize > 0 ? (PUCHAR)actualCiphertext : NULL;
-        PUCHAR ptBuffer = actualCipherSize > 0 ? tempPlaintext.data() : NULL;
+        PUCHAR ptBuffer = actualCipherSize > 0 ? outPlaintext.data() : NULL;
 
         if (BCryptDecrypt(localKey, ctBuffer, (ULONG)actualCipherSize, &authInfo, ivTemp, sizeof(ivTemp), 
                           ptBuffer, (ULONG)actualCipherSize, &cbResult, 0) != STATUS_SUCCESS) {
@@ -191,9 +191,6 @@ namespace Security {
         }
 
         outPlaintext.resize(cbResult);
-        if (cbResult > 0) {
-            memcpy(outPlaintext.data(), tempPlaintext.data(), cbResult);
-        }
 
         return true;
     }

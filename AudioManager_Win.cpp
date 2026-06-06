@@ -37,6 +37,7 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
+#include <shared_mutex>
 #include <avrt.h>
 #pragma comment(lib, "avrt.lib")
 
@@ -169,9 +170,10 @@ namespace Audio {
         ByteRingBuffer buffer;
         std::mutex mtx;
         bool isBuffering = true;
+        int starvationCount = 0;
     };
     std::map<uintptr_t, std::shared_ptr<ClientAudioQueue>> g_clientAudioQueues;
-    std::mutex g_queuesMutex; // Protects the map itself during additions/removals.
+    std::shared_mutex g_queuesMutex; // Protects the map itself during additions/removals.
 
     // --- CLIENT MIC RECEIVER THREAD ---
     std::thread g_clientMicThread;
@@ -585,7 +587,7 @@ namespace Audio {
                 std::vector<float> activeVolumes;
 
                 {
-                    std::lock_guard<std::mutex> mapLock(g_queuesMutex);
+                    std::shared_lock<std::shared_mutex> mapLock(g_queuesMutex);
                     for (auto& pair : g_clientAudioQueues) {
                         bool isEnabled = false;
                         float vol = 1.0f;
@@ -613,13 +615,19 @@ namespace Audio {
                             // Still in initial buffering mode - play silence until jitter buffer fills
                             isBuffering = true;
                         } else if (availableBytes == 0) {
-                            // Complete starvation - re-enter buffering mode to rebuild the jitter buffer
-                            queue->isBuffering = true;
-                            isBuffering = true;
-                            if (State::globalDebugMode) { 
-                                UI::LogDebug("[Audio Debug] Starvation! (Requested %zu, Have 0). Returning to Jitter Buffering mode.", bytesToProcess);
+                            // Instead of instantly pausing for 50ms due to microsecond clock drift,
+                            // we pad with 5ms of silence. We only rebuild the jitter buffer if it's a true network drop.
+                            queue->starvationCount++;
+                            if (queue->starvationCount > 10) {
+                                queue->isBuffering = true;
+                                queue->starvationCount = 0;
+                                isBuffering = true;
+                                if (State::globalDebugMode) { 
+                                    UI::LogDebug("[Audio Debug] Starvation! (Requested %zu, Have 0). Returning to Jitter Buffering mode.", bytesToProcess);
+                                }
                             }
                         } else {
+                            queue->starvationCount = 0;
                             // PARTIAL FILL: Play whatever audio IS available, even if less than requested.
                             // This prevents one slow packet from triggering a catastrophic 50ms re-buffering pause
                             // that causes the vicious starvation loop from hardware clock drift.
@@ -711,7 +719,7 @@ namespace Audio {
             g_renderThread.join();
         }
         // Clear out any stale audio data.
-        std::lock_guard<std::mutex> lock(g_queuesMutex);
+        std::unique_lock<std::shared_mutex> lock(g_queuesMutex);
         g_clientAudioQueues.clear();
     }
 
@@ -1093,7 +1101,15 @@ namespace Audio {
         // Find or create a queue for this client.
         std::shared_ptr<ClientAudioQueue> pQueue;
         {
-            std::lock_guard<std::mutex> mapLock(g_queuesMutex);
+            std::shared_lock<std::shared_mutex> readLock(g_queuesMutex);
+            auto it = g_clientAudioQueues.find(clientIdentifier);
+            if (it != g_clientAudioQueues.end()) {
+                pQueue = it->second;
+            }
+        }
+        
+        if (!pQueue) {
+            std::unique_lock<std::shared_mutex> writeLock(g_queuesMutex);
             if (g_clientAudioQueues.find(clientIdentifier) == g_clientAudioQueues.end()) {
                 g_clientAudioQueues[clientIdentifier] = std::make_shared<ClientAudioQueue>();
             }
@@ -1151,7 +1167,7 @@ namespace Audio {
      * @return void
      */
     void ClearClientAudioQueue(uintptr_t clientIdentifier) {
-        std::lock_guard<std::mutex> mapLock(g_queuesMutex);
+        std::unique_lock<std::shared_mutex> mapLock(g_queuesMutex);
         if (g_clientAudioQueues.count(clientIdentifier)) {
             g_clientAudioQueues.erase(clientIdentifier);
         }

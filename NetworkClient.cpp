@@ -108,6 +108,11 @@ namespace Network {
 
         if (targetSock == INVALID_SOCKET) return false;
 
+        std::lock_guard<std::mutex> lock(*targetMutex);
+        
+        // CRITICAL: Sequence generation AND encryption MUST happen inside the targetMutex.
+        // Otherwise, concurrent threads (Audio, Heartbeat) will interleave sequence numbers 
+        // into the TCP stream, causing the receiver to drop packets as false-positive Replay Attacks.
         PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++clientTxSequence };
         std::vector<uint8_t> buffer;
 
@@ -126,8 +131,8 @@ namespace Network {
             memcpy(buffer.data(), &h, sizeof(h));
             memcpy(buffer.data() + sizeof(h), payload, payloadSize);
         }
+        
         if (!buffer.empty()) {
-            std::lock_guard<std::mutex> lock(*targetMutex);
             int res = send(targetSock, (const char*)buffer.data(), (int)buffer.size(), 0);
             return res != SOCKET_ERROR;
         }
@@ -140,6 +145,9 @@ namespace Network {
     void SendHeartbeatToSocket(SOCKET sock, std::mutex& sockMutex) {
         if (sock == INVALID_SOCKET) return;
         
+        std::unique_lock<std::mutex> lock(sockMutex, std::try_to_lock);
+        if (!lock.owns_lock()) return; // Socket is actively streaming data, heartbeat is unnecessary.
+        
         PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_HEARTBEAT, 0, ++clientTxSequence };
         std::vector<uint8_t> buffer;
         std::vector<uint8_t> ciphertext;
@@ -150,7 +158,6 @@ namespace Network {
             memcpy(buffer.data(), &h, sizeof(h));
             memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
             
-            std::lock_guard<std::mutex> lock(sockMutex);
             send(sock, (const char*)buffer.data(), (int)buffer.size(), 0);
         }
     }
@@ -318,6 +325,12 @@ namespace Network {
      */
     void ClientAudioLoop() {
         uint32_t rxSequence = 0;
+        
+        thread_local std::vector<uint8_t> tls_rawPayload;
+        thread_local std::vector<uint8_t> tls_decrypted;
+        tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
+        tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
+
         while (isClientRunning && clientAudioSocket != INVALID_SOCKET) {
             PacketHeader h;
             int bytes = recv(clientAudioSocket, (char*)&h, sizeof(h), MSG_WAITALL);
@@ -326,24 +339,23 @@ namespace Network {
             if (h.magic == PACKET_MAGIC) {
                 if (h.payloadSize > MAX_PAYLOAD_SIZE) break;
 
-                std::vector<uint8_t> rawPayload(h.payloadSize);
+                tls_rawPayload.resize(h.payloadSize);
                 if (h.payloadSize > 0) {
-                    int pBytes = recv(clientAudioSocket, (char*)rawPayload.data(), h.payloadSize, MSG_WAITALL);
+                    int pBytes = recv(clientAudioSocket, (char*)tls_rawPayload.data(), h.payloadSize, MSG_WAITALL);
                     if (pBytes != static_cast<int>(h.payloadSize)) break;
                 }
 
                 if (h.sequenceNumber <= rxSequence && h.sequenceNumber != 0) continue;
                 rxSequence = h.sequenceNumber;
 
-                std::vector<uint8_t> decrypted;
-                const uint8_t* finalPayload = rawPayload.data();
-                size_t finalSize = rawPayload.size();
+                const uint8_t* finalPayload = tls_rawPayload.data();
+                size_t finalSize = tls_rawPayload.size();
 
                 bool isEncrypted = (h.type != MessageType::EVENT_AUTH_AUDIO);
                 if (isEncrypted) {
-                    if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &h, sizeof(h), decrypted)) continue;
-                    finalPayload = decrypted.data();
-                    finalSize = decrypted.size();
+                    if (!Security::DecryptPayload(tls_rawPayload.data(), tls_rawPayload.size(), &h, sizeof(h), tls_decrypted)) continue;
+                    finalPayload = tls_decrypted.data();
+                    finalSize = tls_decrypted.size();
                 }
 
                 if (h.type == MessageType::EVENT_HEARTBEAT) continue;
@@ -365,6 +377,11 @@ namespace Network {
         int pullBackAccumulator = 0;
         const int PULL_BACK_THRESHOLD = 150; 
         uint32_t rxSequence = 0;
+
+        thread_local std::vector<uint8_t> tls_rawPayload;
+        thread_local std::vector<uint8_t> tls_decrypted;
+        tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
+        tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
 
         if (State::globalDebugMode) UI::LogDebug("[Network Client] TCP Listener Thread active.");
 
@@ -397,10 +414,10 @@ namespace Network {
                 break;
             }
 
-            std::vector<uint8_t> rawPayload(h.payloadSize);
+            tls_rawPayload.resize(h.payloadSize);
             if (h.payloadSize > 0) {
                 // Ensure full payload is received to avoid processing corrupted state data.
-                int pBytes = recv(clientSocket, (char*)rawPayload.data(), h.payloadSize, MSG_WAITALL);
+                int pBytes = recv(clientSocket, (char*)tls_rawPayload.data(), h.payloadSize, MSG_WAITALL);
                 if (pBytes != static_cast<int>(h.payloadSize)) {
                     if (State::globalDebugMode) UI::LogDebug("[Network Client] WARNING: Partial payload received. (Got %d of %u bytes, Error: %d). Dropping connection.", pBytes, h.payloadSize, WSAGetLastError());
                     break; 
@@ -413,19 +430,18 @@ namespace Network {
             }
             rxSequence = h.sequenceNumber;
 
-            std::vector<uint8_t> decrypted;
-            const uint8_t* finalPayload = rawPayload.data();
-            size_t finalSize = rawPayload.size();
+            const uint8_t* finalPayload = tls_rawPayload.data();
+            size_t finalSize = tls_rawPayload.size();
 
             bool isEncrypted = (h.type != MessageType::EVENT_AUTH) && (h.type != MessageType::EVENT_UDP_BEACON);
 
             if (isEncrypted) {
-                if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &h, sizeof(h), decrypted)) {
+                if (!Security::DecryptPayload(tls_rawPayload.data(), tls_rawPayload.size(), &h, sizeof(h), tls_decrypted)) {
                     if (State::globalDebugMode) UI::LogDebug("[Security] Failed to decrypt server packet. Dropping.");
                     continue; 
                 }
-                finalPayload = decrypted.data();
-                finalSize = decrypted.size();
+                finalPayload = tls_decrypted.data();
+                finalSize = tls_decrypted.size();
                 
                 if (State::globalDebugMode && h.type != MessageType::EVENT_MOUSE) {
                     UI::LogDebug("[Network Client] RX Decrypted -> Type: %d | Size: %zu b", (int)h.type, finalSize);
@@ -610,10 +626,17 @@ namespace Network {
         if (clientHeartbeatThread.joinable()) {
             clientHeartbeatThread.join();
         }
+        if (clientAudioThread.joinable()) {
+            clientAudioThread.join();
+        }
 
         if (clientSocket != INVALID_SOCKET) {
             closesocket(clientSocket);
             clientSocket = INVALID_SOCKET;
+        }
+        if (clientAudioSocket != INVALID_SOCKET) {
+            closesocket(clientAudioSocket);
+            clientAudioSocket = INVALID_SOCKET;
         }
 
         if (State::globalDebugMode) UI::LogDebug("[Network Client] Attempting TCP Connection to %s:%u...", ip.c_str(), port);

@@ -273,6 +273,14 @@ namespace Network {
      */
     void ClientAudioListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
         uint32_t rxSequence = initialRxSequence;
+        
+        // Zero-Allocation Buffer Pool: Pre-allocate memory once per thread to avoid 
+        // CPU cache thrashing from 144Hz continuous vector allocations.
+        thread_local std::vector<uint8_t> tls_rawPayload;
+        thread_local std::vector<uint8_t> tls_decrypted;
+        tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
+        tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
+
         while (isRunning) {
             PacketHeader header;
             int bytes = recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL);
@@ -281,24 +289,23 @@ namespace Network {
             if (header.magic == PACKET_MAGIC) {
                 if (header.payloadSize > MAX_PAYLOAD_SIZE) break;
 
-                std::vector<uint8_t> rawPayload(header.payloadSize);
+                tls_rawPayload.resize(header.payloadSize);
                 if (header.payloadSize > 0) {
-                    int pBytes = recv(clientSocket, (char*)rawPayload.data(), header.payloadSize, MSG_WAITALL);
+                    int pBytes = recv(clientSocket, (char*)tls_rawPayload.data(), header.payloadSize, MSG_WAITALL);
                     if (pBytes != static_cast<int>(header.payloadSize)) break;
                 }
 
                 if (header.sequenceNumber <= rxSequence && header.sequenceNumber != 0) continue;
                 rxSequence = header.sequenceNumber;
 
-                std::vector<uint8_t> decrypted;
-                const uint8_t* finalPayload = rawPayload.data();
-                size_t finalSize = rawPayload.size();
+                const uint8_t* finalPayload = tls_rawPayload.data();
+                size_t finalSize = tls_rawPayload.size();
 
                 bool isEncrypted = (header.type != MessageType::EVENT_AUTH_AUDIO);
                 if (isEncrypted) {
-                    if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &header, sizeof(header), decrypted)) continue;
-                    finalPayload = decrypted.data();
-                    finalSize = decrypted.size();
+                    if (!Security::DecryptPayload(tls_rawPayload.data(), tls_rawPayload.size(), &header, sizeof(header), tls_decrypted)) continue;
+                    finalPayload = tls_decrypted.data();
+                    finalSize = tls_decrypted.size();
                 }
 
                 if (header.type == MessageType::EVENT_HEARTBEAT) continue; // Keep socket alive
@@ -327,6 +334,12 @@ namespace Network {
     void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
         uint32_t rxSequence = initialRxSequence;
         int rxHbCount = 0;
+        
+        thread_local std::vector<uint8_t> tls_rawPayload;
+        thread_local std::vector<uint8_t> tls_decrypted;
+        tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
+        tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
+
         while (isRunning) {
             PacketHeader header;
             int bytes = recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL);
@@ -341,16 +354,14 @@ namespace Network {
             }
 
             if (header.magic == PACKET_MAGIC) {
-                // CRITICAL GUARD: Prevent memory allocation attacks (CWE-400)
                 if (header.payloadSize > MAX_PAYLOAD_SIZE) {
                     if (State::globalDebugMode) UI::LogDebug("[Network Server] CRITICAL: Payload size exceeds safety bounds! Dropping connection.");
                     break;
                 }
 
-                std::vector<uint8_t> rawPayload(header.payloadSize);
+                tls_rawPayload.resize(header.payloadSize);
                 if (header.payloadSize > 0) {
-                    // Ensure full payload is received to avoid processing corrupted state data.
-                    int pBytes = recv(clientSocket, (char*)rawPayload.data(), header.payloadSize, MSG_WAITALL);
+                    int pBytes = recv(clientSocket, (char*)tls_rawPayload.data(), header.payloadSize, MSG_WAITALL);
                     if (pBytes != static_cast<int>(header.payloadSize)) {
                         if (State::globalDebugMode) UI::LogDebug("[Network Server] WARNING: Partial payload received. (Got %d of %u bytes, Error: %d). Dropping connection.", pBytes, header.payloadSize, WSAGetLastError());
                         break; 
@@ -363,19 +374,18 @@ namespace Network {
                 }
                 rxSequence = header.sequenceNumber;
 
-                std::vector<uint8_t> decrypted;
-                const uint8_t* finalPayload = rawPayload.data();
-                size_t finalSize = rawPayload.size();
+                const uint8_t* finalPayload = tls_rawPayload.data();
+                size_t finalSize = tls_rawPayload.size();
 
                 bool isEncrypted = (header.type != MessageType::EVENT_AUTH);
 
                 if (isEncrypted) {
-                    if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &header, sizeof(header), decrypted)) {
+                    if (!Security::DecryptPayload(tls_rawPayload.data(), tls_rawPayload.size(), &header, sizeof(header), tls_decrypted)) {
                         if (State::globalDebugMode) UI::LogDebug("[Security] Failed to decrypt client packet.");
                         continue;
                     }
-                    finalPayload = decrypted.data();
-                    finalSize = decrypted.size();
+                    finalPayload = tls_decrypted.data();
+                    finalSize = tls_decrypted.size();
                 }
 
                 if (header.type == MessageType::EVENT_HEARTBEAT) {
@@ -797,28 +807,32 @@ namespace Network {
             }
         }
 
-        PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
-        std::vector<uint8_t> buffer;
-
-        if (type != MessageType::EVENT_AUTH && type != MessageType::EVENT_UDP_BEACON) {
-            std::vector<uint8_t> ciphertext;
-            h.payloadSize = static_cast<uint32_t>(payloadSize + 28); // 12-byte IV + 16-byte Tag
-            if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), ciphertext)) {
-                buffer.resize(sizeof(h) + ciphertext.size());
-                memcpy(buffer.data(), &h, sizeof(h));
-                memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
-            } else {
-                return false; 
-            }
-        } else {
-            buffer.resize(sizeof(h) + payloadSize);
-            memcpy(buffer.data(), &h, sizeof(h));
-            memcpy(buffer.data() + sizeof(h), payload, payloadSize);
-        }
-
         // Per-client send: a congested Client A no longer blocks sends to Client B from other threads.
+        // CRITICAL: Sequence generation AND encryption MUST happen inside the sendLock.
+        // Otherwise, concurrent threads (Mouse, Heartbeat) will interleave sequence numbers 
+        // into the TCP stream, causing the receiver to drop packets as false-positive Replay Attacks.
         for (auto& t : targets) {
             std::lock_guard<std::mutex> sendLock(*t.mtx);
+            
+            PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
+            std::vector<uint8_t> buffer;
+
+            if (type != MessageType::EVENT_AUTH && type != MessageType::EVENT_UDP_BEACON) {
+                std::vector<uint8_t> ciphertext;
+                h.payloadSize = static_cast<uint32_t>(payloadSize + 28); // 12-byte IV + 16-byte Tag
+                if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), ciphertext)) {
+                    buffer.resize(sizeof(h) + ciphertext.size());
+                    memcpy(buffer.data(), &h, sizeof(h));
+                    memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
+                } else {
+                    continue; 
+                }
+            } else {
+                buffer.resize(sizeof(h) + payloadSize);
+                memcpy(buffer.data(), &h, sizeof(h));
+                memcpy(buffer.data() + sizeof(h), payload, payloadSize);
+            }
+
             uint64_t tStart = GetTickCount64();
             if (send(t.sock, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
                 shutdown(t.sock, SD_BOTH); // Force the listener loop to sever the dead socket.

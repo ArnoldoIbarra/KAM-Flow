@@ -35,6 +35,9 @@ namespace Input {
      */
     LRESULT CALLBACK KeyboardHookCallback(int nCode, WPARAM wParam, LPARAM lParam) {
         if (nCode >= 0) {
+            // Absolute Fast-Path: Instantly return to OS scheduler if Game Mode is active
+            if (State::enableGameMode) return CallNextHookEx(globalKeyboardHook, nCode, wParam, lParam);
+
             if (!Network::g_hasClients.load(std::memory_order_relaxed)) {
                 return CallNextHookEx(globalKeyboardHook, nCode, wParam, lParam);
             }

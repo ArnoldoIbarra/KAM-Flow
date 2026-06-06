@@ -18,10 +18,20 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
 
 namespace Input {
     /// Global handle for the low-level mouse hook.
     HHOOK globalMouseHook = NULL;
+
+    /// Background queue to decouple the OS hook from the network socket
+    std::queue<Network::MousePayload> g_mouseQueue;
+    std::mutex g_mouseQueueMutex;
+    std::condition_variable g_mouseQueueCv;
+    std::atomic<bool> g_isMouseNetworkThreadRunning{false};
+    std::thread g_mouseNetworkThread;
 
     /// Coordinates where the mouse entered the boundary.
     POINT entryPoint = { 0, 0 };
@@ -67,6 +77,67 @@ namespace Input {
     }
 
     /**
+     * @brief Background thread loop that consumes mouse payloads and broadcasts them over the network.
+     * This fully decouples the high-frequency OS mouse hook from blocking network calls.
+     * @return void
+     */
+    void MouseNetworkThreadLoop() {
+        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        while (g_isMouseNetworkThreadRunning) {
+            std::queue<Network::MousePayload> localQueue;
+            {
+                std::unique_lock<std::mutex> lock(g_mouseQueueMutex);
+                g_mouseQueueCv.wait(lock, [] { 
+                    return !g_mouseQueue.empty() || !g_isMouseNetworkThreadRunning; 
+                });
+
+                if (!g_isMouseNetworkThreadRunning && g_mouseQueue.empty()) {
+                    break;
+                }
+
+                // Swap queues instantly to release the mutex back to the hook thread
+                std::swap(localQueue, g_mouseQueue);
+            }
+
+            // Perform the blocking network calls outside of the OS hook chain
+            Network::MousePayload coalescedMove = { 0, 0, 0, 0 };
+            bool hasCoalescedMove = false;
+
+            while (!localQueue.empty()) {
+                auto p = localQueue.front();
+                localQueue.pop();
+
+                // If it is a pure relative move, sum the deltas to compress multiple events into one packet
+                if (p.flags == MOUSEEVENTF_MOVE && p.mouseData == 0) {
+                    coalescedMove.deltaX += p.deltaX;
+                    coalescedMove.deltaY += p.deltaY;
+                    coalescedMove.flags = MOUSEEVENTF_MOVE;
+                    hasCoalescedMove = true;
+                } else {
+                    // Send any accumulated movement BEFORE sending the discrete click/scroll
+                    if (hasCoalescedMove) {
+                        Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
+                        coalescedMove = { 0, 0, 0, 0 };
+                        hasCoalescedMove = false;
+                    }
+                    // Send the discrete action
+                    Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
+                }
+            }
+
+            // Flush any remaining accumulated movement
+            if (hasCoalescedMove) {
+                Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
+            }
+
+            // Cap the KVM network transmission rate to ~144Hz (7ms). 
+            // This prevents TCP congestion/bufferbloat (WSA 10060/10054 crashes) when 
+            // the user has a high-polling-rate (1000Hz+) gaming mouse.
+            std::this_thread::sleep_for(std::chrono::milliseconds(7));
+        }
+    }
+
+    /**
      * @brief Processes all mouse input during Remote mode, translating clicks and scrolls to flags.
      * @param wParam Message identifier representing the specific mouse action.
      * @param ms Pointer to the low-level mouse struct containing exact hardware data.
@@ -100,7 +171,9 @@ namespace Input {
 
                 if (dx != 0 || dy != 0) {
                     Network::MousePayload p = { dx, dy, 0, MOUSEEVENTF_MOVE };
-                    Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
+                    std::lock_guard<std::mutex> lock(g_mouseQueueMutex);
+                    g_mouseQueue.push(p);
+                    g_mouseQueueCv.notify_one();
                 }
             }
             return; 
@@ -133,7 +206,10 @@ namespace Input {
         }
 
         Network::MousePayload p = { 0, 0, mouseData, flags };
-        Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
+        
+        std::lock_guard<std::mutex> lock(g_mouseQueueMutex);
+        g_mouseQueue.push(p);
+        g_mouseQueueCv.notify_one();
     }
 
     /**
@@ -242,6 +318,10 @@ namespace Input {
         if (globalMouseHook != NULL) {
             return true; // Prevent handle leaking from double-hooks
         }
+        
+        g_isMouseNetworkThreadRunning = true;
+        g_mouseNetworkThread = std::thread(MouseNetworkThreadLoop);
+        
         globalMouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookCallback, NULL, 0);
         return (globalMouseHook != NULL);
     }
@@ -254,6 +334,12 @@ namespace Input {
         if (globalMouseHook) {
             UnhookWindowsHookEx(globalMouseHook);
             globalMouseHook = NULL;
+        }
+
+        g_isMouseNetworkThreadRunning = false;
+        g_mouseQueueCv.notify_all();
+        if (g_mouseNetworkThread.joinable()) {
+            g_mouseNetworkThread.join();
         }
     }
 }
