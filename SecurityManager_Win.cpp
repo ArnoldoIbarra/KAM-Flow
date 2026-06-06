@@ -27,9 +27,23 @@ namespace Security {
     BCRYPT_ALG_HANDLE hAesAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
     std::vector<uint8_t> keyObjectBuffer;
-    
-    /// Mutex to prevent AES-GCM internal state corruption during heavy bi-directional data flow.
-    std::mutex cryptoMutex;
+
+    thread_local BCRYPT_KEY_HANDLE tls_hKey = NULL;
+    thread_local std::vector<uint8_t> tls_keyObjectBuffer;
+
+    BCRYPT_KEY_HANDLE GetThreadLocalKey() {
+        if (tls_hKey != NULL) return tls_hKey;
+        if (hKey == NULL) return NULL;
+
+        DWORD cbKeyObject = 0, cbData = 0;
+        BCryptGetProperty(hAesAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObject, sizeof(DWORD), &cbData, 0);
+        tls_keyObjectBuffer.resize(cbKeyObject);
+        
+        if (BCryptDuplicateKey(hKey, &tls_hKey, tls_keyObjectBuffer.data(), cbKeyObject, 0) != STATUS_SUCCESS) {
+            return NULL;
+        }
+        return tls_hKey;
+    }
 
     /**
      * @brief Initializes CNG, sets the AES-GCM chaining mode, and hashes the PIN to a 256-bit key.
@@ -85,8 +99,8 @@ namespace Security {
      * @return true if successful.
      */
     bool EncryptPayload(const void* plaintext, size_t plainSize, const void* aad, size_t aadSize, std::vector<uint8_t>& outCiphertext) {
-        std::lock_guard<std::mutex> lock(cryptoMutex);
-        if (!hKey) return false;
+        BCRYPT_KEY_HANDLE localKey = GetThreadLocalKey();
+        if (!localKey) return false;
 
         uint8_t iv[12];
         BCryptGenRandom(NULL, iv, sizeof(iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
@@ -111,7 +125,7 @@ namespace Security {
         PUCHAR ptBuffer = plainSize > 0 ? (PUCHAR)plaintext : NULL;
         PUCHAR ctBuffer = plainSize > 0 ? tempCiphertext.data() : NULL;
 
-        if (BCryptEncrypt(hKey, ptBuffer, (ULONG)plainSize, &authInfo, ivTemp, sizeof(ivTemp), 
+        if (BCryptEncrypt(localKey, ptBuffer, (ULONG)plainSize, &authInfo, ivTemp, sizeof(ivTemp), 
                           ctBuffer, (ULONG)tempCiphertext.size(), &cbResult, 0) != STATUS_SUCCESS) {
             outCiphertext.clear();
             return false;
@@ -137,8 +151,8 @@ namespace Security {
      * @return true if decryption succeeds.
      */
     bool DecryptPayload(const void* ciphertext, size_t cipherSize, const void* aad, size_t aadSize, std::vector<uint8_t>& outPlaintext) {
-        std::lock_guard<std::mutex> lock(cryptoMutex);
-        if (!hKey || cipherSize < 28) return false; // 12 (IV) + 16 (Tag) minimum
+        BCRYPT_KEY_HANDLE localKey = GetThreadLocalKey();
+        if (!localKey || cipherSize < 28) return false; // 12 (IV) + 16 (Tag) minimum
 
         const uint8_t* cipherData = static_cast<const uint8_t*>(ciphertext);
 
@@ -160,23 +174,26 @@ namespace Security {
         authInfo.pbTag = authTag;
         authInfo.cbTag = sizeof(authTag);
 
-        outPlaintext.resize(actualCipherSize);
         DWORD cbResult = 0;
 
         uint8_t ivTemp[12];
         // Preserve the original IV since BCryptDecrypt mutates the passed buffer during execution.
         memcpy(ivTemp, iv, sizeof(iv));
         
+        std::vector<uint8_t> tempPlaintext(actualCipherSize);
         PUCHAR ctBuffer = actualCipherSize > 0 ? (PUCHAR)actualCiphertext : NULL;
-        PUCHAR ptBuffer = actualCipherSize > 0 ? outPlaintext.data() : NULL;
+        PUCHAR ptBuffer = actualCipherSize > 0 ? tempPlaintext.data() : NULL;
 
-        if (BCryptDecrypt(hKey, ctBuffer, (ULONG)actualCipherSize, &authInfo, ivTemp, sizeof(ivTemp), 
+        if (BCryptDecrypt(localKey, ctBuffer, (ULONG)actualCipherSize, &authInfo, ivTemp, sizeof(ivTemp), 
                           ptBuffer, (ULONG)actualCipherSize, &cbResult, 0) != STATUS_SUCCESS) {
             outPlaintext.clear();
             return false;
         }
 
         outPlaintext.resize(cbResult);
+        if (cbResult > 0) {
+            memcpy(outPlaintext.data(), tempPlaintext.data(), cbResult);
+        }
 
         return true;
     }

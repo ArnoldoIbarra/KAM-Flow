@@ -37,11 +37,40 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
+#include <avrt.h>
+#pragma comment(lib, "avrt.lib")
 
 namespace Audio {
 
     /// PIMPL: The WASAPI device enumerator instance.
     IMMDeviceEnumerator* pEnumerator = nullptr;
+
+    /// RAII helper for safely initializing and unitializing COM on background threads.
+    struct CoInitRAII {
+        CoInitRAII() { CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
+        ~CoInitRAII() { CoUninitialize(); }
+    };
+
+    /**
+     * @brief Registers the calling thread with Windows MMCSS for guaranteed real-time scheduling.
+     * MMCSS reserves a CPU time slice that no game or foreground app can steal.
+     * Falls back to THREAD_PRIORITY_TIME_CRITICAL if MMCSS registration fails.
+     * @param taskName The MMCSS task category (e.g., "Pro Audio").
+     * @param callerName A debug label for logging which thread registered.
+     * @return The MMCSS task handle (must be reverted on thread exit), or NULL on failure.
+     */
+    HANDLE RegisterMMCSS(const wchar_t* taskName, const char* callerName) {
+        DWORD taskIndex = 0;
+        HANDLE hTask = AvSetMmThreadCharacteristicsW(taskName, &taskIndex);
+        if (hTask) {
+            if (State::globalDebugMode) UI::LogDebug("[Audio] %s: MMCSS 'Pro Audio' registered (index=%u). Thread is scheduler-protected.", callerName, taskIndex);
+        } else {
+            // Fallback: MMCSS service may be disabled on exotic Windows configurations
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            if (State::globalDebugMode) UI::LogDebug("[Audio] %s: MMCSS registration failed (err=%lu). Falling back to TIME_CRITICAL.", callerName, GetLastError());
+        }
+        return hTask;
+    }
 
     // --- CLIENT CAPTURE THREAD ---
     /// The background thread that captures and streams client audio.
@@ -227,7 +256,7 @@ namespace Audio {
         outFormat.sampleRate = pWaveFormat->nSamplesPerSec;
         outFormat.channels = pWaveFormat->nChannels;
         
-        if (pWaveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        if (pWaveFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pWaveFormat->cbSize >= 22) {
             WAVEFORMATEXTENSIBLE* pEx = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pWaveFormat);
             if (IsEqualGUID(pEx->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
                 outFormat.bitDepth = 32; // Standardize on 32-bit float for mixing
@@ -276,8 +305,9 @@ namespace Audio {
      * @return void
      */
     void CaptureThreadLoop(AudioFormat targetFormat) {
-        // Mark thread as time-critical to prevent audio buffer underruns during heavy system load
-        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        CoInitRAII coInit;
+        // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
+        HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "CaptureThread");
 
         // 1. Get the default audio playback device (e.g., speakers).
         IMMDevice* pDevice = nullptr;
@@ -396,6 +426,7 @@ namespace Audio {
         }
 
         delete pTargetWaveFormat;
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (State::globalDebugMode) UI::LogDebug("[Audio] Loopback capture thread stopped.");
     }
 
@@ -423,8 +454,9 @@ namespace Audio {
      * @return void
      */
     void RenderThreadLoop() {
-        // Mark thread as time-critical to prevent audio buffer underruns during heavy system load
-        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        CoInitRAII coInit;
+        // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
+        HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "RenderThread");
 
         AudioFormat format;
         if (!GetDefaultDeviceFormat(format)) {
@@ -446,13 +478,28 @@ namespace Audio {
         // We will request to mix in 32-bit float format for highest quality.
         WAVEFORMATEX* pMixFormat = nullptr;
         hr = pAudioClient->GetMixFormat(&pMixFormat);
-        WAVEFORMATEXTENSIBLE* pEx = (WAVEFORMATEXTENSIBLE*)pMixFormat;
-        pEx->SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-        pEx->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-        pEx->Format.wBitsPerSample = 32;
-        pEx->Format.nBlockAlign = (pEx->Format.nChannels * pEx->Format.wBitsPerSample) / 8;
-        pEx->Format.nAvgBytesPerSec = pEx->Format.nSamplesPerSec * pEx->Format.nBlockAlign;
-        pEx->Samples.wValidBitsPerSample = 32;
+        
+        WAVEFORMATEXTENSIBLE extFormat;
+        ZeroMemory(&extFormat, sizeof(WAVEFORMATEXTENSIBLE));
+        if (pMixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pMixFormat->cbSize >= 22) {
+            memcpy(&extFormat, pMixFormat, sizeof(WAVEFORMATEXTENSIBLE));
+        } else {
+            memcpy(&extFormat.Format, pMixFormat, sizeof(WAVEFORMATEX));
+            // Provide a sensible default channel mask if the device didn't natively provide one
+            if (extFormat.Format.nChannels == 1) extFormat.dwChannelMask = KSAUDIO_SPEAKER_MONO;
+            else if (extFormat.Format.nChannels == 2) extFormat.dwChannelMask = KSAUDIO_SPEAKER_STEREO;
+            else if (extFormat.Format.nChannels == 4) extFormat.dwChannelMask = KSAUDIO_SPEAKER_QUAD;
+            else if (extFormat.Format.nChannels == 6) extFormat.dwChannelMask = KSAUDIO_SPEAKER_5POINT1;
+            else if (extFormat.Format.nChannels == 8) extFormat.dwChannelMask = KSAUDIO_SPEAKER_7POINT1;
+        }
+
+        extFormat.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        extFormat.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+        extFormat.Format.wBitsPerSample = 32;
+        extFormat.Format.cbSize = 22;
+        extFormat.Format.nBlockAlign = (extFormat.Format.nChannels * extFormat.Format.wBitsPerSample) / 8;
+        extFormat.Format.nAvgBytesPerSec = extFormat.Format.nSamplesPerSec * extFormat.Format.nBlockAlign;
+        extFormat.Samples.wValidBitsPerSample = 32;
 
         g_hRenderEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         if (!g_hRenderEvent) {
@@ -462,7 +509,7 @@ namespace Audio {
             return;
         }
 
-        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, &pEx->Format, nullptr);
+        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, 0, 0, &extFormat.Format, nullptr);
         if (FAILED(hr)) {
             if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: IAudioClient Initialize failed.");
             CloseHandle(g_hRenderEvent);
@@ -554,8 +601,8 @@ namespace Audio {
                     float vol = activeVolumes[i];
 
                     size_t availableBytes = 0;
+                    size_t bytesRead = 0;
                     bool isBuffering = false;
-                    bool justStartedBuffering = false;
 
                     {
                         // Scope the lock tightly to just the memory extraction to prevent network thread convoying
@@ -563,28 +610,54 @@ namespace Audio {
                         
                         availableBytes = queue->buffer.Size();
                         if (queue->isBuffering) {
+                            // Still in initial buffering mode - play silence until jitter buffer fills
                             isBuffering = true;
-                        } else if (availableBytes < bytesToProcess) {
+                        } else if (availableBytes == 0) {
+                            // Complete starvation - re-enter buffering mode to rebuild the jitter buffer
                             queue->isBuffering = true;
                             isBuffering = true;
-                            justStartedBuffering = true;
-                        } else {
-                            if (linearBuffer.size() < bytesToProcess) {
-                                linearBuffer.resize(bytesToProcess);
+                            if (State::globalDebugMode) { 
+                                UI::LogDebug("[Audio Debug] Starvation! (Requested %zu, Have 0). Returning to Jitter Buffering mode.", bytesToProcess);
                             }
-                            queue->buffer.Pop(linearBuffer.data(), bytesToProcess);
+                        } else {
+                            // PARTIAL FILL: Play whatever audio IS available, even if less than requested.
+                            // This prevents one slow packet from triggering a catastrophic 50ms re-buffering pause
+                            // that causes the vicious starvation loop from hardware clock drift.
+                            bytesRead = (std::min)(availableBytes, bytesToProcess);
+                            
+                            // Align to frame boundaries to prevent mid-sample splits (causes static/clicks)
+                            bytesRead = bytesRead - (bytesRead % bytesPerFrame);
+
+                            if (bytesRead > 0) {
+                                if (linearBuffer.size() < bytesToProcess) {
+                                    linearBuffer.resize(bytesToProcess);
+                                }
+                                // Zero the entire extraction buffer first so the unfilled tail is silence
+                                memset(linearBuffer.data(), 0, bytesToProcess);
+                                queue->buffer.Pop(linearBuffer.data(), bytesRead);
+                            }
                         }
                     } // Mutex instantly released! Network thread is free to push new data.
 
                     if (isBuffering) {
-                        if (justStartedBuffering && State::globalDebugMode) { 
-                            UI::LogDebug("[Audio Debug] Starvation! (Requested %zu, Have %zu). Returning to Jitter Buffering mode.", bytesToProcess, availableBytes);
-                        }
                         continue; 
                     }
 
-                    size_t bytesToMix = bytesToProcess;
-                    size_t framesToMix = bytesToMix / bytesPerFrame;
+                    if (bytesRead == 0) continue;
+
+                    // Log partial fills (only when significant data is missing, rate-limited)
+                    if (bytesRead < bytesToProcess && State::globalDebugMode) {
+                        static uint64_t lastPartialLog = 0;
+                        uint64_t now = GetTickCount64();
+                        if (now - lastPartialLog > 2000) {
+                            UI::LogDebug("[Audio Debug] Partial fill: Got %zu/%zu bytes (%.0f%%). Padding remainder with silence.", 
+                                         bytesRead, bytesToProcess, (100.0 * bytesRead / bytesToProcess));
+                            lastPartialLog = now;
+                        }
+                    }
+
+                    // Mix the data we have (including the zero-padded tail) into the master buffer
+                    size_t framesToMix = bytesToProcess / bytesPerFrame;
                     size_t samplesToMix = framesToMix * pMixFormat->nChannels;
                     
                     if (format.bitDepth == 16) {
@@ -617,6 +690,7 @@ namespace Audio {
         CloseHandle(g_hRenderEvent);
         g_hRenderEvent = NULL;
         g_hasRenderFormat = false;
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (State::globalDebugMode) UI::LogDebug("[Audio] Audio renderer thread stopped.");
     }
 
@@ -647,8 +721,9 @@ namespace Audio {
      * @return void
      */
     void ServerMicCaptureThreadLoop(AudioFormat targetFormat) {
-        // Mark thread as time-critical to prevent audio buffer underruns during heavy system load
-        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        CoInitRAII coInit;
+        // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
+        HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "ServerMicCapture");
 
         IMMDevice* pDevice = nullptr;
         // eCapture for microphones, eConsole to respect the standard Windows Default Recording Device
@@ -731,6 +806,7 @@ namespace Audio {
         pCaptureClient->Release();
         pAudioClient->Release();
         delete pTargetWaveFormat;
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
 
         if (State::globalDebugMode) UI::LogDebug("[Audio] Server Microphone broadcast stopped.");
     }
@@ -818,8 +894,9 @@ namespace Audio {
      * @brief Plays the incoming microphone stream into the target device.
      */
     void ClientMicRenderThreadLoop(AudioFormat sourceFormat) {
-        // Mark thread as time-critical to prevent audio buffer underruns during heavy system load
-        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        CoInitRAII coInit;
+        // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
+        HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "ClientMicRender");
 
         IMMDevice* pDevice = nullptr;
         HRESULT hr = GetAudioDevice(&pDevice);
@@ -918,6 +995,7 @@ namespace Audio {
         pRenderClient->Release();
         pAudioClient->Release();
         delete pSourceFormat;
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (State::globalDebugMode) UI::LogDebug("[Audio] Client Microphone Receiver stopped.");
     }
 
@@ -1053,8 +1131,13 @@ namespace Audio {
                 excess = excess - (excess % frameSize);
                 
                 if (excess > 0) {
-                    if (State::globalDebugMode) { // Log every overrun event in debug mode
-                        UI::LogDebug("[Audio Debug] OVERRUN! Dropping %zu oldest bytes to maintain %.0fms latency target.", excess, LATENCY_TARGET_MS);
+                    if (State::globalDebugMode) { 
+                        static uint64_t lastOverrunLog = 0;
+                        uint64_t now = GetTickCount64();
+                        if (now - lastOverrunLog > 500) {
+                            UI::LogDebug("[Audio Debug] OVERRUN! Dropping oldest bytes to maintain %.0fms latency target. (Rate-limited log)", LATENCY_TARGET_MS);
+                            lastOverrunLog = now;
+                        }
                     }
                     pQueue->buffer.Drop(excess);
                 }

@@ -22,11 +22,16 @@
 #include "UIManager.h"
 #include <iostream>
 #include <ws2tcpip.h>
+#include <map>
 #include <thread>
 #include <atomic>
 #include <vector>
 #include <mutex>
 #include <chrono>
+#include <bcrypt.h>
+#include <avrt.h>
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "avrt.lib")
 
 namespace Network {
 
@@ -36,12 +41,17 @@ namespace Network {
     std::vector<ConnectedClientInfo> activeClients;
     /// Mutex protecting the active clients list.
     std::mutex clientsMutex;
-    /// Mutex to prevent interleaved sends and deadlocks when broadcasting.
-    std::mutex serverSendMutex;
+    /// Per-client send mutexes to prevent interleaved TCP writes without global serialization.
+    /// Protected by clientsMutex for additions/removals. shared_ptr ensures the mutex stays alive
+    /// even if a client disconnects while another thread is mid-send (the pointer keeps it valid).
+    std::map<SOCKET, std::shared_ptr<std::mutex>> clientSendMutexes;
     /// Background thread for accepting incoming TCP connections.
     std::thread serverThread;   
     /// Control flag for the TCP server lifecycle.
     std::atomic<bool> isRunning(false);
+
+    /// Zero-cost atomic flag indicating if any clients are currently connected.
+    std::atomic<bool> g_hasClients(false);
 
     /// The active 8-digit security PIN loaded from the Credential Manager.
     std::string activeServerPin;
@@ -77,8 +87,9 @@ namespace Network {
      * @return void
      */
     void RegenerateMasterPin() {
-        srand((unsigned int)time(NULL));
-        activeServerPin = std::to_string(10000000 + (rand() % 90000000));
+        uint32_t rng;
+        BCryptGenRandom(NULL, (PUCHAR)&rng, sizeof(rng), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        activeServerPin = std::to_string(10000000 + (rng % 90000000));
         CredentialManager::SaveSecret("KAMFlow_LocalServer", activeServerPin);
         
         std::lock_guard<std::mutex> lock(clientsMutex);
@@ -92,8 +103,7 @@ namespace Network {
      * @return true if at least one client is ready to receive input.
      */
     bool HasAuthenticatedClients() {
-        std::lock_guard<std::mutex> lock(clientsMutex);
-        return !activeClients.empty();
+        return g_hasClients.load(std::memory_order_relaxed);
     }
 
     /**
@@ -112,6 +122,13 @@ namespace Network {
      */
     void DisconnectClient(SOCKET clientSocket) {
         shutdown(clientSocket, SD_BOTH); // Abort the connection safely; the listener thread will clean up the socket.
+        std::lock_guard<std::mutex> lock(clientsMutex);
+        for (const auto& c : activeClients) {
+            if (c.socket == clientSocket && c.audioSocket != INVALID_SOCKET) {
+                shutdown(c.audioSocket, SD_BOTH);
+                break;
+            }
+        }
     }
 
     /**
@@ -191,7 +208,7 @@ namespace Network {
     bool GetClientAudioState(SOCKET clientSocket, bool& isEnabled, float& volume) {
         std::lock_guard<std::mutex> lock(clientsMutex);
         for (const auto& c : activeClients) {
-            if (c.socket == clientSocket) {
+            if (c.socket == clientSocket || c.audioSocket == clientSocket) {
                 isEnabled = c.isAudioEnabled;
                 volume = c.audioVolume;
                 return true;
@@ -250,12 +267,66 @@ namespace Network {
     }
 
     /**
+     * @brief Dedicated thread for handling the audio OOB socket (EVENT_AUDIO_DATA and EVENT_MIC_DATA).
+     * @param clientSocket The authenticated OOB audio socket connection.
+     * @return void
+     */
+    void ClientAudioListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
+        uint32_t rxSequence = initialRxSequence;
+        while (isRunning) {
+            PacketHeader header;
+            int bytes = recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL);
+            if (bytes <= 0) break;
+
+            if (header.magic == PACKET_MAGIC) {
+                if (header.payloadSize > MAX_PAYLOAD_SIZE) break;
+
+                std::vector<uint8_t> rawPayload(header.payloadSize);
+                if (header.payloadSize > 0) {
+                    int pBytes = recv(clientSocket, (char*)rawPayload.data(), header.payloadSize, MSG_WAITALL);
+                    if (pBytes != static_cast<int>(header.payloadSize)) break;
+                }
+
+                if (header.sequenceNumber <= rxSequence && header.sequenceNumber != 0) continue;
+                rxSequence = header.sequenceNumber;
+
+                std::vector<uint8_t> decrypted;
+                const uint8_t* finalPayload = rawPayload.data();
+                size_t finalSize = rawPayload.size();
+
+                bool isEncrypted = (header.type != MessageType::EVENT_AUTH_AUDIO);
+                if (isEncrypted) {
+                    if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &header, sizeof(header), decrypted)) continue;
+                    finalPayload = decrypted.data();
+                    finalSize = decrypted.size();
+                }
+
+                if (header.type == MessageType::EVENT_HEARTBEAT) continue; // Keep socket alive
+
+                if (header.type == MessageType::EVENT_AUDIO_DATA) {
+                    bool isEnabled = true;
+                    float vol = 1.0f;
+                    GetClientAudioState(clientSocket, isEnabled, vol); // NOTE: clientSocket won't match here, need to match main socket if we check by socket. Wait!
+                    // Fix GetClientAudioState to check c.audioSocket as well!
+                    if (isEnabled) {
+                        Audio::HandleAudioData(clientSocket, finalPayload, finalSize);
+                    }
+                } else if (header.type == MessageType::EVENT_MIC_DATA) {
+                    // Server receives mic data from client? No, server sends mic data. Wait, client could send mic data in the future.
+                }
+            }
+        }
+        closesocket(clientSocket);
+    }
+
+    /**
      * @brief Dedicated thread for an authenticated client to listen for return control commands.
      * @param clientSocket The authenticated socket connection.
      * @return void
      */
     void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
         uint32_t rxSequence = initialRxSequence;
+        int rxHbCount = 0;
         while (isRunning) {
             PacketHeader header;
             int bytes = recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL);
@@ -308,7 +379,6 @@ namespace Network {
                 }
 
                 if (header.type == MessageType::EVENT_HEARTBEAT) {
-                    static int rxHbCount = 0;
                     if (++rxHbCount % 10 == 0 && State::globalDebugMode) {
                         UI::LogDebug("[Network Server] Received Keep-Alive Heartbeat from Client.");
                     }
@@ -368,7 +438,13 @@ namespace Network {
         std::lock_guard<std::mutex> lock(clientsMutex);
         for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
             if (it->socket == clientSocket) {
+                if (it->audioSocket != INVALID_SOCKET) {
+                    shutdown(it->audioSocket, SD_BOTH);
+                    clientSendMutexes.erase(it->audioSocket);
+                }
                 activeClients.erase(it);
+                g_hasClients.store(!activeClients.empty(), std::memory_order_relaxed);
+                clientSendMutexes.erase(clientSocket);
                 break;
             }
         }
@@ -407,7 +483,7 @@ namespace Network {
 
                 PacketHeader header;
                 if (recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL) > 0 && 
-                    header.magic == PACKET_MAGIC && header.type == MessageType::EVENT_AUTH) {
+                    header.magic == PACKET_MAGIC && (header.type == MessageType::EVENT_AUTH || header.type == MessageType::EVENT_AUTH_AUDIO)) {
                     
                     // Validate authentication payload bounds to prevent overflow attacks.
                     if (header.payloadSize >= sizeof(AuthPayload) && header.payloadSize <= MAX_PAYLOAD_SIZE) {
@@ -457,12 +533,62 @@ namespace Network {
 
                                 int flag = 1;
                                 setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+                                
+                                int tos = 0xB8; // DSCP 46 (Expedited Forwarding) for Voice/Real-Time priority
+                                setsockopt(clientSocket, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos));
 
                                 char ipStr[INET_ADDRSTRLEN];
                                 inet_ntop(AF_INET, &(clientAddr.sin_addr), ipStr, INET_ADDRSTRLEN);
                                 
                                 char safeName[33] = {0};
                                 memcpy(safeName, auth.clientName, 32);
+
+                                if (header.type == MessageType::EVENT_AUTH_AUDIO) {
+                                    if (State::globalDebugMode) UI::LogDebug("[Network Server] Client Audio OOB Socket Connected.");
+                                    
+                                    // Limit audio buffer sizes to prevent deep OS-level bufferbloat during network spikes
+                                    int audioBufSize = 65536;
+                                    setsockopt(clientSocket, SOL_SOCKET, SO_RCVBUF, (char*)&audioBufSize, sizeof(audioBufSize));
+                                    setsockopt(clientSocket, SOL_SOCKET, SO_SNDBUF, (char*)&audioBufSize, sizeof(audioBufSize));
+
+                                    bool found = false;
+                                    {
+                                        std::lock_guard<std::mutex> lock(clientsMutex);
+                                        for (auto& c : activeClients) {
+                                            if (strncmp(c.name.c_str(), safeName, 32) == 0) {
+                                                c.audioSocket = clientSocket;
+                                                clientSendMutexes[clientSocket] = std::make_shared<std::mutex>();
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (found) {
+                                        auto threadInfo = std::make_shared<ClientThreadInfo>();
+                                        threadInfo->thread = std::thread([clientSocket, seq = header.sequenceNumber, threadInfo]() {
+                                            // Register with MMCSS to guarantee CPU scheduling for audio receive/decrypt
+                                            DWORD taskIndex = 0;
+                                            HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+                                            if (!hMmcss) {
+                                                ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                                            } else {
+                                                if (State::globalDebugMode) UI::LogDebug("[Network Server] AudioListenerLoop: MMCSS registered (index=%u).", taskIndex);
+                                            }
+                                            ClientAudioListenerLoop(clientSocket, seq);
+                                            if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
+                                            threadInfo->isFinished = true;
+                                        });
+                                        
+                                        {
+                                            std::lock_guard<std::mutex> lock(clientThreadsListMutex);
+                                            activeClientThreadsList.push_back(threadInfo);
+                                        }
+                                    } else {
+                                        closesocket(clientSocket);
+                                    }
+                                    continue;
+                                }
 
                                 int targetX = 0, targetY = 0;
                                 bool loaded = Config::LoadClientLayout(safeName, targetX, targetY);
@@ -497,7 +623,9 @@ namespace Network {
                                             }
                                         }
                                     }
-                                    activeClients.push_back({clientSocket, ipStr, safeName, 1.0f, true, true, targetX, targetY});
+                                    activeClients.push_back({clientSocket, INVALID_SOCKET, ipStr, safeName, 1.0f, true, true, targetX, targetY});
+                                    g_hasClients.store(true, std::memory_order_relaxed);
+                                    clientSendMutexes[clientSocket] = std::make_shared<std::mutex>();
                                     Config::SaveClientLayout(safeName, targetX, targetY);
                                 }
 
@@ -532,8 +660,9 @@ namespace Network {
 
         if (!CredentialManager::LoadSecret("KAMFlow_LocalServer", activeServerPin)) {
             // First boot: Generate a secure 8-digit random PIN
-            srand((unsigned int)time(NULL));
-            activeServerPin = std::to_string(10000000 + (rand() % 90000000));
+            uint32_t rng;
+            BCryptGenRandom(NULL, (PUCHAR)&rng, sizeof(rng), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            activeServerPin = std::to_string(10000000 + (rng % 90000000));
             CredentialManager::SaveSecret("KAMFlow_LocalServer", activeServerPin);
             if (State::globalDebugMode) UI::LogDebug("[Security] Generated new Master PIN: %s", activeServerPin.c_str());
         }
@@ -566,13 +695,29 @@ namespace Network {
 
         serverHeartbeatThread = std::thread([]() {
             ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            int txHbCount = 0;
             while (isRunning) {
                 for (int i = 0; i < 20 && isRunning; ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
                 if (isRunning) {
                     BroadcastMessage(MessageType::EVENT_HEARTBEAT, nullptr, 0);
-                    static int txHbCount = 0;
+                    
+                    // Manually send heartbeats to the OOB audio sockets to prevent SO_RCVTIMEO disconnects.
+                    {
+                        std::lock_guard<std::mutex> lock(clientsMutex);
+                        for (const auto& client : activeClients) {
+                            if (client.audioSocket != INVALID_SOCKET) {
+                                auto it = clientSendMutexes.find(client.audioSocket);
+                                if (it != clientSendMutexes.end()) {
+                                    PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_HEARTBEAT, 0, ++serverTxSequence };
+                                    std::lock_guard<std::mutex> sockLock(*(it->second));
+                                    send(client.audioSocket, (const char*)&h, sizeof(h), 0);
+                                }
+                            }
+                        }
+                    }
+
                     if (++txHbCount % 10 == 0 && State::globalDebugMode) {
                         UI::LogDebug("[Network Server] Sent Keep-Alive Heartbeat to Clients.");
                     }
@@ -600,7 +745,11 @@ namespace Network {
             std::lock_guard<std::mutex> lock(clientsMutex);
             for (const auto& client : activeClients) {
                 shutdown(client.socket, SD_BOTH);
+                if (client.audioSocket != INVALID_SOCKET) {
+                    shutdown(client.audioSocket, SD_BOTH);
+                }
             }
+            clientSendMutexes.clear();
         }
         
         if (serverThread.joinable()) serverThread.join();
@@ -630,11 +779,22 @@ namespace Network {
      * @return true if data was sent to at least one client.
      */
     bool BroadcastMessage(MessageType type, const void* payload, size_t payloadSize) {
-        std::vector<SOCKET> targets;
+        // Snapshot targets WITH their per-client send mutexes so we don't hold clientsMutex during send().
+        struct SendTarget { SOCKET sock; std::shared_ptr<std::mutex> mtx; };
+        std::vector<SendTarget> targets;
         {
             std::lock_guard<std::mutex> lock(clientsMutex);
             if (activeClients.empty()) return false;
-            for (const auto& c : activeClients) targets.push_back(c.socket);
+            for (const auto& c : activeClients) {
+                SOCKET targetSock = c.socket;
+                if ((type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) && c.audioSocket != INVALID_SOCKET) {
+                    targetSock = c.audioSocket;
+                }
+                auto it = clientSendMutexes.find(targetSock);
+                if (it != clientSendMutexes.end()) {
+                    targets.push_back({targetSock, it->second});
+                }
+            }
         }
 
         PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
@@ -656,16 +816,17 @@ namespace Network {
             memcpy(buffer.data() + sizeof(h), payload, payloadSize);
         }
 
-        std::lock_guard<std::mutex> sendLock(serverSendMutex);
-        uint64_t tStart = GetTickCount64();
-        for (SOCKET s : targets) {
-            if (send(s, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
-                shutdown(s, SD_BOTH); // Force the listener loop to sever the dead socket.
+        // Per-client send: a congested Client A no longer blocks sends to Client B from other threads.
+        for (auto& t : targets) {
+            std::lock_guard<std::mutex> sendLock(*t.mtx);
+            uint64_t tStart = GetTickCount64();
+            if (send(t.sock, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
+                shutdown(t.sock, SD_BOTH); // Force the listener loop to sever the dead socket.
             }
-        }
-        uint64_t tEnd = GetTickCount64();
-        if (State::globalDebugMode && (tEnd - tStart) > 50) {
-            UI::LogDebug("[Network Server] WARNING: BroadcastMessage blocked for %llu ms! TCP Window congested.", (unsigned long long)(tEnd - tStart));
+            uint64_t tEnd = GetTickCount64();
+            if (State::globalDebugMode && (tEnd - tStart) > 50) {
+                UI::LogDebug("[Network Server] WARNING: send() to client blocked for %llu ms! TCP congested.", (unsigned long long)(tEnd - tStart));
+            }
         }
 
         return true;
@@ -678,12 +839,19 @@ namespace Network {
      * @return true if data was sent to at least one client.
      */
     bool BroadcastClipboardMessage(const void* payload, size_t payloadSize) {
-        std::vector<SOCKET> targets;
+        // Snapshot clipboard-enabled targets with their per-client send mutexes.
+        struct SendTarget { SOCKET sock; std::shared_ptr<std::mutex> mtx; };
+        std::vector<SendTarget> targets;
         {
             std::lock_guard<std::mutex> lock(clientsMutex);
             if (activeClients.empty()) return false;
             for (const auto& c : activeClients) {
-                if (c.isClipboardEnabled) targets.push_back(c.socket);
+                if (c.isClipboardEnabled) {
+                    auto it = clientSendMutexes.find(c.socket);
+                    if (it != clientSendMutexes.end()) {
+                        targets.push_back({c.socket, it->second});
+                    }
+                }
             }
         }
         if (targets.empty()) return false;
@@ -701,10 +869,11 @@ namespace Network {
             return false;
         }
 
-        std::lock_guard<std::mutex> sendLock(serverSendMutex);
-        for (SOCKET s : targets) {
-            if (send(s, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
-                shutdown(s, SD_BOTH);
+        // Per-client send: clipboard delivery to each client is independently locked.
+        for (auto& t : targets) {
+            std::lock_guard<std::mutex> sendLock(*t.mtx);
+            if (send(t.sock, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
+                shutdown(t.sock, SD_BOTH);
             }
         }
         return true;
@@ -721,12 +890,32 @@ namespace Network {
             memcpy(buffer.data(), &h, sizeof(h));
             memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
             
-            std::lock_guard<std::mutex> sendLock(serverSendMutex);
+            // Lock only this specific client's send mutex, not a global lock.
+            std::shared_ptr<std::mutex> sendMtx;
+            SOCKET targetSock = clientSocket;
+            {
+                std::lock_guard<std::mutex> lock(clientsMutex);
+                for (const auto& c : activeClients) {
+                    if (c.socket == clientSocket || c.audioSocket == clientSocket) {
+                        if ((type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) && c.audioSocket != INVALID_SOCKET) {
+                            targetSock = c.audioSocket;
+                        } else {
+                            targetSock = c.socket;
+                        }
+                        break;
+                    }
+                }
+                auto it = clientSendMutexes.find(targetSock);
+                if (it != clientSendMutexes.end()) sendMtx = it->second;
+            }
+            if (!sendMtx) return false; // Client disconnected before we could send
+            
+            std::lock_guard<std::mutex> sendLock(*sendMtx);
             uint64_t tStart = GetTickCount64();
-            int res = send(clientSocket, (const char*)buffer.data(), (int)buffer.size(), 0);
+            int res = send(targetSock, (const char*)buffer.data(), (int)buffer.size(), 0);
             uint64_t tEnd = GetTickCount64();
             if (State::globalDebugMode && (tEnd - tStart) > 50) {
-                UI::LogDebug("[Network Server] WARNING: SendToClient blocked for %llu ms! TCP Window congested.", (unsigned long long)(tEnd - tStart));
+                UI::LogDebug("[Network Server] WARNING: SendToClient blocked for %llu ms! TCP congested.", (unsigned long long)(tEnd - tStart));
             }
             return res != SOCKET_ERROR;
         }

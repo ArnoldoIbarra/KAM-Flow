@@ -644,9 +644,7 @@ namespace UI {
                     }
                     DrawWrappedTooltip("Generate a new random PIN and instantly disconnect all currently active clients.");
                 } else { // Client
-                    int tabFlags = 0;
                     if (focusPairingTab) {
-                        tabFlags = ImGuiTabItemFlags_SetSelected;
                         focusPairingTab = false;
                     }
 
@@ -1053,9 +1051,7 @@ namespace UI {
                 ImGui::Text("Engine & Debug");
                 ImGui::Separator();
                 
-                if (ImGui::Checkbox("Show Debug Console Tab", &State::globalDebugMode)) {
-                    State::UpdateConsoleVisibility();
-                }
+                ImGui::Checkbox("Show Debug Console Tab", &State::globalDebugMode);
                 DrawWrappedTooltip("Show or hide the real-time diagnostic console tab for troubleshooting.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();

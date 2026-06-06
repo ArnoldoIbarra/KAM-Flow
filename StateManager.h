@@ -42,9 +42,6 @@ namespace State {
     /// Helper to check if the system is currently in Remote mode.
     bool IsRemote();
 
-    /// Dynamically shows or hides the allocated Win32 Console window based on globalDebugMode.
-    void UpdateConsoleVisibility();
-
     /// Master toggle for rendering the console window and enabling verbose std::cout logging.
     extern bool globalDebugMode;
 

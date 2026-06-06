@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <string>
 #include <vector>
+#include <atomic>
 #include "NetworkMessages.h"
 
 /// Namespace managing network server operations and incoming client connections.
@@ -30,6 +31,7 @@ namespace Network {
     /// Structure containing information about an actively connected client.
     struct ConnectedClientInfo {
         SOCKET socket;           ///< The TCP socket handle.
+        SOCKET audioSocket;      ///< The OOB TCP socket for audio data.
         std::string ip;          ///< IPv4 address of the client.
         std::string name;        ///< Hostname of the client PC.
         float audioVolume;       ///< Local mixing volume for this client (0.0f to 1.0f).
@@ -50,6 +52,9 @@ namespace Network {
 
     /// Checks if there are any clients currently connected and authenticated.
     bool HasAuthenticatedClients();
+
+    /// Zero-cost atomic flag indicating if any clients are currently connected.
+    extern std::atomic<bool> g_hasClients;
 
     /// Retrieves a list of all currently connected and authenticated clients.
     std::vector<ConnectedClientInfo> GetConnectedClients();

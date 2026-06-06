@@ -35,7 +35,7 @@ namespace Input {
      */
     LRESULT CALLBACK KeyboardHookCallback(int nCode, WPARAM wParam, LPARAM lParam) {
         if (nCode >= 0) {
-            if (!Network::HasAuthenticatedClients()) {
+            if (!Network::g_hasClients.load(std::memory_order_relaxed)) {
                 return CallNextHookEx(globalKeyboardHook, nCode, wParam, lParam);
             }
 

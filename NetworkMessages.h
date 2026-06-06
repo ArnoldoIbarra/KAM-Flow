@@ -39,6 +39,7 @@ namespace Network {
         EVENT_KEYBOARD,      ///< Keystroke data.
         EVENT_STATE,         ///< Control mode transition (Local vs Remote).
         EVENT_AUTH,          ///< Authentication payload containing the PIN.
+        EVENT_AUTH_AUDIO,    ///< Authentication payload for the dedicated audio OOB socket.
         EVENT_SYNC_CURSOR,   ///< Instructions to snap the cursor to a specific edge on the Client.
         EVENT_RETURN_CONTROL,///< Sent by Client to request control return.
         EVENT_UDP_BEACON,    ///< Sent via UDP broadcast for local network auto-discovery.

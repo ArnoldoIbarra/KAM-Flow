@@ -99,6 +99,7 @@ namespace ClipboardManager {
 
         wchar_t* pDst = (wchar_t*)GlobalLock(hg);
         if (!pDst) {
+            GlobalFree(hg);
             CloseClipboard();
             return;
         }

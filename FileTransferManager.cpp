@@ -44,6 +44,10 @@ namespace FileTransfer {
     };
     std::map<uint32_t, TransferContext> g_transfers;
 
+    std::vector<std::shared_ptr<std::thread>> g_transferThreads;
+    std::vector<SOCKET> g_activeSockets;
+    std::atomic<bool> g_isTransferManagerRunning(true);
+
     void ExecuteTransferIO(SOCKET sock, uint32_t transferId);
     void OOB_ServerTask(uint32_t transferId, uint16_t port);
     void OOB_ClientTask(uint32_t transferId, uint16_t port);
@@ -192,28 +196,44 @@ namespace FileTransfer {
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listenSock == INVALID_SOCKET) return;
 
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_activeSockets.push_back(listenSock);
+        }
+
         int opt = 1; setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
         sockaddr_in addr = {0};
         addr.sin_family = AF_INET; addr.sin_port = htons(port); addr.sin_addr.s_addr = INADDR_ANY;
 
-        if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Bind failed on port %u", port);
-            closesocket(listenSock); return;
+        if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR || listen(listenSock, 1) == SOCKET_ERROR) {
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Bind/Listen failed on port %u", port);
+            closesocket(listenSock); 
+            return;
         }
-        listen(listenSock, 1);
 
         sockaddr_in clientAddr; int clientSize = sizeof(clientAddr);
         SOCKET oobSock = accept(listenSock, (sockaddr*)&clientAddr, &clientSize);
         closesocket(listenSock); // Listener no longer needed
 
-        if (oobSock != INVALID_SOCKET) {
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_activeSockets.erase(std::remove(g_activeSockets.begin(), g_activeSockets.end(), listenSock), g_activeSockets.end());
+            if (oobSock != INVALID_SOCKET) {
+                g_activeSockets.push_back(oobSock);
+            }
+        }
+
+        if (oobSock != INVALID_SOCKET && g_isTransferManagerRunning) {
             int flag = 1; setsockopt(oobSock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
             DWORD timeout = 10000; // 10s idle teardown
             setsockopt(oobSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
             setsockopt(oobSock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
             ExecuteTransferIO(oobSock, transferId);
             closesocket(oobSock);
+
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_activeSockets.erase(std::remove(g_activeSockets.begin(), g_activeSockets.end(), oobSock), g_activeSockets.end());
         }
     }
 
@@ -245,16 +265,24 @@ namespace FileTransfer {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
-        if (connected) {
+        if (connected && g_isTransferManagerRunning) {
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_activeSockets.push_back(oobSock);
+            }
             int flag = 1; setsockopt(oobSock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
             DWORD timeout = 10000;
             setsockopt(oobSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
             setsockopt(oobSock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
             ExecuteTransferIO(oobSock, transferId);
+            closesocket(oobSock);
+
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_activeSockets.erase(std::remove(g_activeSockets.begin(), g_activeSockets.end(), oobSock), g_activeSockets.end());
         } else {
             if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Client failed to connect to %s:%u", serverIp.c_str(), port);
+            closesocket(oobSock);
         }
-        closesocket(oobSock);
     }
 
     /**
@@ -271,8 +299,26 @@ namespace FileTransfer {
      * @return void
      */
     void Shutdown() {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_pendingOffers.clear();
+        g_isTransferManagerRunning = false;
+        std::vector<std::shared_ptr<std::thread>> threadsToJoin;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_pendingOffers.clear();
+            for (SOCKET sock : g_activeSockets) {
+                if (sock != INVALID_SOCKET) {
+                    shutdown(sock, SD_BOTH);
+                    closesocket(sock);
+                }
+            }
+            g_activeSockets.clear();
+            threadsToJoin = g_transferThreads;
+            g_transferThreads.clear();
+        }
+        
+        for (auto& t : threadsToJoin) {
+            if (t && t->joinable()) t->join();
+        }
+
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Manager Shutdown.");
     }
 
@@ -377,12 +423,14 @@ namespace FileTransfer {
         acceptPayload.tcpPort = 8082; // Default out-of-band streaming port
         
         if (State::currentRole == State::AppRole::SERVER) {
-            std::thread(OOB_ServerTask, transferId, acceptPayload.tcpPort).detach();
+            auto t = std::make_shared<std::thread>(OOB_ServerTask, transferId, acceptPayload.tcpPort);
+            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
             if (targetSocket != INVALID_SOCKET) {
                 Network::SendToClient(targetSocket, Network::MessageType::EVENT_FILE_ACCEPT, &acceptPayload, sizeof(acceptPayload));
             }
         } else {
-            std::thread(OOB_ClientTask, transferId, acceptPayload.tcpPort).detach();
+            auto t = std::make_shared<std::thread>(OOB_ClientTask, transferId, acceptPayload.tcpPort);
+            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
             Network::SendToServer(Network::MessageType::EVENT_FILE_ACCEPT, &acceptPayload, sizeof(acceptPayload));
         }
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u Accepted. Will save to: %s", transferId, saveDirectory.c_str());
@@ -453,9 +501,11 @@ namespace FileTransfer {
      */
     void HandleFileAccept(SOCKET senderSocket, const Network::FileAcceptPayload& payload) {
         if (State::currentRole == State::AppRole::SERVER) {
-            std::thread(OOB_ServerTask, payload.transferId, payload.tcpPort).detach();
+            auto t = std::make_shared<std::thread>(OOB_ServerTask, payload.transferId, payload.tcpPort);
+            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
         } else {
-            std::thread(OOB_ClientTask, payload.transferId, payload.tcpPort).detach();
+            auto t = std::make_shared<std::thread>(OOB_ClientTask, payload.transferId, payload.tcpPort);
+            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
         }
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u Accepted by remote host. Establishing OOB stream.", payload.transferId);
     }

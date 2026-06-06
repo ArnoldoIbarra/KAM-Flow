@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <vector>
 #include <mutex>
+#include <avrt.h>
+#pragma comment(lib, "avrt.lib")
 
 namespace Network {
 
@@ -38,12 +40,19 @@ namespace Network {
     std::atomic<bool> isClientRunning(false);
 
     /// Global transmit sequence counter.
-    std::atomic<uint32_t> clientTxSequence(0);
+    std::atomic<uint32_t> clientTxSequence{0};
 
     /// Mutex to prevent interleaved sends from KVM hooks vs heartbeat threads.
     std::mutex clientSendMutex;
     /// Background thread for keeping the connection alive.
     std::thread clientHeartbeatThread;
+
+    /// Active socket connected to the Server specifically for Audio OOB data.
+    SOCKET clientAudioSocket = INVALID_SOCKET;
+    /// Background thread processing incoming Audio OOB TCP packets.
+    std::thread clientAudioThread;
+    /// Mutex to prevent interleaved sends of audio data.
+    std::mutex clientAudioSendMutex;
 
     // UDP Discovery state variables.
     SOCKET udpListenerSocket = INVALID_SOCKET;
@@ -59,6 +68,7 @@ namespace Network {
     // Auto-Reconnect state variables.
     std::string lastConnectedIp = "";
     uint16_t lastConnectedPort = 0;
+    std::thread autoReconnectThread;
     std::atomic<bool> isIntentionalDisconnect(false);
     std::atomic<bool> isAutoReconnecting(false);
     std::atomic<bool> isCurrentSessionAutoReconnected(false);
@@ -87,9 +97,16 @@ namespace Network {
      * @return true if sent successfully.
      */
     bool SendToServer(MessageType type, const void* payload, size_t payloadSize) {
-        std::lock_guard<std::mutex> lock(clientSendMutex);
+        if (!isClientRunning) return false;
         
-        if (clientSocket == INVALID_SOCKET || !isClientRunning) return false;
+        SOCKET targetSock = clientSocket;
+        std::mutex* targetMutex = &clientSendMutex;
+        if ((type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) && clientAudioSocket != INVALID_SOCKET) {
+            targetSock = clientAudioSocket;
+            targetMutex = &clientAudioSendMutex;
+        }
+
+        if (targetSock == INVALID_SOCKET) return false;
 
         PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++clientTxSequence };
         std::vector<uint8_t> buffer;
@@ -109,15 +126,33 @@ namespace Network {
             memcpy(buffer.data(), &h, sizeof(h));
             memcpy(buffer.data() + sizeof(h), payload, payloadSize);
         }
-
-        uint64_t tStart = GetTickCount64();
-        int res = send(clientSocket, (const char*)buffer.data(), (int)buffer.size(), 0);
-        uint64_t tEnd = GetTickCount64();
-        
-        if (State::globalDebugMode && (tEnd - tStart) > 50) {
-            UI::LogDebug("[Network Client] WARNING: send() blocked for %llu ms! TCP Window may be congested.", (unsigned long long)(tEnd - tStart));
+        if (!buffer.empty()) {
+            std::lock_guard<std::mutex> lock(*targetMutex);
+            int res = send(targetSock, (const char*)buffer.data(), (int)buffer.size(), 0);
+            return res != SOCKET_ERROR;
         }
-        return res != SOCKET_ERROR;
+        return false;
+    }
+
+    /**
+     * @brief Specially sends a Keep-Alive heartbeat on the specified socket to prevent SO_RCVTIMEO disconnects.
+     */
+    void SendHeartbeatToSocket(SOCKET sock, std::mutex& sockMutex) {
+        if (sock == INVALID_SOCKET) return;
+        
+        PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_HEARTBEAT, 0, ++clientTxSequence };
+        std::vector<uint8_t> buffer;
+        std::vector<uint8_t> ciphertext;
+        
+        h.payloadSize = 28; // 12-byte IV + 16-byte Tag overhead for a 0-byte payload
+        if (Security::EncryptPayload(nullptr, 0, &h, sizeof(h), ciphertext)) {
+            buffer.resize(sizeof(h) + ciphertext.size());
+            memcpy(buffer.data(), &h, sizeof(h));
+            memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
+            
+            std::lock_guard<std::mutex> lock(sockMutex);
+            send(sock, (const char*)buffer.data(), (int)buffer.size(), 0);
+        }
     }
 
     /**
@@ -274,10 +309,56 @@ namespace Network {
         if (discoveryThread.joinable()) discoveryThread.join();
         std::lock_guard<std::mutex> lock(discoveryMutex);
         discoveredServers.clear();
+        WSACleanup();
     }
 
     /**
-     * @brief Background loop that handles receiving, decrypting, and dispatching payloads.
+     * @brief Dedicated thread for handling the audio OOB socket.
+     * @return void
+     */
+    void ClientAudioLoop() {
+        uint32_t rxSequence = 0;
+        while (isClientRunning && clientAudioSocket != INVALID_SOCKET) {
+            PacketHeader h;
+            int bytes = recv(clientAudioSocket, (char*)&h, sizeof(h), MSG_WAITALL);
+            if (bytes <= 0) break;
+
+            if (h.magic == PACKET_MAGIC) {
+                if (h.payloadSize > MAX_PAYLOAD_SIZE) break;
+
+                std::vector<uint8_t> rawPayload(h.payloadSize);
+                if (h.payloadSize > 0) {
+                    int pBytes = recv(clientAudioSocket, (char*)rawPayload.data(), h.payloadSize, MSG_WAITALL);
+                    if (pBytes != static_cast<int>(h.payloadSize)) break;
+                }
+
+                if (h.sequenceNumber <= rxSequence && h.sequenceNumber != 0) continue;
+                rxSequence = h.sequenceNumber;
+
+                std::vector<uint8_t> decrypted;
+                const uint8_t* finalPayload = rawPayload.data();
+                size_t finalSize = rawPayload.size();
+
+                bool isEncrypted = (h.type != MessageType::EVENT_AUTH_AUDIO);
+                if (isEncrypted) {
+                    if (!Security::DecryptPayload(rawPayload.data(), rawPayload.size(), &h, sizeof(h), decrypted)) continue;
+                    finalPayload = decrypted.data();
+                    finalSize = decrypted.size();
+                }
+
+                if (h.type == MessageType::EVENT_HEARTBEAT) continue;
+
+                if (h.type == MessageType::EVENT_MIC_DATA) {
+                    if (finalSize > 0) {
+                        Audio::HandleMicData(finalPayload, finalSize);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Background loop for the Client that continually blocks on recv() parsing incoming network packets.
      * @return void
      */
     void ClientLoop() {
@@ -449,9 +530,7 @@ namespace Network {
                 }
             }
             else if (h.type == MessageType::EVENT_MIC_DATA) {
-                if (finalSize > 0) {
-                    Audio::HandleMicData(finalPayload, finalSize);
-                }
+                // Handled in ClientAudioLoop, should not arrive here but ignored safely if it does.
             }
             else if (h.type == MessageType::EVENT_FILE_OFFER) {
                 if (finalSize == sizeof(FileOfferPayload)) {
@@ -486,7 +565,11 @@ namespace Network {
                 State::SetClientStatus("Connection dropped. Auto-reconnecting in 5s...");
                 if (State::globalDebugMode) UI::LogDebug("[Network Client] Connection dropped unintentionally. Preparing to auto-reconnect...");
                 
-                std::thread([]() {
+                if (autoReconnectThread.joinable()) {
+                    autoReconnectThread.join();
+                }
+                
+                autoReconnectThread = std::thread([]() {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     if (!isIntentionalDisconnect && State::enableClientAutoReconnect) {
                         if (State::globalDebugMode) UI::LogDebug("[Network Client] Attempting auto-reconnect to %s:%u...", lastConnectedIp.c_str(), lastConnectedPort);
@@ -495,7 +578,7 @@ namespace Network {
                         }
                     }
                     isAutoReconnecting = false;
-                }).detach();
+                });
             }
         }
     }
@@ -567,6 +650,9 @@ namespace Network {
         }
 
         int flag = 1; setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+        
+        int tos = 0xB8; // DSCP 46 (Expedited Forwarding) for Voice/Real-Time priority
+        setsockopt(clientSocket, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos));
 
         DWORD timeout = 5000;
         setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
@@ -588,6 +674,44 @@ namespace Network {
         State::SetClientStatus("Authenticating...");
         SendToServer(MessageType::EVENT_AUTH, &p, sizeof(p));
         
+        // Immediately connect the Audio OOB socket
+        clientAudioSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (clientAudioSocket != INVALID_SOCKET) {
+            if (connect(clientAudioSocket, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                setsockopt(clientAudioSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+                setsockopt(clientAudioSocket, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos));
+                setsockopt(clientAudioSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+                setsockopt(clientAudioSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeout, sizeof(sndTimeout));
+                
+                int audioBufSize = 65536;
+                setsockopt(clientAudioSocket, SOL_SOCKET, SO_RCVBUF, (char*)&audioBufSize, sizeof(audioBufSize));
+                setsockopt(clientAudioSocket, SOL_SOCKET, SO_SNDBUF, (char*)&audioBufSize, sizeof(audioBufSize));
+
+                // We send manually because SendToServer doesn't know about clientAudioSocket yet
+                PacketHeader authH = { PACKET_MAGIC, MessageType::EVENT_AUTH_AUDIO, static_cast<uint32_t>(sizeof(p)), 0 };
+                std::vector<uint8_t> authBuffer(sizeof(authH) + sizeof(p));
+                memcpy(authBuffer.data(), &authH, sizeof(authH));
+                memcpy(authBuffer.data() + sizeof(authH), &p, sizeof(p));
+                send(clientAudioSocket, (const char*)authBuffer.data(), (int)authBuffer.size(), 0);
+                
+                clientAudioThread = std::thread([]() {
+                    // Register with MMCSS to guarantee CPU scheduling for audio receive from server
+                    DWORD taskIndex = 0;
+                    HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+                    if (!hMmcss) {
+                        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                    } else {
+                        if (State::globalDebugMode) UI::LogDebug("[Network Client] AudioLoop: MMCSS registered (index=%u).", taskIndex);
+                    }
+                    ClientAudioLoop();
+                    if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
+                });
+            } else {
+                closesocket(clientAudioSocket);
+                clientAudioSocket = INVALID_SOCKET;
+            }
+        }
+
         State::SetClientStatus("Connected");
 
         clientThread = std::thread([]() {
@@ -599,12 +723,14 @@ namespace Network {
             ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             bool wasLocked = false;
             while (isClientRunning) {
-                // Sleep in short intervals to allow instant thread teardown on shutdown.
                 for (int i = 0; i < 20 && isClientRunning; ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
                 if (isClientRunning) {
-                    SendToServer(MessageType::EVENT_HEARTBEAT, nullptr, 0);
+                    SendHeartbeatToSocket(clientSocket, clientSendMutex);
+                    if (clientAudioSocket != INVALID_SOCKET) {
+                        SendHeartbeatToSocket(clientAudioSocket, clientAudioSendMutex);
+                    }
                     static int txHbCount = 0;
                     if (++txHbCount % 10 == 0 && State::globalDebugMode) {
                         UI::LogDebug("[Network Client] Sent Keep-Alive Heartbeat to Server.");
@@ -651,9 +777,16 @@ namespace Network {
             closesocket(clientSocket);
             clientSocket = INVALID_SOCKET;
         }
+        if (clientAudioSocket != INVALID_SOCKET) {
+            closesocket(clientAudioSocket);
+            clientAudioSocket = INVALID_SOCKET;
+        }
         if (clientThread.joinable()) clientThread.join();
+        if (clientAudioThread.joinable()) clientAudioThread.join();
         if (clientHeartbeatThread.joinable()) clientHeartbeatThread.join();
+        if (autoReconnectThread.joinable()) autoReconnectThread.join();
         Security::Shutdown();
+        WSACleanup();
         if (State::globalDebugMode) UI::LogDebug("[Network Client] Client successfully stopped.");
     }
 }

@@ -49,7 +49,6 @@ namespace Config {
 
         if (!fileExists) {
             SaveConfig("127.0.0.1", 8080);
-            State::UpdateConsoleVisibility(); // Ensure initial console state applies
             return true;
         }
 
@@ -60,9 +59,6 @@ namespace Config {
         // Load global debug and security preferences.
         State::globalDebugMode = GetPrivateProfileIntA("System", "GlobalDebugMode", 0, fullPath.c_str()) != 0;
         State::minimizeToTray = GetPrivateProfileIntA("System", "MinimizeToTray", 1, fullPath.c_str()) != 0;
-
-        // Apply console visibility immediately upon reading the configuration.
-        State::UpdateConsoleVisibility();
 
         // Load input synchronization toggles.
         State::enableKeyboardSync = GetPrivateProfileIntA("Control", "EnableKeyboardSync", 1, fullPath.c_str()) != 0;
@@ -100,7 +96,7 @@ namespace Config {
         State::enableClientAudioStream = GetPrivateProfileIntA("Audio", "EnableClientAudioStream", 1, fullPath.c_str()) != 0;
         State::enableClientMicReceive = GetPrivateProfileIntA("Audio", "EnableClientMicReceive", 0, fullPath.c_str()) != 0;
 
-        State::audioJitterBufferMs = GetPrivateProfileIntA("Audio", "JitterBufferMs", 50, fullPath.c_str());
+        State::audioJitterBufferMs = GetPrivateProfileIntA("Audio", "JitterBufferMs", 80, fullPath.c_str());
         if (State::audioJitterBufferMs < 20) State::audioJitterBufferMs = 20;
         if (State::audioJitterBufferMs > 500) State::audioJitterBufferMs = 500;
 

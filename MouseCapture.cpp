@@ -148,7 +148,7 @@ namespace Input {
             // Absolute Fast-Path: Instantly return to OS scheduler if Game Mode is active
             if (State::enableGameMode) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
 
-            if (!Network::HasAuthenticatedClients()) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
+            if (!Network::g_hasClients.load(std::memory_order_relaxed)) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
 
             MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
             if (ms->flags & LLMHF_INJECTED) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);

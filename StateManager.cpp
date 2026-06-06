@@ -21,13 +21,14 @@
 #include "UIManager.h"
 #include <iostream>
 #include <mutex>
+#include <atomic>
 
 namespace State {
     
     // --- GLOBAL STATE VARIABLES ---
     AppRole currentRole = AppRole::NONE;
     AppRole defaultRole = AppRole::NONE;
-    ControlMode currentMode = ControlMode::LOCAL;
+    std::atomic<ControlMode> currentMode{ControlMode::LOCAL};
     bool globalDebugMode = false;
     bool minimizeToTray = true;
     bool enableClipboardSync = true;
@@ -37,7 +38,7 @@ namespace State {
     bool enableServerMicBroadcast = false;
     bool enableClientAudioStream = true;
     bool enableClientMicReceive = false;
-    int audioJitterBufferMs = 50;
+    int audioJitterBufferMs = 80;
     int edgeDeadzonePercent = 5;
     float mouseSensitivity = 1.0f;
     char emergencyHotkey = 'M';
@@ -54,14 +55,13 @@ namespace State {
      * @return void
      */
     void SetMode(ControlMode newMode) {
-        if (currentMode == newMode) return;
-
-        currentMode = newMode;
+        ControlMode oldMode = currentMode.exchange(newMode);
+        if (oldMode == newMode) return;
         
-        Network::StatePayload payload = { static_cast<uint8_t>(currentMode == ControlMode::REMOTE ? 1 : 0) };
+        Network::StatePayload payload = { static_cast<uint8_t>(newMode == ControlMode::REMOTE ? 1 : 0) };
         Network::BroadcastMessage(Network::MessageType::EVENT_STATE, &payload, sizeof(payload));
 
-        if (currentMode == ControlMode::REMOTE) {
+        if (newMode == ControlMode::REMOTE) {
             if (globalDebugMode) UI::LogDebug("[KAM-Flow State] Entered REMOTE mode.");
         } else {
             if (globalDebugMode) UI::LogDebug("[KAM-Flow State] Returned to LOCAL mode.");
@@ -103,12 +103,4 @@ namespace State {
         return clientConnectionStatus;
     }
 
-    /**
-     * @brief Dynamically allocates or frees the Win32 Console window to bypass Win11 Terminal minimizing issues.
-     * @return void
-     */
-    void UpdateConsoleVisibility() {
-        // No-op: The console view is now handled natively via the internal ImGui "Debug Log" Tab.
-        // This prevents the Windows Host Terminal from intercepting clicks and pausing the application execution.
-    }
 }
