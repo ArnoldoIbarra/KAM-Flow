@@ -39,7 +39,8 @@ namespace Network {
         EVENT_KEYBOARD,      ///< Keystroke data.
         EVENT_STATE,         ///< Control mode transition (Local vs Remote).
         EVENT_AUTH,          ///< Authentication payload containing the PIN.
-        EVENT_AUTH_AUDIO,    ///< Authentication payload for the dedicated audio OOB socket.
+        EVENT_UDP_HANDSHAKE, ///< UDP Hole-punching payload to associate a connectionless stream.
+        EVENT_UDP_HANDSHAKE_ACK, ///< Server confirms UDP connection is fully open.
         EVENT_SYNC_CURSOR,   ///< Instructions to snap the cursor to a specific edge on the Client.
         EVENT_RETURN_CONTROL,///< Sent by Client to request control return.
         EVENT_UDP_BEACON,    ///< Sent via UDP broadcast for local network auto-discovery.
@@ -77,6 +78,14 @@ namespace Network {
         /// Null-terminated 8-digit security PIN.
         char pin[9]; 
         /// Hostname of the Client machine for UI display.
+        char clientName[32];
+    };
+
+    /**
+     * @brief Payload sent over UDP to verify routing and associate the stream with a TCP session.
+     */
+    struct UDPHandshakePayload {
+        /// Hostname of the Client machine to match against active TCP sessions.
         char clientName[32];
     };
 

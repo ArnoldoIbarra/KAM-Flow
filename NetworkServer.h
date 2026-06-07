@@ -31,7 +31,8 @@ namespace Network {
     /// Structure containing information about an actively connected client.
     struct ConnectedClientInfo {
         SOCKET socket;           ///< The TCP socket handle.
-        SOCKET audioSocket;      ///< The OOB TCP socket for audio data.
+        sockaddr_in udpAddr;     ///< The UDP return address for this client.
+        bool hasUdp;             ///< True if the client has successfully completed the UDP handshake.
         std::string ip;          ///< IPv4 address of the client.
         std::string name;        ///< Hostname of the client PC.
         float audioVolume;       ///< Local mixing volume for this client (0.0f to 1.0f).
@@ -39,6 +40,7 @@ namespace Network {
         bool isClipboardEnabled; ///< Individual toggle for syncing this client's clipboard.
         int gridX;               ///< Spatial X coordinate relative to Server at (0,0).
         int gridY;               ///< Spatial Y coordinate relative to Server at (0,0).
+        uint32_t udpRxSequence;  ///< Independent UDP receive sequence counter for this client.
     };
 
     /// Initializes WinSock2 and starts the background listening thread.

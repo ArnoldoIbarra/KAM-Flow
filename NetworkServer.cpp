@@ -37,6 +37,8 @@ namespace Network {
 
     /// Active TCP listener socket.
     SOCKET serverSocket = INVALID_SOCKET;
+    /// Active UDP listener socket for latency-sensitive streaming.
+    SOCKET serverUdpSocket = INVALID_SOCKET;
     /// Vector containing all active and authenticated client sockets.
     std::vector<ConnectedClientInfo> activeClients;
     /// Mutex protecting the active clients list.
@@ -58,6 +60,8 @@ namespace Network {
 
     /// Global transmit sequence counter.
     std::atomic<uint32_t> serverTxSequence(0);
+    /// Independent UDP transmit sequence counter to prevent cross-talk replay drops.
+    std::atomic<uint32_t> serverUdpTxSequence{0};
 
     // UDP Beacon state variables.
     std::thread beaconThread;
@@ -73,6 +77,9 @@ namespace Network {
     };
     std::vector<std::shared_ptr<ClientThreadInfo>> activeClientThreadsList;
     std::mutex clientThreadsListMutex;
+    
+    /// Background thread for receiving connectionless UDP packets.
+    std::thread udpListenerThread;
 
     /**
      * @brief Retrieves the active Master PIN from memory for display in the UI.
@@ -132,8 +139,8 @@ namespace Network {
         shutdown(clientSocket, SD_BOTH); // Abort the connection safely; the listener thread will clean up the socket.
         std::lock_guard<std::mutex> lock(clientsMutex);
         for (const auto& c : activeClients) {
-            if (c.socket == clientSocket && c.audioSocket != INVALID_SOCKET) {
-                shutdown(c.audioSocket, SD_BOTH);
+            if (c.socket == clientSocket) {
+                // Client disconnected, UDP routing will naturally drop.
                 break;
             }
         }
@@ -216,7 +223,7 @@ namespace Network {
     bool GetClientAudioState(SOCKET clientSocket, bool& isEnabled, float& volume) {
         std::lock_guard<std::mutex> lock(clientsMutex);
         for (const auto& c : activeClients) {
-            if (c.socket == clientSocket || c.audioSocket == clientSocket) {
+            if (c.socket == clientSocket) {
                 isEnabled = c.isAudioEnabled;
                 volume = c.audioVolume;
                 return true;
@@ -274,65 +281,6 @@ namespace Network {
         closesocket(udpSocket);
     }
 
-    /**
-     * @brief Dedicated thread for handling the audio OOB socket (EVENT_AUDIO_DATA and EVENT_MIC_DATA).
-     * @param clientSocket The authenticated OOB audio socket connection.
-     * @return void
-     */
-    void ClientAudioListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
-        uint32_t rxSequence = initialRxSequence;
-        
-        // Zero-Allocation Buffer Pool: Pre-allocate memory once per thread to avoid 
-        // CPU cache thrashing from 144Hz continuous vector allocations.
-        thread_local std::vector<uint8_t> tls_rawPayload;
-        thread_local std::vector<uint8_t> tls_decrypted;
-        tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
-        tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
-
-        while (isRunning) {
-            PacketHeader header;
-            int bytes = recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL);
-            if (bytes <= 0) break;
-
-            if (header.magic == PACKET_MAGIC) {
-                if (header.payloadSize > MAX_PAYLOAD_SIZE) break;
-
-                tls_rawPayload.resize(header.payloadSize);
-                if (header.payloadSize > 0) {
-                    int pBytes = recv(clientSocket, (char*)tls_rawPayload.data(), header.payloadSize, MSG_WAITALL);
-                    if (pBytes != static_cast<int>(header.payloadSize)) break;
-                }
-
-                if (header.sequenceNumber <= rxSequence && header.sequenceNumber != 0) continue;
-                rxSequence = header.sequenceNumber;
-
-                const uint8_t* finalPayload = tls_rawPayload.data();
-                size_t finalSize = tls_rawPayload.size();
-
-                bool isEncrypted = (header.type != MessageType::EVENT_AUTH_AUDIO);
-                if (isEncrypted) {
-                    if (!Security::DecryptPayload(tls_rawPayload.data(), tls_rawPayload.size(), &header, sizeof(header), tls_decrypted)) continue;
-                    finalPayload = tls_decrypted.data();
-                    finalSize = tls_decrypted.size();
-                }
-
-                if (header.type == MessageType::EVENT_HEARTBEAT) continue; // Keep socket alive
-
-                if (header.type == MessageType::EVENT_AUDIO_DATA) {
-                    bool isEnabled = true;
-                    float vol = 1.0f;
-                    GetClientAudioState(clientSocket, isEnabled, vol); // NOTE: clientSocket won't match here, need to match main socket if we check by socket. Wait!
-                    // Fix GetClientAudioState to check c.audioSocket as well!
-                    if (isEnabled) {
-                        Audio::HandleAudioData(clientSocket, finalPayload, finalSize);
-                    }
-                } else if (header.type == MessageType::EVENT_MIC_DATA) {
-                    // Server receives mic data from client? No, server sends mic data. Wait, client could send mic data in the future.
-                }
-            }
-        }
-        closesocket(clientSocket);
-    }
 
     /**
      * @brief Dedicated thread for an authenticated client to listen for return control commands.
@@ -403,22 +351,7 @@ namespace Network {
                     continue; // Keep-alive heartbeat acknowledged.
                 }
 
-                if (header.type == MessageType::EVENT_RETURN_CONTROL) {
-                    if (finalSize == sizeof(ReturnControlPayload)) {
-                        ReturnControlPayload p;
-                        memcpy(&p, finalPayload, sizeof(p));
-                        
-                        int sourceX = 0, sourceY = 0;
-                        {
-                            std::lock_guard<std::mutex> lock(clientsMutex);
-                            for (const auto& c : activeClients) {
-                                if (c.socket == clientSocket) { sourceX = c.gridX; sourceY = c.gridY; break; }
-                            }
-                        }
-                        // Route the cursor dynamically based on the client's grid coordinates
-                        RouteCursorTransition(sourceX, sourceY, p.exitEdge, p.normalizedX, p.normalizedY);
-                    }
-                } else if (header.type == MessageType::EVENT_AUDIO_DATA) {
+                if (header.type == MessageType::EVENT_AUDIO_DATA) {
                     // Pass the raw PCM data to the audio manager for mixing and playback.
                     Audio::HandleAudioData(clientSocket, finalPayload, finalSize);
                 } else if (header.type == MessageType::EVENT_CLIPBOARD) {
@@ -436,6 +369,24 @@ namespace Network {
                 if (!text.empty()) {
                     ClipboardManager::SetRemoteClipboard(text);
                 }
+                    }
+                } else if (header.type == MessageType::EVENT_RETURN_CONTROL) {
+                    if (finalSize == sizeof(ReturnControlPayload)) {
+                        ReturnControlPayload p;
+                        memcpy(&p, finalPayload, sizeof(p));
+                        
+                        int sourceX = 0, sourceY = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(clientsMutex);
+                            for (const auto& c : activeClients) {
+                                if (c.socket == clientSocket) {
+                                    sourceX = c.gridX;
+                                    sourceY = c.gridY;
+                                    break;
+                                }
+                            }
+                        }
+                        RouteCursorTransition(sourceX, sourceY, p.exitEdge, p.normalizedX, p.normalizedY);
                     }
                 } else if (header.type == MessageType::EVENT_CLIENT_LOCKED) {
                     if (State::IsRemote()) {
@@ -466,10 +417,6 @@ namespace Network {
         std::lock_guard<std::mutex> lock(clientsMutex);
         for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
             if (it->socket == clientSocket) {
-                if (it->audioSocket != INVALID_SOCKET) {
-                    shutdown(it->audioSocket, SD_BOTH);
-                    clientSendMutexes.erase(it->audioSocket);
-                }
                 activeClients.erase(it);
                 g_hasClients.store(!activeClients.empty(), std::memory_order_relaxed);
                 clientSendMutexes.erase(clientSocket);
@@ -511,7 +458,7 @@ namespace Network {
 
                 PacketHeader header;
                 if (recv(clientSocket, (char*)&header, sizeof(header), MSG_WAITALL) > 0 && 
-                    header.magic == PACKET_MAGIC && (header.type == MessageType::EVENT_AUTH || header.type == MessageType::EVENT_AUTH_AUDIO)) {
+                    header.magic == PACKET_MAGIC && header.type == MessageType::EVENT_AUTH) {
                     
                     // Validate authentication payload bounds to prevent overflow attacks.
                     if (header.payloadSize >= sizeof(AuthPayload) && header.payloadSize <= MAX_PAYLOAD_SIZE) {
@@ -583,53 +530,6 @@ namespace Network {
                                 char safeName[33] = {0};
                                 memcpy(safeName, auth.clientName, 32);
 
-                                if (header.type == MessageType::EVENT_AUTH_AUDIO) {
-                                    if (State::globalDebugMode) UI::LogDebug("[Network Server] Client Audio OOB Socket Connected.");
-                                    
-                                    // Limit audio buffer sizes to prevent deep OS-level bufferbloat during network spikes
-                                    int audioBufSize = 65536;
-                                    setsockopt(clientSocket, SOL_SOCKET, SO_RCVBUF, (char*)&audioBufSize, sizeof(audioBufSize));
-                                    setsockopt(clientSocket, SOL_SOCKET, SO_SNDBUF, (char*)&audioBufSize, sizeof(audioBufSize));
-
-                                    bool found = false;
-                                    {
-                                        std::lock_guard<std::mutex> lock(clientsMutex);
-                                        for (auto& c : activeClients) {
-                                            if (strncmp(c.name.c_str(), safeName, 32) == 0) {
-                                                c.audioSocket = clientSocket;
-                                                clientSendMutexes[clientSocket] = std::make_shared<std::mutex>();
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if (found) {
-                                        auto threadInfo = std::make_shared<ClientThreadInfo>();
-                                        threadInfo->thread = std::thread([clientSocket, seq = header.sequenceNumber, threadInfo]() {
-                                            // Register with MMCSS to guarantee CPU scheduling for audio receive/decrypt
-                                            DWORD taskIndex = 0;
-                                            HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-                                            if (!hMmcss) {
-                                                ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-                                            } else {
-                                                if (State::globalDebugMode) UI::LogDebug("[Network Server] AudioListenerLoop: MMCSS registered (index=%u).", taskIndex);
-                                            }
-                                            ClientAudioListenerLoop(clientSocket, seq);
-                                            if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
-                                            threadInfo->isFinished = true;
-                                        });
-                                        
-                                        {
-                                            std::lock_guard<std::mutex> lock(clientThreadsListMutex);
-                                            activeClientThreadsList.push_back(threadInfo);
-                                        }
-                                    } else {
-                                        closesocket(clientSocket);
-                                    }
-                                    continue;
-                                }
-
                                 int targetX = 0, targetY = 0;
                                 bool loaded = Config::LoadClientLayout(safeName, targetX, targetY);
 
@@ -663,7 +563,9 @@ namespace Network {
                                             }
                                         }
                                     }
-                                    activeClients.push_back({clientSocket, INVALID_SOCKET, ipStr, safeName, 1.0f, true, true, targetX, targetY});
+                                    sockaddr_in emptyUdpAddr;
+                                    memset(&emptyUdpAddr, 0, sizeof(emptyUdpAddr));
+                                    activeClients.push_back({clientSocket, emptyUdpAddr, false, ipStr, safeName, 1.0f, true, true, targetX, targetY, 0});
                                     g_hasClients.store(true, std::memory_order_relaxed);
                                     clientSendMutexes[clientSocket] = std::make_shared<std::mutex>();
                                     Config::SaveClientLayout(safeName, targetX, targetY);
@@ -691,12 +593,106 @@ namespace Network {
     }
 
     /**
+     * @brief Listener thread for connectionless UDP streaming (Mouse and Audio).
+     */
+    void UDPListenerLoop() {
+        std::vector<uint8_t> buffer(MAX_PAYLOAD_SIZE);
+        std::vector<uint8_t> decrypted(MAX_PAYLOAD_SIZE);
+        sockaddr_in senderAddr;
+        int senderAddrSize = sizeof(senderAddr);
+
+        while (isRunning) {
+            int bytes = recvfrom(serverUdpSocket, (char*)buffer.data(), (int)buffer.size(), 0, (sockaddr*)&senderAddr, &senderAddrSize);
+            if (bytes <= 0) continue;
+
+            if (bytes < sizeof(PacketHeader)) continue;
+
+            PacketHeader header;
+            memcpy(&header, buffer.data(), sizeof(PacketHeader));
+
+            if (header.magic != PACKET_MAGIC) continue;
+
+            size_t payloadSize = header.payloadSize;
+            if (payloadSize > MAX_PAYLOAD_SIZE || bytes < sizeof(PacketHeader) + payloadSize) continue;
+
+            const uint8_t* rawPayload = buffer.data() + sizeof(PacketHeader);
+            
+            if (!Security::DecryptPayload(rawPayload, payloadSize, &header, sizeof(header), decrypted)) {
+                continue; // Decryption failed, drop packet
+            }
+
+            if (header.type == MessageType::EVENT_UDP_HANDSHAKE) {
+                if (decrypted.size() == sizeof(UDPHandshakePayload)) {
+                    UDPHandshakePayload p;
+                    memcpy(&p, decrypted.data(), sizeof(p));
+                    // Safely ensure null termination
+                    p.clientName[sizeof(p.clientName) - 1] = '\0';
+                    
+                    SOCKET ackSocket = INVALID_SOCKET;
+                    {
+                        std::lock_guard<std::mutex> lock(clientsMutex);
+                        for (auto& c : activeClients) {
+                            if (strncmp(c.name.c_str(), p.clientName, 32) == 0) {
+                                c.udpAddr = senderAddr;
+                                c.hasUdp = true;
+                                ackSocket = c.socket;
+                                if (State::globalDebugMode) UI::LogDebug("[Network Server] UDP Stream Handshake matched for %s. Connection verified.", p.clientName);
+                                break;
+                            }
+                        }
+                    } // Release mutex before calling SendToClient
+                    
+                    if (ackSocket != INVALID_SOCKET) {
+                        SendToClient(ackSocket, MessageType::EVENT_UDP_HANDSHAKE_ACK, nullptr, 0);
+                    }
+                }
+                continue;
+            }
+
+            SOCKET matchingSocket = INVALID_SOCKET;
+            int sourceX = 0, sourceY = 0;
+            
+            {
+                std::lock_guard<std::mutex> lock(clientsMutex);
+                for (auto& c : activeClients) {
+                    if (c.hasUdp && c.udpAddr.sin_addr.s_addr == senderAddr.sin_addr.s_addr && c.udpAddr.sin_port == senderAddr.sin_port) {
+                        // Drop out-of-order packets immediately to prevent backward time travel in audio/mouse
+                        if (header.sequenceNumber <= c.udpRxSequence && header.sequenceNumber != 0) {
+                            matchingSocket = (SOCKET)-1; // Flag as replay drop
+                            break;
+                        }
+                        c.udpRxSequence = header.sequenceNumber;
+                        matchingSocket = c.socket;
+                        sourceX = c.gridX;
+                        sourceY = c.gridY;
+                        break;
+                    }
+                }
+            }
+
+            if (matchingSocket == INVALID_SOCKET || matchingSocket == (SOCKET)-1) continue;
+
+            if (header.type == MessageType::EVENT_AUDIO_DATA || header.type == MessageType::EVENT_MIC_DATA) {
+                Audio::HandleAudioData(matchingSocket, decrypted.data(), decrypted.size());
+            } else if (header.type == MessageType::EVENT_RETURN_CONTROL) {
+                if (decrypted.size() == sizeof(ReturnControlPayload)) {
+                    ReturnControlPayload p;
+                    memcpy(&p, decrypted.data(), sizeof(p));
+                    // Route the cursor dynamically based on the client's grid coordinates
+                    RouteCursorTransition(sourceX, sourceY, p.exitEdge, p.normalizedX, p.normalizedY);
+                }
+            }
+        }
+    }
+
+    /**
      * @brief Initializes WinSock2, binds the socket, and starts the background listening thread.
      * @param port The TCP port to listen on.
      * @return true if the server started successfully, false otherwise.
      */
     bool StartServer(uint16_t port) {
         serverTxSequence = 0; // Reset monotonic counter for new sessions
+        serverUdpTxSequence = 0;
 
         if (!CredentialManager::LoadSecret("KAMFlow_LocalServer", activeServerPin)) {
             // First boot: Generate a secure 8-digit random PIN
@@ -723,11 +719,19 @@ namespace Network {
 
         if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) return false;
         listen(serverSocket, SOMAXCONN);
+        
+        serverUdpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (bind(serverUdpSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) return false;
 
         isRunning = true;
         serverThread = std::thread([]() {
             ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             AcceptClientsLoop();
+        });
+        
+        udpListenerThread = std::thread([]() {
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            UDPListenerLoop();
         });
 
         isBeaconRunning = true;
@@ -743,21 +747,6 @@ namespace Network {
                 if (isRunning) {
                     BroadcastMessage(MessageType::EVENT_HEARTBEAT, nullptr, 0);
                     
-                    // Manually send heartbeats to the OOB audio sockets to prevent SO_RCVTIMEO disconnects.
-                    {
-                        std::lock_guard<std::mutex> lock(clientsMutex);
-                        for (const auto& client : activeClients) {
-                            if (client.audioSocket != INVALID_SOCKET) {
-                                auto it = clientSendMutexes.find(client.audioSocket);
-                                if (it != clientSendMutexes.end()) {
-                                    PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_HEARTBEAT, 0, ++serverTxSequence };
-                                    std::lock_guard<std::mutex> sockLock(*(it->second));
-                                    send(client.audioSocket, (const char*)&h, sizeof(h), 0);
-                                }
-                            }
-                        }
-                    }
-
                     if (++txHbCount % 10 == 0 && State::globalDebugMode) {
                         UI::LogDebug("[Network Server] Sent Keep-Alive Heartbeat to Clients.");
                     }
@@ -781,13 +770,15 @@ namespace Network {
             serverSocket = INVALID_SOCKET;
         }
 
+        if (serverUdpSocket != INVALID_SOCKET) {
+            closesocket(serverUdpSocket);
+            serverUdpSocket = INVALID_SOCKET;
+        }
+
         {
             std::lock_guard<std::mutex> lock(clientsMutex);
             for (const auto& client : activeClients) {
                 shutdown(client.socket, SD_BOTH);
-                if (client.audioSocket != INVALID_SOCKET) {
-                    shutdown(client.audioSocket, SD_BOTH);
-                }
             }
             clientSendMutexes.clear();
         }
@@ -820,19 +811,29 @@ namespace Network {
      */
     bool BroadcastMessage(MessageType type, const void* payload, size_t payloadSize) {
         // Snapshot targets WITH their per-client send mutexes so we don't hold clientsMutex during send().
-        struct SendTarget { SOCKET sock; std::shared_ptr<std::mutex> mtx; };
+        struct SendTarget { SOCKET sock; std::shared_ptr<std::mutex> mtx; bool useUdp; sockaddr_in udpAddr; };
         std::vector<SendTarget> targets;
+        static bool hasLoggedTcpFallback = false;
         {
             std::lock_guard<std::mutex> lock(clientsMutex);
             if (activeClients.empty()) return false;
             for (const auto& c : activeClients) {
                 SOCKET targetSock = c.socket;
-                if ((type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) && c.audioSocket != INVALID_SOCKET) {
-                    targetSock = c.audioSocket;
+                bool isMediaPacket = (type == MessageType::EVENT_MOUSE || type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA);
+                bool useUdp = isMediaPacket && c.hasUdp;
+                
+                if (isMediaPacket && !c.hasUdp && State::globalDebugMode) {
+                    if (!hasLoggedTcpFallback) {
+                        UI::LogDebug("[Network Server] UDP not available. Falling back to TCP for media streams.");
+                        hasLoggedTcpFallback = true;
+                    }
+                } else if (c.hasUdp) {
+                    hasLoggedTcpFallback = false; // Reset if UDP becomes available again
                 }
+
                 auto it = clientSendMutexes.find(targetSock);
                 if (it != clientSendMutexes.end()) {
-                    targets.push_back({targetSock, it->second});
+                    targets.push_back({targetSock, it->second, useUdp, c.udpAddr});
                 }
             }
         }
@@ -844,7 +845,9 @@ namespace Network {
         for (auto& t : targets) {
             std::lock_guard<std::mutex> sendLock(*t.mtx);
             
-            PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
+            bool isUdp = t.useUdp;
+            uint32_t seq = isUdp ? ++serverUdpTxSequence : ++serverTxSequence;
+            PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), seq };
             
             thread_local std::vector<uint8_t> tls_sendBuffer;
             thread_local std::vector<uint8_t> tls_ciphertext;
@@ -865,11 +868,15 @@ namespace Network {
             }
 
             uint64_t tStart = GetTickCount64();
-            if (send(t.sock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0) == SOCKET_ERROR) {
-                shutdown(t.sock, SD_BOTH); // Force the listener loop to sever the dead socket.
+            if (isUdp) {
+                sendto(serverUdpSocket, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0, (sockaddr*)&t.udpAddr, sizeof(t.udpAddr));
+            } else {
+                if (send(t.sock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0) == SOCKET_ERROR) {
+                    shutdown(t.sock, SD_BOTH); // Force the listener loop to sever the dead socket.
+                }
             }
             uint64_t tEnd = GetTickCount64();
-            if (State::globalDebugMode && (tEnd - tStart) > 50) {
+            if (State::globalDebugMode && (tEnd - tStart) > 50 && !isUdp) {
                 UI::LogDebug("[Network Server] WARNING: send() to client blocked for %llu ms! TCP congested.", (unsigned long long)(tEnd - tStart));
             }
         }
@@ -925,7 +932,8 @@ namespace Network {
     }
 
     bool SendToClient(SOCKET clientSocket, MessageType type, const void* payload, size_t payloadSize) {
-        PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), 0 }; // Sequence generated below
+        bool useUdp = false;
+        sockaddr_in udpAddr;
         
         thread_local std::vector<uint8_t> tls_sendBuffer;
         thread_local std::vector<uint8_t> tls_ciphertext;
@@ -936,12 +944,9 @@ namespace Network {
             {
                 std::lock_guard<std::mutex> lock(clientsMutex);
                 for (const auto& c : activeClients) {
-                    if (c.socket == clientSocket || c.audioSocket == clientSocket) {
-                        if ((type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) && c.audioSocket != INVALID_SOCKET) {
-                            targetSock = c.audioSocket;
-                        } else {
-                            targetSock = c.socket;
-                        }
+                    if (c.socket == clientSocket) {
+                        useUdp = (type == MessageType::EVENT_MOUSE || type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) && c.hasUdp;
+                        udpAddr = c.udpAddr;
                         break;
                     }
                 }
@@ -953,7 +958,9 @@ namespace Network {
             std::lock_guard<std::mutex> sendLock(*sendMtx);
             
             // Generate sequence and encrypt under the per-client lock
-            h.sequenceNumber = ++serverTxSequence;
+            uint32_t seq = useUdp ? ++serverUdpTxSequence : ++serverTxSequence;
+            PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), seq };
+
             h.payloadSize = static_cast<uint32_t>(payloadSize + 28);
             if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), tls_ciphertext)) {
                 tls_sendBuffer.resize(sizeof(h) + tls_ciphertext.size());
@@ -961,9 +968,14 @@ namespace Network {
                 memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(), tls_ciphertext.size());
 
                 uint64_t tStart = GetTickCount64();
-                int res = send(targetSock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0);
+                int res = 0;
+                if (useUdp) {
+                    res = sendto(serverUdpSocket, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0, (sockaddr*)&udpAddr, sizeof(udpAddr));
+                } else {
+                    res = send(targetSock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0);
+                }
                 uint64_t tEnd = GetTickCount64();
-                if (State::globalDebugMode && (tEnd - tStart) > 50) {
+                if (State::globalDebugMode && (tEnd - tStart) > 50 && !useUdp) {
                     UI::LogDebug("[Network Server] WARNING: SendToClient blocked for %llu ms! TCP congested.", (unsigned long long)(tEnd - tStart));
                 }
                 return res != SOCKET_ERROR;

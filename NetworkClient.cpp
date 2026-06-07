@@ -47,12 +47,20 @@ namespace Network {
     /// Background thread for keeping the connection alive.
     std::thread clientHeartbeatThread;
 
-    /// Active socket connected to the Server specifically for Audio OOB data.
-    SOCKET clientAudioSocket = INVALID_SOCKET;
-    /// Background thread processing incoming Audio OOB TCP packets.
-    std::thread clientAudioThread;
-    /// Mutex to prevent interleaved sends of audio data.
-    std::mutex clientAudioSendMutex;
+    /// Independent UDP transmit sequence counter to prevent cross-talk replay drops.
+    std::atomic<uint32_t> clientUdpTxSequence{0};
+    /// Independent UDP receive sequence counter.
+    uint32_t udpRxSequence = 0;
+
+    /// Active socket connected to the Server specifically for latency-sensitive UDP data.
+    SOCKET clientUdpSocket = INVALID_SOCKET;
+    /// Address of the Server's UDP endpoint.
+    sockaddr_in serverUdpAddr;
+    /// Background thread processing incoming UDP packets.
+    std::thread clientUdpListenerThread;
+    
+    /// Tracks whether the UDP connection has been successfully established and verified by the Server.
+    std::atomic<bool> isUdpActive{false};
 
     // UDP Discovery state variables.
     SOCKET udpListenerSocket = INVALID_SOCKET;
@@ -99,21 +107,37 @@ namespace Network {
     bool SendToServer(MessageType type, const void* payload, size_t payloadSize) {
         if (!isClientRunning) return false;
         
+        bool isUdp = false;
         SOCKET targetSock = clientSocket;
         std::mutex* targetMutex = &clientSendMutex;
-        if ((type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) && clientAudioSocket != INVALID_SOCKET) {
-            targetSock = clientAudioSocket;
-            targetMutex = &clientAudioSendMutex;
+        
+        if (type == MessageType::EVENT_UDP_HANDSHAKE) {
+            isUdp = true;
+            targetSock = clientUdpSocket;
+        } else if (type == MessageType::EVENT_MOUSE || type == MessageType::EVENT_RETURN_CONTROL) {
+            if (isUdpActive.load(std::memory_order_relaxed)) {
+                isUdp = true;
+                targetSock = clientUdpSocket;
+                static bool hasLoggedUdpRecovery = false;
+                if (hasLoggedUdpRecovery) {
+                    hasLoggedUdpRecovery = false;
+                }
+            } else {
+                static bool hasLoggedTcpFallback = false;
+                if (!hasLoggedTcpFallback && State::globalDebugMode) {
+                    UI::LogDebug("[Network Client] UDP not active. Falling back to TCP for EVENT_MOUSE/RETURN_CONTROL.");
+                    hasLoggedTcpFallback = true;
+                }
+                // Fallback to TCP is automatic because targetSock is already clientSocket
+            }
         }
 
         if (targetSock == INVALID_SOCKET) return false;
 
         std::lock_guard<std::mutex> lock(*targetMutex);
         
-        // CRITICAL: Sequence generation AND encryption MUST happen inside the targetMutex.
-        // Otherwise, concurrent threads (Audio, Heartbeat) will interleave sequence numbers 
-        // into the TCP stream, causing the receiver to drop packets as false-positive Replay Attacks.
-        PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++clientTxSequence };
+        uint32_t seq = isUdp ? ++clientUdpTxSequence : ++clientTxSequence;
+        PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), seq };
         
         thread_local std::vector<uint8_t> tls_sendBuffer;
         thread_local std::vector<uint8_t> tls_ciphertext;
@@ -134,7 +158,12 @@ namespace Network {
         }
         
         if (!tls_sendBuffer.empty()) {
-            int res = send(targetSock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0);
+            int res = 0;
+            if (isUdp) {
+                res = sendto(clientUdpSocket, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0, (sockaddr*)&serverUdpAddr, sizeof(serverUdpAddr));
+            } else {
+                res = send(targetSock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0);
+            }
             return res != SOCKET_ERROR;
         }
         return false;
@@ -322,49 +351,80 @@ namespace Network {
     }
 
     /**
-     * @brief Dedicated thread for handling the audio OOB socket.
-     * @return void
+     * @brief Dedicated thread for handling incoming connectionless UDP packets (Audio/Mouse).
      */
-    void ClientAudioLoop() {
-        uint32_t rxSequence = 0;
-        
-        thread_local std::vector<uint8_t> tls_rawPayload;
-        thread_local std::vector<uint8_t> tls_decrypted;
-        tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
-        tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
+    void ClientUDPListenerLoop() {
+        int pullBackAccumulator = 0;
+        const int PULL_BACK_THRESHOLD = 150; 
 
-        while (isClientRunning && clientAudioSocket != INVALID_SOCKET) {
-            PacketHeader h;
-            int bytes = recv(clientAudioSocket, (char*)&h, sizeof(h), MSG_WAITALL);
-            if (bytes <= 0) break;
+        std::vector<uint8_t> buffer(MAX_PAYLOAD_SIZE);
+        std::vector<uint8_t> decrypted(MAX_PAYLOAD_SIZE);
+        sockaddr_in senderAddr;
+        int senderAddrSize = sizeof(senderAddr);
 
-            if (h.magic == PACKET_MAGIC) {
-                if (h.payloadSize > MAX_PAYLOAD_SIZE) break;
+        while (isClientRunning && clientUdpSocket != INVALID_SOCKET) {
+            int bytes = recvfrom(clientUdpSocket, (char*)buffer.data(), (int)buffer.size(), 0, (sockaddr*)&senderAddr, &senderAddrSize);
+            if (bytes <= 0) continue;
 
-                tls_rawPayload.resize(h.payloadSize);
-                if (h.payloadSize > 0) {
-                    int pBytes = recv(clientAudioSocket, (char*)tls_rawPayload.data(), h.payloadSize, MSG_WAITALL);
-                    if (pBytes != static_cast<int>(h.payloadSize)) break;
+            if (bytes < sizeof(PacketHeader)) continue;
+
+            // Only accept UDP traffic from the Server we explicitly connected to
+            if (senderAddr.sin_addr.s_addr != serverUdpAddr.sin_addr.s_addr) continue;
+
+            PacketHeader header;
+            memcpy(&header, buffer.data(), sizeof(PacketHeader));
+
+            if (header.magic != PACKET_MAGIC) continue;
+
+            // Drop out-of-order packets immediately to prevent backward time travel in audio/mouse
+            if (header.sequenceNumber <= udpRxSequence && header.sequenceNumber != 0) continue;
+            udpRxSequence = header.sequenceNumber;
+
+            size_t payloadSize = header.payloadSize;
+            if (payloadSize > MAX_PAYLOAD_SIZE || bytes < sizeof(PacketHeader) + payloadSize) continue;
+
+            const uint8_t* rawPayload = buffer.data() + sizeof(PacketHeader);
+            
+            if (!Security::DecryptPayload(rawPayload, payloadSize, &header, sizeof(header), decrypted)) {
+                continue; // Decryption failed, drop packet
+            }
+
+            if (header.type == MessageType::EVENT_MIC_DATA || header.type == MessageType::EVENT_AUDIO_DATA) {
+                if (decrypted.size() > 0) {
+                    Audio::HandleMicData(decrypted.data(), decrypted.size());
                 }
+            } else if (header.type == MessageType::EVENT_MOUSE) {
+                if (decrypted.size() == sizeof(MousePayload)) {
+                    MousePayload p; memcpy(&p, decrypted.data(), sizeof(p));
+                    InjectMouseInput(p);
 
-                if (h.sequenceNumber <= rxSequence && h.sequenceNumber != 0) continue;
-                rxSequence = h.sequenceNumber;
+                    POINT pt; GetCursorPos(&pt);
+                    int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
 
-                const uint8_t* finalPayload = tls_rawPayload.data();
-                size_t finalSize = tls_rawPayload.size();
+                    int deadzoneX = (sw * State::edgeDeadzonePercent) / 100;
+                    int deadzoneY = (sh * State::edgeDeadzonePercent) / 100;
 
-                bool isEncrypted = (h.type != MessageType::EVENT_AUTH_AUDIO);
-                if (isEncrypted) {
-                    if (!Security::DecryptPayload(tls_rawPayload.data(), tls_rawPayload.size(), &h, sizeof(h), tls_decrypted)) continue;
-                    finalPayload = tls_decrypted.data();
-                    finalSize = tls_decrypted.size();
-                }
+                    bool safeY = pt.y > deadzoneY && pt.y < (sh - deadzoneY);
+                    bool safeX = pt.x > deadzoneX && pt.x < (sw - deadzoneX);
 
-                if (h.type == MessageType::EVENT_HEARTBEAT) continue;
+                    uint8_t exitEdge = 255;
+                    float normX = 0.0f, normY = 0.0f;
 
-                if (h.type == MessageType::EVENT_MIC_DATA) {
-                    if (finalSize > 0) {
-                        Audio::HandleMicData(finalPayload, finalSize);
+                    // Calculate the normalized exit coordinates based on which screen edge was breached.
+                    if (pt.x <= 0 && p.deltaX < 0 && safeY) { exitEdge = 0; normX = 0.0f; normY = (float)pt.y / sh; }
+                    else if (pt.x >= sw - 1 && p.deltaX > 0 && safeY) { exitEdge = 1; normX = 1.0f; normY = (float)pt.y / sh; }
+                    else if (pt.y <= 0 && p.deltaY < 0 && safeX) { exitEdge = 2; normX = (float)pt.x / sw; normY = 0.0f; }
+                    else if (pt.y >= sh - 1 && p.deltaY > 0 && safeX) { exitEdge = 3; normX = (float)pt.x / sw; normY = 1.0f; }
+
+                    if (exitEdge != 255) {
+                        pullBackAccumulator += (exitEdge <= 1) ? abs(p.deltaX) : abs(p.deltaY);
+                        if (pullBackAccumulator > PULL_BACK_THRESHOLD) {
+                            ReturnControlPayload retPayload = { exitEdge, normX, normY };
+                            SendToServer(MessageType::EVENT_RETURN_CONTROL, &retPayload, sizeof(retPayload));
+                            pullBackAccumulator = 0;
+                        }
+                    } else {
+                        pullBackAccumulator = 0;
                     }
                 }
             }
@@ -456,6 +516,10 @@ namespace Network {
                     UI::LogDebug("[Network Client] Received Keep-Alive Heartbeat from Server.");
                 }
                 continue; // Keep-alive heartbeat acknowledged.
+            } else if (h.type == MessageType::EVENT_UDP_HANDSHAKE_ACK) {
+                isUdpActive.store(true, std::memory_order_relaxed);
+                if (State::globalDebugMode) UI::LogDebug("[Network Client] UDP Connection fully established with Server.");
+                continue;
             }
 
             if (h.type == MessageType::EVENT_MOUSE) {
@@ -631,6 +695,9 @@ namespace Network {
         State::SetClientStatus("Connecting...");
 
         clientTxSequence = 0; // Reset monotonic counter for new connection
+        clientUdpTxSequence = 0;
+        udpRxSequence = 0;
+        isUdpActive.store(false, std::memory_order_relaxed);
 
         if (clientThread.joinable()) {
             if (State::globalDebugMode) UI::LogDebug("[Network Client] Reaping zombie thread from previous connection attempt...");
@@ -639,17 +706,13 @@ namespace Network {
         if (clientHeartbeatThread.joinable()) {
             clientHeartbeatThread.join();
         }
-        if (clientAudioThread.joinable()) {
-            clientAudioThread.join();
+        if (clientUdpSocket != INVALID_SOCKET) {
+            closesocket(clientUdpSocket);
+            clientUdpSocket = INVALID_SOCKET;
         }
 
-        if (clientSocket != INVALID_SOCKET) {
-            closesocket(clientSocket);
-            clientSocket = INVALID_SOCKET;
-        }
-        if (clientAudioSocket != INVALID_SOCKET) {
-            closesocket(clientAudioSocket);
-            clientAudioSocket = INVALID_SOCKET;
+        if (clientUdpListenerThread.joinable()) {
+            clientUdpListenerThread.join();
         }
 
         if (State::globalDebugMode) UI::LogDebug("[Network Client] Attempting TCP Connection to %s:%u...", ip.c_str(), port);
@@ -710,42 +773,38 @@ namespace Network {
         State::SetClientStatus("Authenticating...");
         SendToServer(MessageType::EVENT_AUTH, &p, sizeof(p));
         
-        // Immediately connect the Audio OOB socket
-        clientAudioSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (clientAudioSocket != INVALID_SOCKET) {
-            if (connect(clientAudioSocket, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
-                setsockopt(clientAudioSocket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
-                setsockopt(clientAudioSocket, IPPROTO_IP, IP_TOS, (char*)&tos, sizeof(tos));
-                setsockopt(clientAudioSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-                setsockopt(clientAudioSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTimeout, sizeof(sndTimeout));
-                
-                int audioBufSize = 65536;
-                setsockopt(clientAudioSocket, SOL_SOCKET, SO_RCVBUF, (char*)&audioBufSize, sizeof(audioBufSize));
-                setsockopt(clientAudioSocket, SOL_SOCKET, SO_SNDBUF, (char*)&audioBufSize, sizeof(audioBufSize));
+        // Configure the Server's UDP address
+        memset(&serverUdpAddr, 0, sizeof(serverUdpAddr));
+        serverUdpAddr.sin_family = AF_INET;
+        serverUdpAddr.sin_port = htons(port); // Server UDP listener is bound to the same port
+        inet_pton(AF_INET, ip.c_str(), &serverUdpAddr.sin_addr);
 
-                // We send manually because SendToServer doesn't know about clientAudioSocket yet
-                PacketHeader authH = { PACKET_MAGIC, MessageType::EVENT_AUTH_AUDIO, static_cast<uint32_t>(sizeof(p)), 0 };
-                std::vector<uint8_t> authBuffer(sizeof(authH) + sizeof(p));
-                memcpy(authBuffer.data(), &authH, sizeof(authH));
-                memcpy(authBuffer.data() + sizeof(authH), &p, sizeof(p));
-                send(clientAudioSocket, (const char*)authBuffer.data(), (int)authBuffer.size(), 0);
-                
-                clientAudioThread = std::thread([]() {
-                    // Register with MMCSS to guarantee CPU scheduling for audio receive from server
-                    DWORD taskIndex = 0;
-                    HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-                    if (!hMmcss) {
-                        ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-                    } else {
-                        if (State::globalDebugMode) UI::LogDebug("[Network Client] AudioLoop: MMCSS registered (index=%u).", taskIndex);
-                    }
-                    ClientAudioLoop();
-                    if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
-                });
-            } else {
-                closesocket(clientAudioSocket);
-                clientAudioSocket = INVALID_SOCKET;
-            }
+        // Bind the UDP listener socket
+        clientUdpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (clientUdpSocket != INVALID_SOCKET) {
+            sockaddr_in localAddr;
+            localAddr.sin_family = AF_INET;
+            localAddr.sin_addr.s_addr = INADDR_ANY;
+            localAddr.sin_port = 0; // Ephemeral port
+            bind(clientUdpSocket, (sockaddr*)&localAddr, sizeof(localAddr));
+
+            clientUdpListenerThread = std::thread([]() {
+                // Register with MMCSS to guarantee CPU scheduling for latency-sensitive UDP receives
+                DWORD taskIndex = 0;
+                HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+                if (!hMmcss) {
+                    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                } else {
+                    if (State::globalDebugMode) UI::LogDebug("[Network Client] UDPListenerLoop: MMCSS registered (index=%u).", taskIndex);
+                }
+                ClientUDPListenerLoop();
+                if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
+            });
+
+            // Send Hole-punching payload to Server
+            UDPHandshakePayload udpHandshake;
+            strncpy_s(udpHandshake.clientName, sizeof(udpHandshake.clientName), hostname, _TRUNCATE);
+            SendToServer(MessageType::EVENT_UDP_HANDSHAKE, &udpHandshake, sizeof(udpHandshake));
         }
 
         State::SetClientStatus("Connected");
@@ -765,11 +824,18 @@ namespace Network {
                 }
                 if (isClientRunning) {
                     SendHeartbeatToSocket(clientSocket, clientSendMutex);
-                    if (clientAudioSocket != INVALID_SOCKET) {
-                        SendHeartbeatToSocket(clientAudioSocket, clientAudioSendMutex);
-                    }
                     if (++txHbCount % 10 == 0 && State::globalDebugMode) {
                         UI::LogDebug("[Network Client] Sent Keep-Alive Heartbeat to Server.");
+                    }
+
+                    if (!isUdpActive.load(std::memory_order_relaxed) && clientUdpSocket != INVALID_SOCKET) {
+                        char hName[MAX_COMPUTERNAME_LENGTH + 1];
+                        DWORD sSize = sizeof(hName);
+                        if (GetComputerNameA(hName, &sSize)) {
+                            UDPHandshakePayload udpHandshake;
+                            strncpy_s(udpHandshake.clientName, sizeof(udpHandshake.clientName), hName, _TRUNCATE);
+                            SendToServer(MessageType::EVENT_UDP_HANDSHAKE, &udpHandshake, sizeof(udpHandshake));
+                        }
                     }
                     
                     // Secure desktop and UAC prompt failsafe.
@@ -805,6 +871,7 @@ namespace Network {
         isIntentionalDisconnect = true;
         State::SetClientStatus("Idle");
         isClientRunning = false;
+        isUdpActive.store(false, std::memory_order_relaxed);
         // Ensure audio capture streams are always stopped on disconnect.
         Audio::StopLoopbackCapture();
         Audio::StopMicReceiver();
@@ -813,12 +880,12 @@ namespace Network {
             closesocket(clientSocket);
             clientSocket = INVALID_SOCKET;
         }
-        if (clientAudioSocket != INVALID_SOCKET) {
-            closesocket(clientAudioSocket);
-            clientAudioSocket = INVALID_SOCKET;
+        if (clientUdpSocket != INVALID_SOCKET) {
+            closesocket(clientUdpSocket);
+            clientUdpSocket = INVALID_SOCKET;
         }
         if (clientThread.joinable()) clientThread.join();
-        if (clientAudioThread.joinable()) clientAudioThread.join();
+        if (clientUdpListenerThread.joinable()) clientUdpListenerThread.join();
         if (clientHeartbeatThread.joinable()) clientHeartbeatThread.join();
         if (autoReconnectThread.joinable()) autoReconnectThread.join();
         Security::Shutdown();
