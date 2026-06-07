@@ -8,7 +8,7 @@ Glide your cursor seamlessly across your desktop and laptop screens, type on any
 <img src="docs/images/Main_Dashboard.png" alt="Main Application Dashboard" width="400">
 
 ## Core Features
-* **Zero-Latency KVM:** High-frequency, mathematically fractional cursor synchronization and keystroke injection ensures native-feeling control across all paired machines.
+* **Zero-Latency KVM:** High-frequency, mathematically fractional cursor synchronization and keystroke injection ensures native-feeling control across all paired machines. Media streams and mouse deltas are transmitted over a dedicated high-speed UDP pipeline, with automatic fallback to reliable TCP if blocked by firewalls.
 * **Centralized Audio Mixing:** Captures system audio from Client PCs using jitter-immune WASAPI loopback streams, mixing it seamlessly into the Server's playback device.
 * **Microphone Broadcasting & Injection:** Stream the Server's primary microphone to any connected Client. *(Note: Injecting this received audio into Client applications like Discord or Zoom requires the installation of a free Virtual Audio Cable, such as VB-CABLE, on the Client PC).*
 * **Out-Of-Band File Transfers:** Drag-and-drop files directly onto the UI to transfer them asynchronously over a dedicated, memory-safe TCP stream without interrupting KVM inputs.
