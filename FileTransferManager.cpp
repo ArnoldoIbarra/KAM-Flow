@@ -489,7 +489,7 @@ namespace FileTransfer {
             return; // Auto-decline if transfers are disabled locally
         }
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_pendingOffers.push_back({ payload.transferId, payload.fileSize, std::string(payload.fileName), senderSocket });
+        g_pendingOffers.push_back({ payload.transferId, payload.fileSize, std::string(payload.fileName, strnlen(payload.fileName, sizeof(payload.fileName))), senderSocket });
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Received File Offer: %s", payload.fileName);
     }
 

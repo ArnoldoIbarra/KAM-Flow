@@ -27,22 +27,38 @@ namespace Security {
     BCRYPT_ALG_HANDLE hAesAlg = NULL;
     BCRYPT_KEY_HANDLE hKey = NULL;
     std::vector<uint8_t> keyObjectBuffer;
+    std::atomic<bool> g_isSecurityShutdown{false};
 
-    thread_local BCRYPT_KEY_HANDLE tls_hKey = NULL;
-    thread_local std::vector<uint8_t> tls_keyObjectBuffer;
+    struct ThreadLocalKey {
+        BCRYPT_KEY_HANDLE hKey = NULL;
+        std::vector<uint8_t> keyObjectBuffer;
+        
+        ~ThreadLocalKey() {
+            if (hKey) {
+                BCryptDestroyKey(hKey);
+                hKey = NULL;
+            }
+            if (!keyObjectBuffer.empty()) {
+                SecureZeroMemory(keyObjectBuffer.data(), keyObjectBuffer.size());
+            }
+        }
+    };
+    
+    thread_local ThreadLocalKey tls_key;
 
     BCRYPT_KEY_HANDLE GetThreadLocalKey() {
-        if (tls_hKey != NULL) return tls_hKey;
+        if (g_isSecurityShutdown.load(std::memory_order_acquire)) return NULL;
+        if (tls_key.hKey != NULL) return tls_key.hKey;
         if (hKey == NULL) return NULL;
 
         DWORD cbKeyObject = 0, cbData = 0;
         BCryptGetProperty(hAesAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObject, sizeof(DWORD), &cbData, 0);
-        tls_keyObjectBuffer.resize(cbKeyObject);
+        tls_key.keyObjectBuffer.resize(cbKeyObject);
         
-        if (BCryptDuplicateKey(hKey, &tls_hKey, tls_keyObjectBuffer.data(), cbKeyObject, 0) != STATUS_SUCCESS) {
+        if (BCryptDuplicateKey(hKey, &tls_key.hKey, tls_key.keyObjectBuffer.data(), cbKeyObject, 0) != STATUS_SUCCESS) {
             return NULL;
         }
-        return tls_hKey;
+        return tls_key.hKey;
     }
 
     /**
@@ -52,6 +68,7 @@ namespace Security {
      */
     bool Initialize(const char* pin) {
         if (hAesAlg != NULL) return true;
+        g_isSecurityShutdown.store(false, std::memory_order_release);
 
         if (BCryptOpenAlgorithmProvider(&hAesAlg, BCRYPT_AES_ALGORITHM, NULL, 0) != STATUS_SUCCESS) {
             if (State::globalDebugMode) UI::LogDebug("[Security] Failed to open CNG AES Provider.");
@@ -200,6 +217,7 @@ namespace Security {
      * @return void
      */
     void Shutdown() {
+        g_isSecurityShutdown.store(true, std::memory_order_release);
         if (hKey) {
             BCryptDestroyKey(hKey);
             hKey = NULL;

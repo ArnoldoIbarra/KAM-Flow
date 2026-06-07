@@ -114,26 +114,27 @@ namespace Network {
         // Otherwise, concurrent threads (Audio, Heartbeat) will interleave sequence numbers 
         // into the TCP stream, causing the receiver to drop packets as false-positive Replay Attacks.
         PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++clientTxSequence };
-        std::vector<uint8_t> buffer;
+        
+        thread_local std::vector<uint8_t> tls_sendBuffer;
+        thread_local std::vector<uint8_t> tls_ciphertext;
 
         if (type != MessageType::EVENT_AUTH) {
-            std::vector<uint8_t> ciphertext;
             h.payloadSize = static_cast<uint32_t>(payloadSize + 28); // 12-byte IV + 16-byte Tag overhead
-            if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), ciphertext)) {
-                buffer.resize(sizeof(h) + ciphertext.size());
-                memcpy(buffer.data(), &h, sizeof(h));
-                memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
+            if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), tls_ciphertext)) {
+                tls_sendBuffer.resize(sizeof(h) + tls_ciphertext.size());
+                memcpy(tls_sendBuffer.data(), &h, sizeof(h));
+                memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(), tls_ciphertext.size());
             } else {
                 return false;
             }
         } else {
-            buffer.resize(sizeof(h) + payloadSize);
-            memcpy(buffer.data(), &h, sizeof(h));
-            memcpy(buffer.data() + sizeof(h), payload, payloadSize);
+            tls_sendBuffer.resize(sizeof(h) + payloadSize);
+            memcpy(tls_sendBuffer.data(), &h, sizeof(h));
+            memcpy(tls_sendBuffer.data() + sizeof(h), payload, payloadSize);
         }
         
-        if (!buffer.empty()) {
-            int res = send(targetSock, (const char*)buffer.data(), (int)buffer.size(), 0);
+        if (!tls_sendBuffer.empty()) {
+            int res = send(targetSock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0);
             return res != SOCKET_ERROR;
         }
         return false;
@@ -149,16 +150,17 @@ namespace Network {
         if (!lock.owns_lock()) return; // Socket is actively streaming data, heartbeat is unnecessary.
         
         PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_HEARTBEAT, 0, ++clientTxSequence };
-        std::vector<uint8_t> buffer;
-        std::vector<uint8_t> ciphertext;
+        
+        thread_local std::vector<uint8_t> tls_sendBuffer;
+        thread_local std::vector<uint8_t> tls_ciphertext;
         
         h.payloadSize = 28; // 12-byte IV + 16-byte Tag overhead for a 0-byte payload
-        if (Security::EncryptPayload(nullptr, 0, &h, sizeof(h), ciphertext)) {
-            buffer.resize(sizeof(h) + ciphertext.size());
-            memcpy(buffer.data(), &h, sizeof(h));
-            memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
+        if (Security::EncryptPayload(nullptr, 0, &h, sizeof(h), tls_ciphertext)) {
+            tls_sendBuffer.resize(sizeof(h) + tls_ciphertext.size());
+            memcpy(tls_sendBuffer.data(), &h, sizeof(h));
+            memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(), tls_ciphertext.size());
             
-            send(sock, (const char*)buffer.data(), (int)buffer.size(), 0);
+            send(sock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0);
         }
     }
 
@@ -302,7 +304,7 @@ namespace Network {
         WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
         isDiscoveryRunning = true;
         discoveryThread = std::thread([]() {
-            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
             DiscoveryLoop();
         });
     }
@@ -391,7 +393,7 @@ namespace Network {
             
             if (bytes <= 0) {
                 int wsaErr = WSAGetLastError();
-                if (WSAGetLastError() == WSAETIMEDOUT) {
+                if (wsaErr == WSAETIMEDOUT) {
                     State::SetClientStatus("Disconnected (Timeout).");
                     if (State::globalDebugMode) UI::LogDebug("[Network Client] Connection timed out (No Heartbeat received). WSA Error: %d", wsaErr);
                 } else {
@@ -541,8 +543,17 @@ namespace Network {
             else if (h.type == MessageType::EVENT_CLIPBOARD) {
                 if (finalSize > 0) {
                     // Convert byte stream back to a wide string and set it locally.
-                    std::wstring text((wchar_t*)finalPayload, finalSize / sizeof(wchar_t));
+                    std::wstring text;
+                if (finalSize % sizeof(wchar_t) == 0 && finalSize > 0) {
+                    text.assign((wchar_t*)finalPayload, finalSize / sizeof(wchar_t));
+                    if (!text.empty() && text.back() == L'\0') {
+                        text.pop_back();
+                    }
+                }
+                
+                if (!text.empty()) {
                     ClipboardManager::SetRemoteClipboard(text);
+                }
                 }
             }
             else if (h.type == MessageType::EVENT_MIC_DATA) {
@@ -585,11 +596,13 @@ namespace Network {
                     autoReconnectThread.join();
                 }
                 
-                autoReconnectThread = std::thread([]() {
+                std::string capturedIp = lastConnectedIp;
+                uint16_t capturedPort = lastConnectedPort;
+                autoReconnectThread = std::thread([capturedIp, capturedPort]() {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     if (!isIntentionalDisconnect && State::enableClientAutoReconnect) {
-                        if (State::globalDebugMode) UI::LogDebug("[Network Client] Attempting auto-reconnect to %s:%u...", lastConnectedIp.c_str(), lastConnectedPort);
-                        if (!StartClient(lastConnectedIp, lastConnectedPort, true)) {
+                        if (State::globalDebugMode) UI::LogDebug("[Network Client] Attempting auto-reconnect to %s:%u...", capturedIp.c_str(), capturedPort);
+                        if (!StartClient(capturedIp, capturedPort, true)) {
                             State::SetClientStatus("Auto-reconnect failed. Server unreachable.");
                         }
                     }
@@ -743,8 +756,9 @@ namespace Network {
             ClientLoop();
         });
         clientHeartbeatThread = std::thread([]() {
-            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             bool wasLocked = false;
+            int txHbCount = 0;
             while (isClientRunning) {
                 for (int i = 0; i < 20 && isClientRunning; ++i) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -754,7 +768,6 @@ namespace Network {
                     if (clientAudioSocket != INVALID_SOCKET) {
                         SendHeartbeatToSocket(clientAudioSocket, clientAudioSendMutex);
                     }
-                    static int txHbCount = 0;
                     if (++txHbCount % 10 == 0 && State::globalDebugMode) {
                         UI::LogDebug("[Network Client] Sent Keep-Alive Heartbeat to Server.");
                     }

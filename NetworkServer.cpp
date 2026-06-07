@@ -111,8 +111,16 @@ namespace Network {
      * @return A vector containing active client details.
      */
     std::vector<ConnectedClientInfo> GetConnectedClients() {
-        std::lock_guard<std::mutex> lock(clientsMutex);
-        return activeClients;
+        static std::vector<ConnectedClientInfo> cachedClients;
+        static uint64_t lastCacheTime = 0;
+        uint64_t now = GetTickCount64();
+
+        if (now - lastCacheTime > 500) {
+            std::lock_guard<std::mutex> lock(clientsMutex);
+            cachedClients = activeClients;
+            lastCacheTime = now;
+        }
+        return cachedClients;
     }
 
     /**
@@ -416,8 +424,18 @@ namespace Network {
                 } else if (header.type == MessageType::EVENT_CLIPBOARD) {
                     if (finalSize > 0) {
                         // Convert byte stream back to a wide string and set it locally.
-                        std::wstring text((wchar_t*)finalPayload, finalSize / sizeof(wchar_t));
-                        ClipboardManager::SetRemoteClipboard(text);
+                        std::wstring text;
+                if (finalSize % sizeof(wchar_t) == 0 && finalSize > 0) {
+                    text.assign((wchar_t*)finalPayload, finalSize / sizeof(wchar_t));
+                    // Ensure the string is properly terminated before passing to clipboard
+                    if (!text.empty() && text.back() == L'\0') {
+                        text.pop_back();
+                    }
+                }
+                
+                if (!text.empty()) {
+                    ClipboardManager::SetRemoteClipboard(text);
+                }
                     }
                 } else if (header.type == MessageType::EVENT_CLIENT_LOCKED) {
                     if (State::IsRemote()) {
@@ -504,7 +522,19 @@ namespace Network {
                             
                             AuthPayload auth;
                             memcpy(&auth, authBuffer.data(), sizeof(AuthPayload));
-                            if (strncmp(auth.pin, activeServerPin.c_str(), 8) == 0) {
+                            if (auth.clientName[sizeof(auth.clientName) - 1] != '\0') {
+                    auth.clientName[sizeof(auth.clientName) - 1] = '\0';
+                }
+                if (auth.pin[sizeof(auth.pin) - 1] != '\0') {
+                    auth.pin[sizeof(auth.pin) - 1] = '\0';
+                }
+
+                volatile uint8_t diff = 0;
+                for (int i = 0; i < 8; ++i) {
+                    diff |= auth.pin[i] ^ activeServerPin.c_str()[i];
+                }
+
+                if (diff == 0) {
 
 
                                 if (State::globalDebugMode) UI::LogDebug("[Network Server] Client Authenticated.");
@@ -704,7 +734,7 @@ namespace Network {
         beaconThread = std::thread(UDPBeaconLoop, port);
 
         serverHeartbeatThread = std::thread([]() {
-            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             int txHbCount = 0;
             while (isRunning) {
                 for (int i = 0; i < 20 && isRunning; ++i) {
@@ -815,26 +845,27 @@ namespace Network {
             std::lock_guard<std::mutex> sendLock(*t.mtx);
             
             PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
-            std::vector<uint8_t> buffer;
+            
+            thread_local std::vector<uint8_t> tls_sendBuffer;
+            thread_local std::vector<uint8_t> tls_ciphertext;
 
             if (type != MessageType::EVENT_AUTH && type != MessageType::EVENT_UDP_BEACON) {
-                std::vector<uint8_t> ciphertext;
                 h.payloadSize = static_cast<uint32_t>(payloadSize + 28); // 12-byte IV + 16-byte Tag
-                if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), ciphertext)) {
-                    buffer.resize(sizeof(h) + ciphertext.size());
-                    memcpy(buffer.data(), &h, sizeof(h));
-                    memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
+                if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), tls_ciphertext)) {
+                    tls_sendBuffer.resize(sizeof(h) + tls_ciphertext.size());
+                    memcpy(tls_sendBuffer.data(), &h, sizeof(h));
+                    memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(), tls_ciphertext.size());
                 } else {
                     continue; 
                 }
             } else {
-                buffer.resize(sizeof(h) + payloadSize);
-                memcpy(buffer.data(), &h, sizeof(h));
-                memcpy(buffer.data() + sizeof(h), payload, payloadSize);
+                tls_sendBuffer.resize(sizeof(h) + payloadSize);
+                memcpy(tls_sendBuffer.data(), &h, sizeof(h));
+                memcpy(tls_sendBuffer.data() + sizeof(h), payload, payloadSize);
             }
 
             uint64_t tStart = GetTickCount64();
-            if (send(t.sock, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
+            if (send(t.sock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0) == SOCKET_ERROR) {
                 shutdown(t.sock, SD_BOTH); // Force the listener loop to sever the dead socket.
             }
             uint64_t tEnd = GetTickCount64();
@@ -870,39 +901,34 @@ namespace Network {
         }
         if (targets.empty()) return false;
 
-        PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_CLIPBOARD, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
-        std::vector<uint8_t> buffer;
-
-        std::vector<uint8_t> ciphertext;
-        h.payloadSize = static_cast<uint32_t>(payloadSize + 28); // 12-byte IV + 16-byte Tag
-        if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), ciphertext)) {
-            buffer.resize(sizeof(h) + ciphertext.size());
-            memcpy(buffer.data(), &h, sizeof(h));
-            memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
-        } else {
-            return false;
-        }
-
         // Per-client send: clipboard delivery to each client is independently locked.
         for (auto& t : targets) {
             std::lock_guard<std::mutex> sendLock(*t.mtx);
-            if (send(t.sock, (const char*)buffer.data(), (int)buffer.size(), 0) == SOCKET_ERROR) {
-                shutdown(t.sock, SD_BOTH);
+            
+            PacketHeader h = { PACKET_MAGIC, MessageType::EVENT_CLIPBOARD, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
+            h.payloadSize = static_cast<uint32_t>(payloadSize + 28); // 12-byte IV + 16-byte Tag
+
+            thread_local std::vector<uint8_t> tls_sendBuffer;
+            thread_local std::vector<uint8_t> tls_ciphertext;
+
+            if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), tls_ciphertext)) {
+                tls_sendBuffer.resize(sizeof(h) + tls_ciphertext.size());
+                memcpy(tls_sendBuffer.data(), &h, sizeof(h));
+                memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(), tls_ciphertext.size());
+                
+                if (send(t.sock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0) == SOCKET_ERROR) {
+                    shutdown(t.sock, SD_BOTH);
+                }
             }
         }
         return true;
     }
 
     bool SendToClient(SOCKET clientSocket, MessageType type, const void* payload, size_t payloadSize) {
-        PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), ++serverTxSequence };
-        std::vector<uint8_t> buffer;
-
-        std::vector<uint8_t> ciphertext;
-        h.payloadSize = static_cast<uint32_t>(payloadSize + 28);
-        if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), ciphertext)) {
-            buffer.resize(sizeof(h) + ciphertext.size());
-            memcpy(buffer.data(), &h, sizeof(h));
-            memcpy(buffer.data() + sizeof(h), ciphertext.data(), ciphertext.size());
+        PacketHeader h = { PACKET_MAGIC, type, static_cast<uint32_t>(payloadSize), 0 }; // Sequence generated below
+        
+        thread_local std::vector<uint8_t> tls_sendBuffer;
+        thread_local std::vector<uint8_t> tls_ciphertext;
             
             // Lock only this specific client's send mutex, not a global lock.
             std::shared_ptr<std::mutex> sendMtx;
@@ -925,14 +951,23 @@ namespace Network {
             if (!sendMtx) return false; // Client disconnected before we could send
             
             std::lock_guard<std::mutex> sendLock(*sendMtx);
-            uint64_t tStart = GetTickCount64();
-            int res = send(targetSock, (const char*)buffer.data(), (int)buffer.size(), 0);
-            uint64_t tEnd = GetTickCount64();
-            if (State::globalDebugMode && (tEnd - tStart) > 50) {
-                UI::LogDebug("[Network Server] WARNING: SendToClient blocked for %llu ms! TCP congested.", (unsigned long long)(tEnd - tStart));
+            
+            // Generate sequence and encrypt under the per-client lock
+            h.sequenceNumber = ++serverTxSequence;
+            h.payloadSize = static_cast<uint32_t>(payloadSize + 28);
+            if (Security::EncryptPayload(payload, payloadSize, &h, sizeof(h), tls_ciphertext)) {
+                tls_sendBuffer.resize(sizeof(h) + tls_ciphertext.size());
+                memcpy(tls_sendBuffer.data(), &h, sizeof(h));
+                memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(), tls_ciphertext.size());
+
+                uint64_t tStart = GetTickCount64();
+                int res = send(targetSock, (const char*)tls_sendBuffer.data(), (int)tls_sendBuffer.size(), 0);
+                uint64_t tEnd = GetTickCount64();
+                if (State::globalDebugMode && (tEnd - tStart) > 50) {
+                    UI::LogDebug("[Network Server] WARNING: SendToClient blocked for %llu ms! TCP congested.", (unsigned long long)(tEnd - tStart));
+                }
+                return res != SOCKET_ERROR;
             }
-            return res != SOCKET_ERROR;
-        }
         return false;
     }
 

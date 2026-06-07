@@ -402,8 +402,11 @@ namespace Audio {
                     if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                         // CRITICAL: We MUST send silence to keep the server's playback clock perfectly synced.
                         // Ignoring silent packets causes the server to consume audio faster than real-time, leading to starvation.
-                        std::vector<BYTE> silence(dataSize, 0);
-                        Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, silence.data(), dataSize);
+                        static thread_local std::vector<BYTE> silenceBuffer;
+                        if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
+                        else std::memset(silenceBuffer.data(), 0, dataSize);
+                        
+                        Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, silenceBuffer.data(), dataSize);
                     } else {
                         Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, pData, dataSize);
                     }
@@ -557,6 +560,7 @@ namespace Audio {
         if (State::globalDebugMode) UI::LogDebug("[Audio] Audio renderer thread started successfully.");
 
         std::vector<uint8_t> linearBuffer; // Reusable extraction buffer for the RingBuffer
+        std::vector<float> mixBuffer;      // Reusable master mix buffer
 
         while (g_isRenderRunning) {
             // Wait precisely for the hardware to demand data, eliminating sleep drift!
@@ -577,8 +581,10 @@ namespace Audio {
             BYTE* pData;
             hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
             if (SUCCEEDED(hr)) {
-                // Create a master mix buffer, initialized to silence (0.0f).
-                std::vector<float> mixBuffer(numFramesAvailable * pMixFormat->nChannels, 0.0f);
+                // Resize if needed, then initialize to silence (0.0f).
+                size_t mixBufferSize = numFramesAvailable * pMixFormat->nChannels;
+                if (mixBuffer.size() < mixBufferSize) mixBuffer.resize(mixBufferSize, 0.0f);
+                std::fill(mixBuffer.begin(), mixBuffer.begin() + mixBufferSize, 0.0f);
                 
                 size_t bytesPerFrame = (format.bitDepth / 8) * format.channels;
                 size_t bytesToProcess = numFramesAvailable * bytesPerFrame;
@@ -797,8 +803,11 @@ namespace Audio {
                 if (SUCCEEDED(hr)) {
                     UINT32 dataSize = numFramesAvailable * pTargetWaveFormat->nBlockAlign;
                     if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                        std::vector<BYTE> silence(dataSize, 0);
-                        Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, silence.data(), dataSize);
+                        static thread_local std::vector<BYTE> silenceBuffer;
+                        if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
+                        else std::memset(silenceBuffer.data(), 0, dataSize);
+                        
+                        Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, silenceBuffer.data(), dataSize);
                     } else {
                         Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, pData, dataSize);
                     }
@@ -974,19 +983,42 @@ namespace Audio {
 
                     {
                         std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
+                        size_t availableBytes = g_clientMicQueue.buffer.Size();
+                        
                         if (g_clientMicQueue.isBuffering) {
                             writeSilence = true;
-                        } else if (g_clientMicQueue.buffer.Size() < bytesToProcess) {
-                            g_clientMicQueue.isBuffering = true;
-                            writeSilence = true;
-                            justStartedBuffering = true;
+                        } else if (availableBytes == 0) {
+                            g_clientMicQueue.starvationCount++;
+                            if (g_clientMicQueue.starvationCount > 10) {
+                                g_clientMicQueue.isBuffering = true;
+                                g_clientMicQueue.starvationCount = 0;
+                                writeSilence = true;
+                                justStartedBuffering = true;
+                            } else {
+                                writeSilence = true; // Pad with silence temporarily
+                            }
                         } else {
-                            g_clientMicQueue.buffer.Pop(pData, bytesToProcess);
+                            g_clientMicQueue.starvationCount = 0;
+                            // Partial fill logic to prevent catastrophic 50ms rebuffering pauses
+                            size_t bytesRead = (std::min)(availableBytes, bytesToProcess);
+                            // Align to frame boundaries
+                            size_t frameSize = pSourceFormat->nBlockAlign;
+                            bytesRead = bytesRead - (bytesRead % frameSize);
+                            
+                            if (bytesRead > 0) {
+                                g_clientMicQueue.buffer.Pop(pData, bytesRead);
+                                if (bytesRead < bytesToProcess) {
+                                    // Zero out the remaining buffer
+                                    std::memset(pData + bytesRead, 0, bytesToProcess - bytesRead);
+                                }
+                            } else {
+                                writeSilence = true;
+                            }
                         }
                     }
 
                     if (justStartedBuffering && State::globalDebugMode) {
-                        UI::LogDebug("[Audio Debug] Client Mic Starvation! Returning to Jitter Buffering mode.");
+                        UI::LogDebug("[Audio Debug] Client Mic Starvation! (10 consecutive drops). Returning to Jitter Buffering mode.");
                     }
 
                     if (writeSilence) {

@@ -104,17 +104,10 @@ int main(int argc, char* argv[]) {
         UI::LogDebug("KAM-Flow Engine Booting...");
     }
     
-    char savedIp[256];
-    const std::string& iniPath = Config::GetResolvedPath();
-    GetPrivateProfileStringA("Network", "TargetIP", "127.0.0.1", savedIp, sizeof(savedIp), iniPath.c_str());
-    std::string targetIp = savedIp;
-    uint16_t port = (uint16_t)GetPrivateProfileIntA("Network", "Port", 8080, iniPath.c_str());
-
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-client") { 
             State::currentRole = State::AppRole::CLIENT; 
-            if (i + 1 < argc) targetIp = argv[i + 1]; 
         }
         if (arg == "-server") { 
             State::currentRole = State::AppRole::SERVER; 
@@ -142,7 +135,7 @@ int main(int argc, char* argv[]) {
                     ClipboardManager::Start();
                 } else if (State::currentRole == State::AppRole::SERVER) {
                     if (State::globalDebugMode) UI::LogDebug("[Role] SERVER MODE locked in.");
-                    Network::StartServer(port);
+                    Network::StartServer(8080);
                     // If audio mixing is enabled in the config, start the renderer now.
                     if (State::enableServerAudioMix) {
                         Audio::StartAudioRenderer();
@@ -160,7 +153,7 @@ int main(int argc, char* argv[]) {
         
         // --- GRACEFUL DATA PERSISTENCE ---
         // Save the precise state of all checkboxes right before the window collapses
-        Config::SaveConfig(targetIp, port);
+        Config::SaveConfig("127.0.0.1", 8080);
         
         UI::Shutdown();
     }

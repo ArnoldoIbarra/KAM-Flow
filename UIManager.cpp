@@ -55,7 +55,6 @@ namespace UI {
     char newServerIP[64] = "";
     char newServerPIN[16] = "";
     bool showServerPin = false;
-    bool focusPairingTab = false;
     
     // --- IN-ENGINE DEBUG CONSOLE ---
     std::mutex g_logMutex;
@@ -644,10 +643,6 @@ namespace UI {
                     }
                     DrawWrappedTooltip("Generate a new random PIN and instantly disconnect all currently active clients.");
                 } else { // Client
-                    if (focusPairingTab) {
-                        focusPairingTab = false;
-                    }
-
                     ImGui::Text("Pairing Status");
                     ImGui::Separator();
                     
