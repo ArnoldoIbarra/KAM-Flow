@@ -47,6 +47,9 @@ namespace Network {
     /// Background thread for keeping the connection alive.
     std::thread clientHeartbeatThread;
 
+    /// Mutex to serialize UDP sends without blocking TCP heartbeats.
+    std::mutex clientUdpSendMutex;
+
     /// Independent UDP transmit sequence counter to prevent cross-talk replay drops.
     std::atomic<uint32_t> clientUdpTxSequence{0};
     /// Independent UDP receive sequence counter.
@@ -114,10 +117,12 @@ namespace Network {
         if (type == MessageType::EVENT_UDP_HANDSHAKE) {
             isUdp = true;
             targetSock = clientUdpSocket;
-        } else if (type == MessageType::EVENT_MOUSE || type == MessageType::EVENT_RETURN_CONTROL) {
+            targetMutex = &clientUdpSendMutex;
+        } else if (type == MessageType::EVENT_MOUSE || type == MessageType::EVENT_AUDIO_DATA || type == MessageType::EVENT_MIC_DATA) {
             if (isUdpActive.load(std::memory_order_relaxed)) {
                 isUdp = true;
                 targetSock = clientUdpSocket;
+                targetMutex = &clientUdpSendMutex;
                 static bool hasLoggedUdpRecovery = false;
                 if (hasLoggedUdpRecovery) {
                     hasLoggedUdpRecovery = false;
@@ -125,7 +130,7 @@ namespace Network {
             } else {
                 static bool hasLoggedTcpFallback = false;
                 if (!hasLoggedTcpFallback && State::globalDebugMode) {
-                    UI::LogDebug("[Network Client] UDP not active. Falling back to TCP for EVENT_MOUSE/RETURN_CONTROL.");
+                    UI::LogDebug("[Network Client] UDP not active. Falling back to TCP for media streams.");
                     hasLoggedTcpFallback = true;
                 }
                 // Fallback to TCP is automatic because targetSock is already clientSocket
