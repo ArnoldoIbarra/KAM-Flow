@@ -47,6 +47,10 @@ namespace Network {
     /// Protected by clientsMutex for additions/removals. shared_ptr ensures the mutex stays alive
     /// even if a client disconnects while another thread is mid-send (the pointer keeps it valid).
     std::map<SOCKET, std::shared_ptr<std::mutex>> clientSendMutexes;
+    /// Tracks which client socket currently has control (receives mouse/keyboard input).
+    /// Set when RouteCursorTransition successfully sends a sync to a target client.
+    /// Reset to INVALID_SOCKET when control returns to LOCAL.
+    std::atomic<SOCKET> g_controllingClientSocket{INVALID_SOCKET};
     /// Background thread for accepting incoming TCP connections.
     std::thread serverThread;   
     /// Control flag for the TCP server lifecycle.
@@ -94,10 +98,21 @@ namespace Network {
      * @return void
      */
     void RegenerateMasterPin() {
-        uint32_t rng;
-        BCryptGenRandom(NULL, (PUCHAR)&rng, sizeof(rng), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-        activeServerPin = std::to_string(10000000 + (rng % 90000000));
+        // Generate 8 independent random digits for maximum visual diversity.
+        // First digit is 1-9 (no leading zero), remaining 7 are 0-9.
+        uint8_t digits[8];
+        BCryptGenRandom(NULL, digits, sizeof(digits), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        char pin[9];
+        pin[0] = '1' + (digits[0] % 9);
+        for (int i = 1; i < 8; ++i) pin[i] = '0' + (digits[i] % 10);
+        pin[8] = '\0';
+        activeServerPin = pin;
         CredentialManager::SaveSecret("KAMFlow_LocalServer", activeServerPin);
+
+        // Re-derive the AES-GCM key from the new PIN. Without this, the server would
+        // continue encrypting with the old key, causing all new client connections to fail.
+        Security::Shutdown();
+        Security::Initialize(activeServerPin.c_str());
         
         std::lock_guard<std::mutex> lock(clientsMutex);
         for (const auto& client : activeClients) {
@@ -120,7 +135,10 @@ namespace Network {
     std::vector<ConnectedClientInfo> GetConnectedClients() {
         static std::vector<ConnectedClientInfo> cachedClients;
         static uint64_t lastCacheTime = 0;
+        static std::mutex cacheMutex;  // Protect the cache itself from concurrent readers
         uint64_t now = GetTickCount64();
+
+        std::lock_guard<std::mutex> cacheLock(cacheMutex);
 
         if (now - lastCacheTime > 500) {
             std::lock_guard<std::mutex> lock(clientsMutex);
@@ -391,6 +409,7 @@ namespace Network {
                 } else if (header.type == MessageType::EVENT_CLIENT_LOCKED) {
                     if (State::IsRemote()) {
                         if (State::globalDebugMode) UI::LogDebug("[Network Server] Client locked by UAC/Secure Desktop. Auto-reverting control.");
+                        g_controllingClientSocket.store(INVALID_SOCKET, std::memory_order_relaxed);
                         State::SetMode(State::ControlMode::LOCAL);
                     }
                 } else if (header.type == MessageType::EVENT_FILE_OFFER) {
@@ -414,17 +433,33 @@ namespace Network {
 
         if (State::globalDebugMode) UI::LogDebug("[Network Server] Client disconnected.");
         
-        std::lock_guard<std::mutex> lock(clientsMutex);
-        for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
-            if (it->socket == clientSocket) {
-                activeClients.erase(it);
-                g_hasClients.store(!activeClients.empty(), std::memory_order_relaxed);
-                clientSendMutexes.erase(clientSocket);
-                break;
+        // Remove the client from the active list under the lock, but release the lock
+        // BEFORE calling SetMode or closesocket. SetMode → BroadcastMessage → clientsMutex
+        // would deadlock if we still held the lock (std::mutex is non-recursive).
+        {
+            std::lock_guard<std::mutex> lock(clientsMutex);
+            for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
+                if (it->socket == clientSocket) {
+                    activeClients.erase(it);
+                    g_hasClients.store(!activeClients.empty(), std::memory_order_relaxed);
+                    clientSendMutexes.erase(clientSocket);
+                    break;
+                }
             }
         }
+        // These operations are safe outside the lock:
         Audio::ClearClientAudioQueue(clientSocket);
         closesocket(clientSocket);
+
+        // CRITICAL SAFETY: If the disconnected client was the one that had control,
+        // immediately revert to LOCAL to prevent input lockout.
+        // Only revert for the controlling client — other clients disconnecting
+        // should not affect the active KVM session.
+        if (State::IsRemote() && g_controllingClientSocket.load(std::memory_order_relaxed) == clientSocket) {
+            if (State::globalDebugMode) UI::LogDebug("[Network Server] Controlling client dropped. Auto-reverting to LOCAL.");
+            g_controllingClientSocket.store(INVALID_SOCKET, std::memory_order_relaxed);
+            State::SetMode(State::ControlMode::LOCAL);
+        }
     }
 
     /**
@@ -695,14 +730,21 @@ namespace Network {
         serverUdpTxSequence = 0;
 
         if (!CredentialManager::LoadSecret("KAMFlow_LocalServer", activeServerPin)) {
-            // First boot: Generate a secure 8-digit random PIN
-            uint32_t rng;
-            BCryptGenRandom(NULL, (PUCHAR)&rng, sizeof(rng), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-            activeServerPin = std::to_string(10000000 + (rng % 90000000));
+            // First boot: Generate a secure 8-digit random PIN (per-digit, no leading zero)
+            uint8_t digits[8];
+            BCryptGenRandom(NULL, digits, sizeof(digits), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            char pin[9];
+            pin[0] = '1' + (digits[0] % 9);
+            for (int i = 1; i < 8; ++i) pin[i] = '0' + (digits[i] % 10);
+            pin[8] = '\0';
+            activeServerPin = pin;
             CredentialManager::SaveSecret("KAMFlow_LocalServer", activeServerPin);
             if (State::globalDebugMode) UI::LogDebug("[Security] Generated new Master PIN: %s", activeServerPin.c_str());
         }
 
+        // Reset the crypto engine before re-init to handle server restarts cleanly.
+        // Security::Initialize() early-returns if already initialized, leaving a stale key.
+        Security::Shutdown();
         if (!Security::Initialize(activeServerPin.c_str())) {
             if (State::globalDebugMode) UI::LogDebug("[Security] FATAL: Cryptography Engine failed to initialize.");
             return false;
@@ -719,9 +761,17 @@ namespace Network {
 
         if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) return false;
         listen(serverSocket, SOMAXCONN);
+
+        // Ensure accept() can be interrupted by closesocket() during shutdown
+        DWORD acceptTimeout = 1000;
+        setsockopt(serverSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&acceptTimeout, sizeof(acceptTimeout));
         
         serverUdpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (bind(serverUdpSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) return false;
+
+        // Prevent indefinite blocking on recvfrom() to allow clean shutdown
+        DWORD udpTimeout = 500;
+        setsockopt(serverUdpSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&udpTimeout, sizeof(udpTimeout));
 
         isRunning = true;
         serverThread = std::thread([]() {
@@ -765,6 +815,9 @@ namespace Network {
         isRunning = false;
         isBeaconRunning = false;
 
+        // Clear control tracking to prevent stale state on restart
+        g_controllingClientSocket.store(INVALID_SOCKET, std::memory_order_relaxed);
+
         if (serverSocket != INVALID_SOCKET) {
             closesocket(serverSocket);
             serverSocket = INVALID_SOCKET;
@@ -786,6 +839,7 @@ namespace Network {
         if (serverThread.joinable()) serverThread.join();
         if (beaconThread.joinable()) beaconThread.join();
         if (serverHeartbeatThread.joinable()) serverHeartbeatThread.join();
+        if (udpListenerThread.joinable()) udpListenerThread.join();
 
         // Securely wait for all client handlers to finish before destroying subsystems
         {
@@ -1000,6 +1054,7 @@ namespace Network {
             if (targetX == 0 && targetY == 0) {
                 // Ray hit the Server's coordinates; pull control back locally.
                 Input::HandleReturnControl(entryEdge, normX, normY);
+                g_controllingClientSocket.store(INVALID_SOCKET, std::memory_order_relaxed);
                 State::SetMode(State::ControlMode::LOCAL);
                 return true;
             }
@@ -1019,6 +1074,7 @@ namespace Network {
                 // Ray hit an active client; send the synchronization command directly.
                 CursorSyncPayload p = { entryEdge, normX, normY };
                 if (SendToClient(targetSocket, MessageType::EVENT_SYNC_CURSOR, &p, sizeof(p))) {
+                    g_controllingClientSocket.store(targetSocket, std::memory_order_relaxed);
                     State::SetMode(State::ControlMode::REMOTE);
                     return true;
                 } else {

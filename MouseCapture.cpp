@@ -87,7 +87,11 @@ namespace Input {
             std::queue<Network::MousePayload> localQueue;
             {
                 std::unique_lock<std::mutex> lock(g_mouseQueueMutex);
-                g_mouseQueueCv.wait(lock, [] { 
+                // Coalesce mouse deltas for up to 2ms before sending.
+                // This replaces the old wait() + sleep(7ms) double-throttle pattern.
+                // With UDP streaming, TCP congestion is no longer a concern, so 2ms
+                // provides near-native responsiveness while still batching a few deltas.
+                g_mouseQueueCv.wait_for(lock, std::chrono::milliseconds(2), [] { 
                     return !g_mouseQueue.empty() || !g_isMouseNetworkThreadRunning; 
                 });
 
@@ -98,6 +102,8 @@ namespace Input {
                 // Swap queues instantly to release the mutex back to the hook thread
                 std::swap(localQueue, g_mouseQueue);
             }
+
+            if (localQueue.empty()) continue; // Timeout with no events, just loop back
 
             // Perform the blocking network calls outside of the OS hook chain
             Network::MousePayload coalescedMove = { 0, 0, 0, 0 };
@@ -129,11 +135,6 @@ namespace Input {
             if (hasCoalescedMove) {
                 Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
             }
-
-            // Cap the KVM network transmission rate to ~144Hz (7ms). 
-            // This prevents TCP congestion/bufferbloat (WSA 10060/10054 crashes) when 
-            // the user has a high-polling-rate (1000Hz+) gaming mouse.
-            std::this_thread::sleep_for(std::chrono::milliseconds(7));
         }
     }
 

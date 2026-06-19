@@ -170,6 +170,7 @@ namespace Audio {
         ByteRingBuffer buffer;
         std::mutex mtx;
         bool isBuffering = true;
+        bool wasBuffering = false;  // Tracks previous buffering state for silence→audio fade-in
         int starvationCount = 0;
     };
     std::map<uintptr_t, std::shared_ptr<ClientAudioQueue>> g_clientAudioQueues;
@@ -571,7 +572,13 @@ namespace Audio {
             }
 
             UINT32 numPaddingFrames;
-            pAudioClient->GetCurrentPadding(&numPaddingFrames);
+            HRESULT hrPad = pAudioClient->GetCurrentPadding(&numPaddingFrames);
+            if (FAILED(hrPad)) {
+                // Device invalidated (sleep/wake, driver update, device unplugged).
+                // Exit the loop cleanly; the thread will release all resources on exit.
+                if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: Device invalidated (0x%08X). Exiting.", hrPad);
+                break;
+            }
 
             UINT32 numFramesAvailable = bufferFrameCount - numPaddingFrames;
             if (numFramesAvailable == 0) {
@@ -580,7 +587,12 @@ namespace Audio {
 
             BYTE* pData;
             hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
-            if (SUCCEEDED(hr)) {
+            if (FAILED(hr)) {
+                // GetBuffer failed — device may be in an invalid state after sleep/wake.
+                if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: GetBuffer failed (0x%08X). Exiting.", hr);
+                break;
+            }
+            {
                 // Resize if needed, then initialize to silence (0.0f).
                 size_t mixBufferSize = numFramesAvailable * pMixFormat->nChannels;
                 if (mixBuffer.size() < mixBufferSize) mixBuffer.resize(mixBufferSize, 0.0f);
@@ -624,7 +636,10 @@ namespace Audio {
                             // Instead of instantly pausing for 50ms due to microsecond clock drift,
                             // we pad with 5ms of silence. We only rebuild the jitter buffer if it's a true network drop.
                             queue->starvationCount++;
-                            if (queue->starvationCount > 10) {
+                            // 50 consecutive empty polls (~500ms at 10ms/callback) before triggering re-buffer.
+                            // The old threshold of 10 was too aggressive — under CPU stress, momentary 100-200ms
+                            // packet delays would trigger a catastrophic re-buffer that causes audible pops.
+                            if (queue->starvationCount > 50) {
                                 queue->isBuffering = true;
                                 queue->starvationCount = 0;
                                 isBuffering = true;
@@ -658,6 +673,24 @@ namespace Audio {
                     }
 
                     if (bytesRead == 0) continue;
+
+                    // Apply a 64-sample linear fade-in ramp to eliminate the silence→audio click.
+                    // This smooths the transition when the buffer resumes after starvation.
+                    if (queue->wasBuffering && bytesRead > 0) {
+                        size_t rampSamples = (std::min)((size_t)64, bytesRead / (format.bitDepth / 8));
+                        if (format.bitDepth == 32) {
+                            float* p = reinterpret_cast<float*>(linearBuffer.data());
+                            for (size_t s = 0; s < rampSamples; ++s) {
+                                p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
+                            }
+                        } else if (format.bitDepth == 16) {
+                            int16_t* p = reinterpret_cast<int16_t*>(linearBuffer.data());
+                            for (size_t s = 0; s < rampSamples; ++s) {
+                                p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
+                            }
+                        }
+                        queue->wasBuffering = false;
+                    }
 
                     // Log partial fills (only when significant data is missing, rate-limited)
                     if (bytesRead < bytesToProcess && State::globalDebugMode) {
@@ -970,13 +1003,22 @@ namespace Audio {
 
         while (g_isClientMicRunning) {
             UINT32 numPaddingFrames;
-            pAudioClient->GetCurrentPadding(&numPaddingFrames);
+            HRESULT hrPad = pAudioClient->GetCurrentPadding(&numPaddingFrames);
+            if (FAILED(hrPad)) {
+                // Device invalidated (sleep/wake, driver update, device unplugged).
+                if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: Device invalidated (0x%08X). Exiting.", hrPad);
+                break;
+            }
             UINT32 numFramesAvailable = bufferFrameCount - numPaddingFrames;
 
             if (numFramesAvailable > 0) {
                 BYTE* pData;
                 hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
-                if (SUCCEEDED(hr)) {
+                if (FAILED(hr)) {
+                    if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: GetBuffer failed (0x%08X). Exiting.", hr);
+                    break;
+                }
+                {
                     size_t bytesToProcess = numFramesAvailable * pSourceFormat->nBlockAlign;
                     bool writeSilence = false;
                     bool justStartedBuffering = false;
@@ -989,7 +1031,8 @@ namespace Audio {
                             writeSilence = true;
                         } else if (availableBytes == 0) {
                             g_clientMicQueue.starvationCount++;
-                            if (g_clientMicQueue.starvationCount > 10) {
+                            // 50 consecutive empty polls (~500ms) before re-buffering (same as server render)
+                            if (g_clientMicQueue.starvationCount > 50) {
                                 g_clientMicQueue.isBuffering = true;
                                 g_clientMicQueue.starvationCount = 0;
                                 writeSilence = true;
@@ -1018,7 +1061,26 @@ namespace Audio {
                     }
 
                     if (justStartedBuffering && State::globalDebugMode) {
-                        UI::LogDebug("[Audio Debug] Client Mic Starvation! (10 consecutive drops). Returning to Jitter Buffering mode.");
+                        UI::LogDebug("[Audio Debug] Client Mic Starvation! (50 consecutive drops). Returning to Jitter Buffering mode.");
+                    }
+
+                    // Apply fade-in ramp when exiting buffering mode to eliminate clicks
+                    if (g_clientMicQueue.wasBuffering && !writeSilence) {
+                        size_t frameSize = pSourceFormat->nBlockAlign;
+                        size_t totalSamples = bytesToProcess / (pSourceFormat->wBitsPerSample / 8);
+                        size_t rampSamples = (std::min)((size_t)64, totalSamples);
+                        if (pSourceFormat->wBitsPerSample == 32) {
+                            float* p = reinterpret_cast<float*>(pData);
+                            for (size_t s = 0; s < rampSamples; ++s) {
+                                p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
+                            }
+                        } else if (pSourceFormat->wBitsPerSample == 16) {
+                            int16_t* p = reinterpret_cast<int16_t*>(pData);
+                            for (size_t s = 0; s < rampSamples; ++s) {
+                                p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
+                            }
+                        }
+                        g_clientMicQueue.wasBuffering = false;
                     }
 
                     if (writeSilence) {
@@ -1096,6 +1158,7 @@ namespace Audio {
             size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (jitterTargetMs / 1000.0f));
             if (g_clientMicQueue.isBuffering && g_clientMicQueue.buffer.Size() >= minBufferThreshold) {
                 g_clientMicQueue.isBuffering = false;
+                g_clientMicQueue.wasBuffering = true;  // Signal fade-in ramp on the next render callback
             }
 
             // Target latency maximum: Provide a massive burst ceiling to gracefully absorb network spikes
@@ -1163,6 +1226,7 @@ namespace Audio {
             size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (jitterTargetMs / 1000.0f));
             if (pQueue->isBuffering && pQueue->buffer.Size() >= minBufferThreshold) {
                 pQueue->isBuffering = false;
+                pQueue->wasBuffering = true;  // Signal fade-in ramp on the next render callback
             }
 
             // Target latency maximum: Provide a massive burst ceiling to gracefully absorb network spikes

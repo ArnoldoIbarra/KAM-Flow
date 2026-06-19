@@ -55,6 +55,43 @@ namespace UI {
     char newServerIP[64] = "";
     char newServerPIN[16] = "";
     bool showServerPin = false;
+
+    // Pairing flow state for the client mode Connections tab
+    char g_pairingTargetIP[64] = "";
+    char g_pairingTargetHostname[64] = "";
+    char g_pairingPinInput[16] = "";
+    bool g_showPinPopup = false;
+    bool g_showAlreadyPairedWarning = false;
+    bool g_showNotPairedPopup = false;
+    bool g_editingPairedIP = false;
+    char g_editIPBuffer[64] = "";
+    bool g_editIPInvalid = false;
+    bool g_showPairingPin = false;
+
+    /**
+     * @brief Validates that a C-string is a well-formed IPv4 address (4 octets, 0-255).
+     * @param ip The null-terminated string to validate.
+     * @return true if the string is a valid IPv4 address.
+     */
+    bool IsValidIPv4(const char* ip) {
+        if (!ip || ip[0] == '\0') return false;
+        int octets[4];
+        char extra;
+        // sscanf with trailing %c detects garbage after the last octet
+        int matched = sscanf(ip, "%d.%d.%d.%d%c", &octets[0], &octets[1], &octets[2], &octets[3], &extra);
+        if (matched != 4) return false;
+        for (int i = 0; i < 4; ++i) {
+            if (octets[i] < 0 || octets[i] > 255) return false;
+        }
+        // Reject leading zeros in octets (e.g., "192.168.01.1")
+        const char* p = ip;
+        for (int i = 0; i < 4; ++i) {
+            if (*p == '0' && *(p + 1) != '.' && *(p + 1) != '\0') return false;
+            while (*p && *p != '.') ++p;
+            if (*p == '.') ++p;
+        }
+        return true;
+    }
     
     // --- IN-ENGINE DEBUG CONSOLE ---
     std::mutex g_logMutex;
@@ -343,6 +380,15 @@ namespace UI {
                     CreateRenderTarget();
                 }
                 return 0;
+            case WM_POWERBROADCAST:
+                if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+                    if (State::globalDebugMode) UI::LogDebug("[UI] System resumed from sleep.");
+                    // Force control to LOCAL to prevent input lock after wake
+                    if (State::currentRole == State::AppRole::SERVER && State::IsRemote()) {
+                        State::SetMode(State::ControlMode::LOCAL);
+                    }
+                }
+                return TRUE;
             case WM_DESTROY:
                 ::PostQuitMessage(0);
                 isAppRunning = false;
@@ -499,6 +545,33 @@ namespace UI {
             }
             if (tabConnections) {
                 if (State::currentRole == State::AppRole::SERVER) {
+                    // === MASTER PIN SECTION (moved from Security & Pairing tab) ===
+                    ImGui::Text("Master PIN");
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    std::string pin = Network::GetMasterPin();
+                    if (showServerPin) {
+                        ImGui::Text("Master PIN: %s", pin.c_str());
+                    } else {
+                        ImGui::Text("Master PIN: ********");
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button(showServerPin ? "Hide" : "Reveal")) { showServerPin = !showServerPin; }
+                    DrawWrappedTooltip("Toggle visibility of the Master PIN.");
+
+                    ImGui::Spacing();
+                    ImGui::TextWrapped("Clients must use this PIN to connect. Regenerating it will instantly disconnect all active clients and require them to re-pair.");
+                    ImGui::Spacing();
+
+                    if (ImGui::Button("Regenerate Master PIN", ImVec2(-1, 30))) {
+                        Network::RegenerateMasterPin();
+                    }
+                    DrawWrappedTooltip("Generate a new random PIN and instantly disconnect all currently active clients.");
+
+                    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+                    // === CONTROL STATUS & CONNECTED CLIENTS ===
                     bool isRemote = State::IsRemote();
                     ImGui::Text("Control Status: "); ImGui::SameLine();
                     if (isRemote) { ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "REMOTE (Client controls input)"); }
@@ -535,21 +608,22 @@ namespace UI {
                         }
                     }
                 } else {
+                    // === CLIENT MODE CONNECTIONS TAB ===
                     auto targets = CredentialManager::GetSavedTargets("KAMFlow_Server_");
                     bool isPaired = !targets.empty();
 
                     std::string currentStatus = State::GetClientStatus();
-                    ImVec4 statusColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); // Default White
+                    ImVec4 statusColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
                     if (currentStatus == "Connected") {
-                        statusColor = ImVec4(0.0f, 1.0f, 0.0f, 1.0f); // Green
+                        statusColor = ImVec4(0.0f, 1.0f, 0.0f, 1.0f);
                     } else if (currentStatus.find("Connecting") != std::string::npos || 
                                currentStatus.find("Authenticating") != std::string::npos || 
                                currentStatus.find("reconnecting") != std::string::npos) {
-                        statusColor = ImVec4(1.0f, 1.0f, 0.0f, 1.0f); // Yellow
+                        statusColor = ImVec4(1.0f, 1.0f, 0.0f, 1.0f);
                     } else if (currentStatus.find("Failed") != std::string::npos || 
                                currentStatus.find("Disconnected") != std::string::npos ||
                                currentStatus.find("dropped") != std::string::npos) {
-                        statusColor = ImVec4(1.0f, 0.4f, 0.4f, 1.0f); // Red
+                        statusColor = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
                     }
 
                     ImGui::Text("Connection Status: ");
@@ -558,46 +632,263 @@ namespace UI {
                     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
                     if (!Network::IsClientConnected()) {
-                        if (!isPaired) {
-                            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "No Server Paired.");
-                            ImGui::Text("Please go to the 'Security & Pairing' tab to pair a server.");
-                        } else {
-                            std::string ip = targets[0].substr(15);
-                            auto servers = Network::GetDiscoveredServers();
-                            bool foundOnline = false;
-                            uint16_t targetPort = 8080;
-                            std::string targetHostname = "Unknown";
+                        // --- CURRENTLY PAIRED SERVER SECTION ---
+                        ImGui::Text("Currently Paired Server:");
 
-                            for (const auto& srv : servers) {
-                                if (srv.ip == ip) {
-                                    targetPort = srv.tcpPort;
-                                    targetHostname = srv.hostname;
-                                    foundOnline = true;
+                        // Resolve the paired server's hostname for display
+                        std::string pairedIP = "";
+                        std::string pairedHostname = "Unknown";
+                        uint16_t pairedPort = 8080;
+                        bool pairedOnline = false;
+                        auto discoveredServers = Network::GetDiscoveredServers();
+
+                        if (isPaired) {
+                            pairedIP = targets[0].substr(15);
+                            for (const auto& srv : discoveredServers) {
+                                if (srv.ip == pairedIP) {
+                                    pairedHostname = srv.hostname;
+                                    pairedPort = srv.tcpPort;
+                                    pairedOnline = true;
                                     break;
                                 }
                             }
-
-                            ImGui::Text("Currently Linked to Server:");
-                            ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "%s", targetHostname.c_str());
-                            ImGui::SameLine(); ImGui::Text("(%s)", ip.c_str());
-                            ImGui::Spacing();
-
-                            if (foundOnline) {
-                                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Server is ONLINE!");
-                                std::string btnText = "Connect to " + targetHostname + " (" + ip + ")";
-                                if (ImGui::Button(btnText.c_str(), ImVec2(-1, 40))) {
-                                    Network::StartClient(ip, targetPort);
-                                }
-                                DrawWrappedTooltip("Establish a secure KVM and Audio connection to this Server.");
+                            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s", pairedHostname.c_str());
+                            ImGui::SameLine(); ImGui::Text("(%s)", pairedIP.c_str());
+                            if (pairedOnline) {
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), " [ONLINE]");
                             } else {
-                                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "Server is offline or not discoverable.");
-                                if (ImGui::Button(("Attempt Manual Connection to " + ip).c_str(), ImVec2(-1, 40))) {
-                                    Network::StartClient(ip, targetPort);
-                                }
-                                DrawWrappedTooltip("Try to connect even though the server is not broadcasting on the local network.");
+                                ImGui::SameLine();
+                                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), " [OFFLINE]");
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "No Server Paired.");
+                        }
+                        ImGui::Spacing();
+
+                        // Connect button — behavior depends on pairing state
+                        if (isPaired) {
+                            std::string connectText = "Connect to " + pairedHostname + " (" + pairedIP + ")";
+                            if (ImGui::Button(connectText.c_str(), ImVec2(-120, 35))) {
+                                Network::StartClient(pairedIP, pairedPort);
+                            }
+                            DrawWrappedTooltip("Establish a secure KVM and Audio connection to the paired Server.");
+                        } else {
+                            if (ImGui::Button("Connect to Server", ImVec2(-120, 35))) {
+                                g_showNotPairedPopup = true;
+                            }
+                            DrawWrappedTooltip("Pair a server first using the 'Pair' button below.");
+                        }
+                        ImGui::SameLine();
+                        // Edit IP button — only enabled when paired
+                        ImGui::BeginDisabled(!isPaired);
+                        if (ImGui::Button("Edit IP", ImVec2(100, 35))) {
+                            g_editingPairedIP = !g_editingPairedIP;
+                            if (g_editingPairedIP && isPaired) {
+                                strncpy_s(g_editIPBuffer, sizeof(g_editIPBuffer), pairedIP.c_str(), _TRUNCATE);
+                                g_editIPInvalid = false;
                             }
                         }
+                        DrawWrappedTooltip("Edit the IP address of the paired server (useful when the server's IP changes due to DHCP).");
+                        ImGui::EndDisabled();
+
+                        // Inline IP editor (shown when Edit IP is clicked)
+                        if (g_editingPairedIP && isPaired) {
+                            ImGui::Spacing();
+                            ImGui::PushItemWidth(-80);
+                            ImGui::InputText("##EditIP", g_editIPBuffer, sizeof(g_editIPBuffer));
+                            ImGui::PopItemWidth();
+                            ImGui::SameLine();
+                            if (ImGui::Button("Save", ImVec2(60, 0))) {
+                                if (IsValidIPv4(g_editIPBuffer)) {
+                                    std::string newIP = g_editIPBuffer;
+                                    if (newIP != pairedIP) {
+                                        // Re-key the credential: load PIN from old, save under new, delete old
+                                        std::string savedPin;
+                                        if (CredentialManager::LoadSecret("KAMFlow_Server_" + pairedIP, savedPin)) {
+                                            CredentialManager::SaveSecret("KAMFlow_Server_" + newIP, savedPin);
+                                            CredentialManager::DeleteSecret("KAMFlow_Server_" + pairedIP);
+                                        }
+                                    }
+                                    g_editingPairedIP = false;
+                                    g_editIPInvalid = false;
+                                } else {
+                                    g_editIPInvalid = true;
+                                }
+                            }
+                            DrawWrappedTooltip("Save the new IP address. The Master PIN will be preserved.");
+                            if (g_editIPInvalid) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Invalid IPv4 address.");
+                            }
+                        }
+
+                        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+
+                        // --- DISCOVERED SERVERS LIST ---
+                        ImGui::Text("Discovered Servers");
+                        ImGui::Separator();
+
+                        if (discoveredServers.empty()) {
+                            ImGui::TextDisabled("Scanning... No servers found.");
+                        } else {
+                            for (const auto& srv : discoveredServers) {
+                                ImGui::PushID(srv.ip.c_str());
+
+                                // Check if THIS server is the one we're paired to
+                                bool isPairedToThis = (isPaired && pairedIP == srv.ip);
+
+                                if (isPairedToThis) {
+                                    // Red "Forget" button
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.5f, 0.05f, 0.05f, 1.0f));
+                                    if (ImGui::Button("Forget", ImVec2(60, 20))) {
+                                        for (const auto& t : targets) {
+                                            CredentialManager::DeleteSecret(t);
+                                        }
+                                        g_editingPairedIP = false;
+                                    }
+                                    DrawWrappedTooltip("Remove the saved pairing for this server.");
+                                    ImGui::PopStyleColor(3);
+                                } else {
+                                    // Green "Pair" button
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.5f, 0.1f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.05f, 0.4f, 0.05f, 1.0f));
+                                    if (ImGui::Button("Pair", ImVec2(60, 20))) {
+                                        // Store the target server info for the popup flow
+                                        strncpy_s(g_pairingTargetIP, sizeof(g_pairingTargetIP), srv.ip.c_str(), _TRUNCATE);
+                                        strncpy_s(g_pairingTargetHostname, sizeof(g_pairingTargetHostname), srv.hostname.c_str(), _TRUNCATE);
+                                        memset(g_pairingPinInput, 0, sizeof(g_pairingPinInput));
+                                        g_showPairingPin = false;
+
+                                        if (isPaired) {
+                                            // Already paired to a DIFFERENT server — show warning
+                                            g_showAlreadyPairedWarning = true;
+                                        } else {
+                                            // Not paired to anything — go straight to PIN entry
+                                            g_showPinPopup = true;
+                                        }
+                                    }
+                                    DrawWrappedTooltip("Pair to this server by entering its Master PIN.");
+                                    ImGui::PopStyleColor(3);
+                                }
+
+                                ImGui::SameLine();
+                                ImGui::Text("%s (%s)", srv.hostname.c_str(), srv.ip.c_str());
+
+                                ImGui::PopID();
+                            }
+                        }
+
+                        // === POPUP MODALS ===
+
+                        // Open popups outside the loop (ImGui requires OpenPopup at the same level)
+                        if (g_showNotPairedPopup) {
+                            ImGui::OpenPopup("NotPairedPopup");
+                            g_showNotPairedPopup = false;
+                        }
+                        if (g_showAlreadyPairedWarning) {
+                            ImGui::OpenPopup("AlreadyPairedPopup");
+                            g_showAlreadyPairedWarning = false;
+                        }
+                        if (g_showPinPopup) {
+                            ImGui::OpenPopup("PairServerPopup");
+                            g_showPinPopup = false;
+                        }
+
+                        // --- NOT PAIRED POPUP ---
+                        if (ImGui::BeginPopupModal("NotPairedPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                            ImGui::Text("No Server Paired");
+                            ImGui::Separator();
+                            ImGui::Spacing();
+                            ImGui::TextWrapped("No server is currently paired.\nClick the 'Pair' button next to a discovered server to get started.");
+                            ImGui::Spacing();
+                            if (ImGui::Button("OK", ImVec2(-1, 30))) {
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::EndPopup();
+                        }
+
+                        // --- ALREADY PAIRED WARNING POPUP ---
+                        if (ImGui::BeginPopupModal("AlreadyPairedPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                            ImGui::Text("Already Paired");
+                            ImGui::Separator();
+                            ImGui::Spacing();
+                            ImGui::Text("You are currently paired to:");
+                            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s (%s)", pairedHostname.c_str(), pairedIP.c_str());
+                            ImGui::Spacing();
+                            ImGui::TextWrapped("Only one server can be paired at a time. Continuing will unpair the current server.");
+                            ImGui::Spacing();
+                            if (ImGui::Button("Cancel", ImVec2(120, 30))) {
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::Button("Continue", ImVec2(120, 30))) {
+                                // Unpair old server and proceed to PIN entry
+                                for (const auto& t : targets) {
+                                    CredentialManager::DeleteSecret(t);
+                                }
+                                g_editingPairedIP = false;
+                                ImGui::CloseCurrentPopup();
+                                g_showPinPopup = true; // Will trigger OpenPopup on next frame
+                            }
+                            ImGui::EndPopup();
+                        }
+
+                        // --- PIN ENTRY POPUP ---
+                        if (ImGui::BeginPopupModal("PairServerPopup", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                            ImGui::Text("Pair to Server");
+                            ImGui::Separator();
+                            ImGui::Spacing();
+                            ImGui::Text("Enter the 8-digit Master PIN for:");
+                            ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "%s (%s)", g_pairingTargetHostname, g_pairingTargetIP);
+                            ImGui::Spacing();
+
+                            ImGui::InputText("Master PIN", g_pairingPinInput, sizeof(g_pairingPinInput),
+                                g_showPairingPin ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password);
+                            ImGui::SameLine();
+                            if (ImGui::Button(g_showPairingPin ? "Hide" : "Show")) { g_showPairingPin = !g_showPairingPin; }
+                            DrawWrappedTooltip("Toggle visibility of the PIN you are typing.");
+
+                            // Validate: exactly 8 digits
+                            size_t pinLen = strlen(g_pairingPinInput);
+                            bool pinValid = (pinLen == 8);
+                            if (pinValid) {
+                                for (size_t i = 0; i < pinLen; ++i) {
+                                    if (g_pairingPinInput[i] < '0' || g_pairingPinInput[i] > '9') {
+                                        pinValid = false;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (pinLen > 0 && !pinValid) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "PIN must be exactly 8 digits (0-9).");
+                            } else {
+                                ImGui::TextDisabled("8 digits required.");
+                            }
+                            ImGui::Spacing();
+
+                            if (ImGui::Button("Cancel", ImVec2(120, 30))) {
+                                memset(g_pairingPinInput, 0, sizeof(g_pairingPinInput));
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::SameLine();
+                            ImGui::BeginDisabled(!pinValid);
+                            if (ImGui::Button("Pair", ImVec2(120, 30))) {
+                                CredentialManager::SaveSecret(
+                                    "KAMFlow_Server_" + std::string(g_pairingTargetIP),
+                                    std::string(g_pairingPinInput));
+                                memset(g_pairingPinInput, 0, sizeof(g_pairingPinInput));
+                                ImGui::CloseCurrentPopup();
+                            }
+                            ImGui::EndDisabled();
+                            ImGui::EndPopup();
+                        }
+
                     } else {
+                        // === CONNECTED STATE ===
                         ImGui::TextWrapped("Receiving Input and KVM Commands from Server.");
                         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
                         
@@ -607,107 +898,6 @@ namespace UI {
                             Network::StopClient();
                         }
                         DrawWrappedTooltip("Safely terminate the encrypted TCP connection and return to standby.");
-                    }
-                }
-                ImGui::EndTabItem();
-            }
-
-            bool tabSecurity = ImGui::BeginTabItem("Security & Pairing");
-            if (State::currentRole == State::AppRole::SERVER) {
-                DrawWrappedTooltip("Manage your Master PIN to control which clients are authorized to connect.");
-            } else {
-                DrawWrappedTooltip("Discover local KAM-Flow servers, manage trusted devices, and securely save connection credentials.");
-            }
-            if (tabSecurity) {
-                if (State::currentRole == State::AppRole::SERVER) {
-                    ImGui::Text("Security & Access Control");
-                    ImGui::Separator();
-                    ImGui::Spacing();
-
-                    std::string pin = Network::GetMasterPin();
-                    if (showServerPin) {
-                        ImGui::Text("Master PIN: %s", pin.c_str());
-                    } else {
-                        ImGui::Text("Master PIN: ********");
-                    }
-                    ImGui::SameLine();
-                    if (ImGui::Button(showServerPin ? "Hide" : "Reveal")) { showServerPin = !showServerPin; }
-                    DrawWrappedTooltip("Toggle visibility of the Master PIN.");
-
-                    ImGui::Spacing();
-                    ImGui::TextWrapped("Clients must use this PIN to connect. Regenerating it will instantly disconnect all active clients and require them to re-pair.");
-                    ImGui::Spacing();
-
-                    if (ImGui::Button("Regenerate Master PIN", ImVec2(-1, 30))) {
-                        Network::RegenerateMasterPin();
-                    }
-                    DrawWrappedTooltip("Generate a new random PIN and instantly disconnect all currently active clients.");
-                } else { // Client
-                    ImGui::Text("Pairing Status");
-                    ImGui::Separator();
-                    
-                    auto targets = CredentialManager::GetSavedTargets("KAMFlow_Server_");
-                    if (!targets.empty()) {
-                        std::string ip = targets[0].substr(15);
-                        
-                        std::string targetHostname = "Unknown";
-                        auto servers = Network::GetDiscoveredServers();
-                        for (const auto& srv : servers) {
-                            if (srv.ip == ip) {
-                                targetHostname = srv.hostname;
-                                break;
-                            }
-                        }
-                        
-                        ImGui::Text("Currently Linked to Server:");
-                        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s", targetHostname.c_str());
-                        ImGui::SameLine(); ImGui::Text("(%s)", ip.c_str());
-
-                        ImGui::Spacing();
-                        ImGui::TextWrapped("A Client can only be linked to one Server at a time. To link to a different Server, or if the Master PIN changed, you must forget the current Server.");
-                        ImGui::Spacing();
-                        if (ImGui::Button("Forget Server & Reset Pairing", ImVec2(-1, 30))) {
-                            for(const auto& t : targets) {
-                                CredentialManager::DeleteSecret(t);
-                            }
-                        }
-                        DrawWrappedTooltip("Delete the saved PIN for this server from the Windows Credential Vault to allow pairing with a new one.");
-                    } else {
-                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "No Server Linked.");
-                        ImGui::Spacing(); ImGui::Spacing();
-
-                        ImGui::Text("Discovered Servers (Local Network)");
-                        ImGui::Separator();
-                        auto servers = Network::GetDiscoveredServers();
-                        if (servers.empty()) {
-                            ImGui::TextDisabled("Scanning... No servers found.");
-                        } else {
-                            for (const auto& srv : servers) {
-                                ImGui::Text("%s (%s)", srv.hostname.c_str(), srv.ip.c_str());
-                                ImGui::SameLine(ImGui::GetWindowWidth() - 80);
-                                ImGui::PushID(srv.ip.c_str());
-                                if (ImGui::Button("Select", ImVec2(60, 20))) {
-                                    strncpy_s(newServerIP, sizeof(newServerIP), srv.ip.c_str(), _TRUNCATE);
-                                }
-                                DrawWrappedTooltip("Auto-fill the IP address below.");
-                                ImGui::PopID();
-                            }
-                        }
-
-                        ImGui::Spacing(); ImGui::Spacing();
-                        ImGui::Text("Link to Server");
-                        ImGui::Separator();
-                        ImGui::InputText("Server IP", newServerIP, sizeof(newServerIP));
-                        ImGui::InputText("Master PIN", newServerPIN, sizeof(newServerPIN), ImGuiInputTextFlags_Password);
-                        
-                        if (ImGui::Button("Save Pairing", ImVec2(-1, 30))) {
-                            if (strlen(newServerIP) > 0 && strlen(newServerPIN) > 0) {
-                                CredentialManager::SaveSecret("KAMFlow_Server_" + std::string(newServerIP), std::string(newServerPIN));
-                                memset(newServerIP, 0, sizeof(newServerIP));
-                                memset(newServerPIN, 0, sizeof(newServerPIN));
-                            }
-                        }
-                        DrawWrappedTooltip("Save this Server's IP and PIN to the Windows Credential Vault for future connections.");
                     }
                 }
                 ImGui::EndTabItem();
@@ -1262,7 +1452,44 @@ namespace UI {
         pd3dDeviceContext->OMSetRenderTargets(1, &pMainRenderTargetView, nullptr);
         pd3dDeviceContext->ClearRenderTargetView(pMainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        pSwapChain->Present(1, 0); 
+        HRESULT hrPresent = pSwapChain->Present(1, 0); 
+        if (hrPresent == DXGI_ERROR_DEVICE_REMOVED || hrPresent == DXGI_ERROR_DEVICE_RESET) {
+            // DX11 device lost (typically caused by sleep/wake, driver update, or GPU reset).
+            // Rebuild the entire D3D pipeline to recover gracefully instead of crashing.
+            if (State::globalDebugMode) UI::LogDebug("[UI] DX11 Device Lost. Attempting recovery...");
+            CleanupRenderTarget();
+            if (pSwapChain) { pSwapChain->Release(); pSwapChain = nullptr; }
+            if (pd3dDeviceContext) { pd3dDeviceContext->Release(); pd3dDeviceContext = nullptr; }
+            if (pd3dDevice) { pd3dDevice->Release(); pd3dDevice = nullptr; }
+
+            DXGI_SWAP_CHAIN_DESC sd;
+            ZeroMemory(&sd, sizeof(sd));
+            sd.BufferCount = 2;
+            sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            sd.BufferDesc.RefreshRate.Numerator = 60;
+            sd.BufferDesc.RefreshRate.Denominator = 1;
+            sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+            sd.OutputWindow = hwnd;
+            sd.SampleDesc.Count = 1;
+            sd.Windowed = TRUE;
+            sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+            D3D_FEATURE_LEVEL featureLevel;
+            const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+            HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &pSwapChain, &pd3dDevice, &featureLevel, &pd3dDeviceContext);
+            if (res == DXGI_ERROR_UNSUPPORTED || res == E_FAIL) {
+                res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &pSwapChain, &pd3dDevice, &featureLevel, &pd3dDeviceContext);
+            }
+            if (SUCCEEDED(res)) {
+                CreateRenderTarget();
+                ImGui_ImplDX11_InvalidateDeviceObjects();
+                ImGui_ImplDX11_CreateDeviceObjects();
+            } else {
+                isAppRunning = false; // Unrecoverable — exit gracefully
+            }
+            return;
+        }
     }
 
     /**

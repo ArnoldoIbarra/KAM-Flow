@@ -730,6 +730,11 @@ namespace Network {
             return false;
         }
 
+        // Always reset the crypto engine before re-initializing to ensure the key is
+        // derived from the current PIN. Without this, Security::Initialize() early-returns
+        // if already initialized (e.g., from a prior auto-reconnect or session), leaving
+        // a stale key that causes all encryption/decryption to fail.
+        Security::Shutdown();
         if (!Security::Initialize(targetPin.c_str())) {
             State::SetClientStatus("Security Initialization Failed.");
             if (State::globalDebugMode) UI::LogDebug("[Security] FATAL: Cryptography Engine failed to initialize.");

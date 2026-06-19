@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <tlhelp32.h>
 
 #include "MouseCapture.h"
 #include "KeyboardCapture.h"
@@ -86,13 +87,115 @@ int main(int argc, char* argv[]) {
     // Load persisted settings from kamflow.ini (This naturally manages initial console state)
     Config::LoadConfig();
 
-    HANDLE hMutex = NULL;
-    if (!State::globalDebugMode) {
+    // === SINGLE INSTANCE ENFORCEMENT ===
+    // Always check, regardless of debug mode. The previous code skipped this when
+    // globalDebugMode was true, allowing phantom processes from debug-mode crashes
+    // to coexist with new instances.
+    HANDLE hMutex = CreateMutexA(NULL, FALSE, "KAMFlow_SingleInstance_Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (hMutex) CloseHandle(hMutex);
+        
+        // Check if the existing instance is a healthy process with a visible window.
+        HWND existingWindow = FindWindowA("KAMFlowUIClass", nullptr);
+        
+        if (existingWindow) {
+            // Healthy instance found — bring it to the foreground and exit.
+            ::ShowWindow(existingWindow, SW_SHOW);
+            ::ShowWindow(existingWindow, SW_RESTORE);
+            ::SetForegroundWindow(existingWindow);
+            ::MessageBoxA(NULL, 
+                "KAM-Flow is already running.\n\n"
+                "The existing instance has been brought to the foreground.\n"
+                "Check your System Tray if you don't see it.",
+                "KAM-Flow", MB_OK | MB_ICONINFORMATION);
+            return 0;
+        }
+        
+        // No visible window — this is a phantom process from a previous crash.
+        // Step 1: Terminate the phantom process.
+        DWORD currentPid = GetCurrentProcessId();
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe32;
+            pe32.dwSize = sizeof(pe32);
+            if (Process32First(hSnap, &pe32)) {
+                do {
+                    if (pe32.th32ProcessID != currentPid && 
+                        _stricmp(pe32.szExeFile, "KAM-Flow.exe") == 0) {
+                        HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                        if (hProc) {
+                            TerminateProcess(hProc, 1);
+                            CloseHandle(hProc);
+                        }
+                    }
+                } while (Process32Next(hSnap, &pe32));
+            }
+            CloseHandle(hSnap);
+        }
+        
+        // Step 2: Wait for the mutex to be released by the terminated phantom.
+        Sleep(500);
+        
+        // Step 3: Verify the phantom is actually dead.
+        bool phantomStillAlive = false;
+        hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32 pe32;
+            pe32.dwSize = sizeof(pe32);
+            if (Process32First(hSnap, &pe32)) {
+                do {
+                    if (pe32.th32ProcessID != currentPid && 
+                        _stricmp(pe32.szExeFile, "KAM-Flow.exe") == 0) {
+                        phantomStillAlive = true;
+                        break;
+                    }
+                } while (Process32Next(hSnap, &pe32));
+            }
+            CloseHandle(hSnap);
+        }
+        
+        if (phantomStillAlive) {
+            // Phantom survived TerminateProcess (elevated/protected process?).
+            // Kill ALL instances including ourselves and let the user restart.
+            ::MessageBoxA(NULL, 
+                "A phantom KAM-Flow process from a previous crash could not be terminated.\n\n"
+                "All KAM-Flow instances will now be closed.\n"
+                "Please relaunch the application.",
+                "KAM-Flow", MB_OK | MB_ICONERROR);
+            
+            // Force-terminate everything
+            hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32 pe32;
+                pe32.dwSize = sizeof(pe32);
+                if (Process32First(hSnap, &pe32)) {
+                    do {
+                        if (_stricmp(pe32.szExeFile, "KAM-Flow.exe") == 0) {
+                            HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
+                            if (hProc) {
+                                TerminateProcess(hProc, 1);
+                                CloseHandle(hProc);
+                            }
+                        }
+                    } while (Process32Next(hSnap, &pe32));
+                }
+                CloseHandle(hSnap);
+            }
+            return 1;
+        }
+        
+        // Step 4: Phantom terminated successfully. Re-acquire the mutex and continue startup.
         hMutex = CreateMutexA(NULL, FALSE, "KAMFlow_SingleInstance_Mutex");
         if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            // Mutex still held (race condition or OS delay). Bail out.
             if (hMutex) CloseHandle(hMutex);
-            return 0; // Silently exit to prevent multiple instances
+            ::MessageBoxA(NULL, 
+                "Failed to acquire the single-instance lock after terminating the phantom process.\n\n"
+                "Please wait a moment and try again.",
+                "KAM-Flow", MB_OK | MB_ICONWARNING);
+            return 1;
         }
+        // Success! Continue startup with the fresh mutex.
     }
 
     // Initialize Core Audio Subsystem
@@ -162,6 +265,11 @@ int main(int argc, char* argv[]) {
     if (subsystemsStarted) {
         ClipboardManager::Stop();
         if (State::currentRole == State::AppRole::SERVER) {
+            // Stop audio threads BEFORE network shutdown to prevent
+            // audio threads from calling BroadcastMessage() on destroyed sockets.
+            Audio::StopAudioRenderer();
+            Audio::StopMicBroadcast();
+
             if (g_HookThreadId.load() != 0) {
                 PostThreadMessage(g_HookThreadId.load(), WM_QUIT, 0, 0);
                 if (hookThread.joinable()) hookThread.join();
