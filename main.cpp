@@ -87,6 +87,16 @@ int main(int argc, char* argv[]) {
     // Load persisted settings from kamflow.ini (This naturally manages initial console state)
     Config::LoadConfig();
 
+    // Elevate the entire process to HIGH_PRIORITY_CLASS so that games running at
+    // NORMAL or ABOVE_NORMAL priority cannot starve our network and input threads.
+    // HIGH is safe for lightweight A/V tools (unlike REALTIME which could lock the OS).
+    // Since we already run as Administrator, this always succeeds.
+    if (!SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS)) {
+        if (State::globalDebugMode) UI::LogDebug("[System] WARNING: Failed to elevate process priority. Error: %lu", GetLastError());
+    } else {
+        if (State::globalDebugMode) UI::LogDebug("[System] Process elevated to HIGH_PRIORITY_CLASS.");
+    }
+
     // === SINGLE INSTANCE ENFORCEMENT ===
     // Always check, regardless of debug mode. The previous code skipped this when
     // globalDebugMode was true, allowing phantom processes from debug-mode crashes
