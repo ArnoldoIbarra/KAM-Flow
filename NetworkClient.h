@@ -51,4 +51,7 @@ namespace Network {
 
     /// Packages a payload with a header, optionally encrypts it, and sends it to the Server.
     bool SendToServer(MessageType type, const void* payload, size_t payloadSize);
+
+    /// Notifies the client that the system resumed from sleep. Resets reconnect backoff for instant recovery.
+    void NotifySystemResumed();
 }

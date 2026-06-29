@@ -1065,7 +1065,11 @@ bool BroadcastMessage(MessageType type, const void *payload,
     bool useUdp;
     sockaddr_in udpAddr;
   };
-  std::vector<SendTarget> targets;
+  // thread_local reuses the vector's internal buffer across calls, eliminating
+  // ~1000 heap allocations/second at 1000Hz mouse polling. clear() only resets
+  // the size without freeing memory.
+  thread_local std::vector<SendTarget> targets;
+  targets.clear();
   static bool hasLoggedTcpFallback = false;
   {
     std::lock_guard<std::mutex> lock(clientsMutex);

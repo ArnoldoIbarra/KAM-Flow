@@ -20,18 +20,28 @@
 #include <atomic>
 #include <queue>
 #include <mutex>
+
+// May be stripped by WIN32_LEAN_AND_MEAN in some SDK configurations
+#ifndef MOUSEEVENTF_VIRTUALDESKTOP
+#define MOUSEEVENTF_VIRTUALDESKTOP 0x4000
+#endif
 #include <condition_variable>
 
 namespace Input {
     /// Global handle for the low-level mouse hook.
     HHOOK globalMouseHook = NULL;
 
-    /// Background queue to decouple the OS hook from the network socket
+    /// Background queue to decouple the OS hook from the network socket.
+    /// Capped at MAX_MOUSE_QUEUE_DEPTH to prevent unbounded growth during
+    /// sleep/wake transitions or network stalls. When exceeded, all pending
+    /// move deltas are coalesced into a single event to prevent stale burst
+    /// playback that causes the cursor to teleport.
     std::queue<Network::MousePayload> g_mouseQueue;
     std::mutex g_mouseQueueMutex;
     std::condition_variable g_mouseQueueCv;
     std::atomic<bool> g_isMouseNetworkThreadRunning{false};
     std::thread g_mouseNetworkThread;
+    const size_t MAX_MOUSE_QUEUE_DEPTH = 64;
 
     /// Coordinates where the mouse entered the boundary.
     POINT entryPoint = { 0, 0 };
@@ -40,6 +50,46 @@ namespace Input {
     
     /// Flags indicating which edge was breached.
     bool isTransitionedOut = false;
+
+    /// Signature value for dwExtraInfo to tag our cursor re-centering events.
+    /// Prevents the feedback loop where cursor repositioning generates phantom
+    /// WM_MOUSEMOVE events that get double-processed as real mouse movement.
+    const ULONG_PTR KAMFLOW_REANCHOR = 0x4B414D46; // "KAMF" in hex
+
+    /**
+     * @brief Re-centers the OS cursor to lockedPoint using SendInput.
+     * Uses MOUSEEVENTF_ABSOLUTE with MOUSEEVENTF_VIRTUALDESKTOP for
+     * correct multi-monitor positioning. The LLMHF_INJECTED flag set by
+     * SendInput plus our dwExtraInfo signature allow the hook to filter
+     * the resulting phantom WM_MOUSEMOVE event.
+     * @return void
+     */
+    void ReanchorCursor() {
+        int vWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int vHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        if (vWidth <= 0 || vHeight <= 0) return;
+
+        INPUT input = {};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = ((lockedPoint.x - vLeft) * 65536) / vWidth;
+        input.mi.dy = ((lockedPoint.y - vTop) * 65536) / vHeight;
+        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESKTOP;
+        input.mi.dwExtraInfo = KAMFLOW_REANCHOR;
+        SendInput(1, &input, sizeof(INPUT));
+
+        // Sync lockedPoint to the actual pixel the cursor landed on. The
+        // ABSOLUTE coordinate mapping uses integer division (65536/screenSize)
+        // which can round the cursor to 1-2px off from lockedPoint. Since
+        // every frame computes delta as (ms->pt - lockedPoint), this small
+        // offset becomes a constant per-frame bias — causing the client
+        // cursor to drift upward/diagonally on every movement.
+        POINT actual;
+        if (GetCursorPos(&actual)) {
+            lockedPoint = actual;
+        }
+    }
     
     /**
      * @brief Teleports the cursor deterministically prior to returning to LOCAL control.
@@ -87,11 +137,10 @@ namespace Input {
             std::queue<Network::MousePayload> localQueue;
             {
                 std::unique_lock<std::mutex> lock(g_mouseQueueMutex);
-                // Coalesce mouse deltas for up to 2ms before sending.
-                // This replaces the old wait() + sleep(7ms) double-throttle pattern.
-                // With UDP streaming, TCP congestion is no longer a concern, so 2ms
-                // provides near-native responsiveness while still batching a few deltas.
-                g_mouseQueueCv.wait_for(lock, std::chrono::milliseconds(2), [] { 
+                // Wake instantly on each event — zero artificial delay. If multiple
+                // events arrive during the network send phase, they batch naturally
+                // via the queue swap and get coalesced into one packet.
+                g_mouseQueueCv.wait(lock, [] { 
                     return !g_mouseQueue.empty() || !g_isMouseNetworkThreadRunning; 
                 });
 
@@ -153,12 +202,20 @@ namespace Input {
         static float fracY = 0.0f;
 
         if (wParam == WM_MOUSEMOVE) {
+            // Delta from lockedPoint is correct because return 1 from the LL hook
+            // DOES prevent the OS from updating the cursor position. The cursor
+            // stays at lockedPoint, and ms->pt reports where it WOULD have moved.
+            // Each frame's delta = ms->pt - lockedPoint = the actual physical
+            // movement for that event.
             int rawDx = ms->pt.x - lockedPoint.x;
             int rawDy = ms->pt.y - lockedPoint.y;
 
-            // Failsafe: Re-anchor the cursor if a background app forcefully moved the OS cursor
-            if (abs(rawDx) > 300 || abs(rawDy) > 300) {
-                SetCursorPos(lockedPoint.x, lockedPoint.y);
+            // Failsafe: If a background app or rare hook timeout forcefully moved
+            // the cursor away from lockedPoint, re-anchor it. Uses SendInput (not
+            // SetCursorPos) so the LLMHF_INJECTED flag is set, preventing the
+            // resulting phantom WM_MOUSEMOVE from being double-processed.
+            if (abs(rawDx) > 200 || abs(rawDy) > 200) {
+                ReanchorCursor();
                 return;
             }
 
@@ -173,7 +230,31 @@ namespace Input {
                 if (dx != 0 || dy != 0) {
                     Network::MousePayload p = { dx, dy, 0, MOUSEEVENTF_MOVE };
                     std::lock_guard<std::mutex> lock(g_mouseQueueMutex);
-                    g_mouseQueue.push(p);
+
+                    // If the queue overflows (sleep/wake stall, network congestion),
+                    // coalesce ALL pending moves into one delta to prevent stale burst
+                    // playback that makes the cursor teleport after resuming.
+                    if (g_mouseQueue.size() >= MAX_MOUSE_QUEUE_DEPTH) {
+                        Network::MousePayload coalesced = { 0, 0, 0, 0 };
+                        while (!g_mouseQueue.empty()) {
+                            auto& front = g_mouseQueue.front();
+                            if (front.flags == MOUSEEVENTF_MOVE && front.mouseData == 0) {
+                                coalesced.deltaX += front.deltaX;
+                                coalesced.deltaY += front.deltaY;
+                            }
+                            // Non-move events (clicks, scrolls) are silently dropped
+                            // during overflow — they are stale and no longer relevant.
+                            g_mouseQueue.pop();
+                        }
+                        // Push the coalesced sum plus the new event as a single move
+                        coalesced.deltaX += p.deltaX;
+                        coalesced.deltaY += p.deltaY;
+                        coalesced.flags = MOUSEEVENTF_MOVE;
+                        g_mouseQueue.push(coalesced);
+                    } else {
+                        g_mouseQueue.push(p);
+                    }
+
                     g_mouseQueueCv.notify_one();
                 }
             }
@@ -229,6 +310,9 @@ namespace Input {
 
             MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
             if (ms->flags & LLMHF_INJECTED) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
+            // Secondary filter: skip our own cursor re-centering events by dwExtraInfo
+            // signature. Belt-and-suspenders with the LLMHF_INJECTED check above.
+            if (ms->dwExtraInfo == KAMFLOW_REANCHOR) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
 
             if (!State::IsRemote() && isTransitionedOut) {
                 isTransitionedOut = false;
@@ -296,7 +380,7 @@ namespace Input {
                                     isTransitionedOut = true;
                                     entryPoint = ms->pt;
                                     lockedPoint = { (cachedMi.rcMonitor.left + cachedMi.rcMonitor.right) / 2, (cachedMi.rcMonitor.top + cachedMi.rcMonitor.bottom) / 2 };
-                                    SetCursorPos(lockedPoint.x, lockedPoint.y);
+                                    ReanchorCursor();
                                     consecutiveEdgeHits = 0;
                                     return 1;
                                 }
@@ -342,5 +426,19 @@ namespace Input {
         if (g_mouseNetworkThread.joinable()) {
             g_mouseNetworkThread.join();
         }
+    }
+
+    /**
+     * @brief Discards all pending mouse events in the queue.
+     * Called on sleep/wake resume to prevent stale burst playback that
+     * would teleport the cursor to wherever thousands of accumulated
+     * deltas point. Also resets the fractional accumulator to prevent
+     * sub-pixel drift from carrying over across sleep cycles.
+     * @return void
+     */
+    void DrainMouseQueue() {
+        std::lock_guard<std::mutex> lock(g_mouseQueueMutex);
+        std::queue<Network::MousePayload> empty;
+        std::swap(g_mouseQueue, empty);
     }
 }

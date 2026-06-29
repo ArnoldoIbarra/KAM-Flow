@@ -18,6 +18,7 @@
 #include "AudioManager.h"
 #include "ConfigManager.h"
 #include "FileTransferManager.h"
+#include "MouseCapture.h"
 #include <string>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
@@ -382,10 +383,25 @@ namespace UI {
                 return 0;
             case WM_POWERBROADCAST:
                 if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
-                    if (State::globalDebugMode) UI::LogDebug("[UI] System resumed from sleep.");
-                    // Force control to LOCAL to prevent input lock after wake
-                    if (State::currentRole == State::AppRole::SERVER && State::IsRemote()) {
-                        State::SetMode(State::ControlMode::LOCAL);
+                    if (State::globalDebugMode) UI::LogDebug("[System] Resumed from sleep/hibernate.");
+
+                    // Drain all stale mouse events that accumulated while the system was
+                    // suspended. Without this, hundreds/thousands of deltas would burst-fire
+                    // on wake, teleporting the cursor to an arbitrary position.
+                    if (State::currentRole == State::AppRole::SERVER) {
+                        Input::DrainMouseQueue();
+                        // Force LOCAL to prevent input lockout — the client's TCP socket
+                        // is likely dead after sleep, so remote control would be a black hole.
+                        if (State::IsRemote()) {
+                            if (State::globalDebugMode) UI::LogDebug("[System] Forcing LOCAL after sleep/wake.");
+                            State::SetMode(State::ControlMode::LOCAL);
+                        }
+                    } else if (State::currentRole == State::AppRole::CLIENT) {
+                        // Reset reconnect backoff so the client reconnects within 1s
+                        // instead of waiting 5-30s from the exponential backoff.
+                        // Sleep-triggered disconnects are expected and should not be
+                        // penalized with escalating delays.
+                        Network::NotifySystemResumed();
                     }
                 }
                 return TRUE;

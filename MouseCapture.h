@@ -28,4 +28,7 @@ namespace Input {
 
     /// Teleports the Server cursor to the physical edge based on 4-way coordinate tracking.
     void HandleReturnControl(uint8_t entryEdge, float normalizedX, float normalizedY);
+
+    /// Discards all pending mouse events in the queue. Called on sleep/wake resume to prevent stale burst playback.
+    void DrainMouseQueue();
 }

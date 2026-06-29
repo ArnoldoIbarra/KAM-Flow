@@ -29,9 +29,25 @@ namespace Security {
     std::vector<uint8_t> keyObjectBuffer;
     std::atomic<bool> g_isSecurityShutdown{false};
 
+    /// Monotonically increasing generation counter. Bumped on every Shutdown()
+    /// so that thread-local key caches auto-invalidate on reconnect cycles.
+    /// Without this, threads that survive across reconnect (heartbeat, hook)
+    /// would silently encrypt with the OLD key, causing decryption failures
+    /// that look like "replay attacks" on the remote end.
+    std::atomic<uint32_t> g_keyGeneration{0};
+
+    /// Counter-based nonce state. AES-GCM only requires nonces to be unique,
+    /// not cryptographically random (NIST SP 800-38D, Section 8.2.1).
+    /// Using a 4-byte random session prefix + 8-byte atomic counter eliminates
+    /// the per-packet BCryptGenRandom() kernel call that was causing ~1000
+    /// kernel-mode CSPRNG invocations per second at 1000Hz mouse polling.
+    uint8_t g_noncePrefix[4] = {0};
+    std::atomic<uint64_t> g_nonceCounter{0};
+
     struct ThreadLocalKey {
         BCRYPT_KEY_HANDLE hKey = NULL;
         std::vector<uint8_t> keyObjectBuffer;
+        uint32_t generation = 0; // Tracks which key generation this TLS copy belongs to
         
         ~ThreadLocalKey() {
             if (hKey) {
@@ -48,6 +64,18 @@ namespace Security {
 
     BCRYPT_KEY_HANDLE GetThreadLocalKey() {
         if (g_isSecurityShutdown.load(std::memory_order_acquire)) return NULL;
+
+        uint32_t currentGen = g_keyGeneration.load(std::memory_order_acquire);
+
+        // If the TLS key exists but belongs to an old generation (pre-reconnect),
+        // destroy it so we re-duplicate from the new master key below.
+        if (tls_key.hKey != NULL && tls_key.generation != currentGen) {
+            BCryptDestroyKey(tls_key.hKey);
+            tls_key.hKey = NULL;
+            SecureZeroMemory(tls_key.keyObjectBuffer.data(), tls_key.keyObjectBuffer.size());
+            tls_key.keyObjectBuffer.clear();
+        }
+
         if (tls_key.hKey != NULL) return tls_key.hKey;
         if (hKey == NULL) return NULL;
 
@@ -58,6 +86,7 @@ namespace Security {
         if (BCryptDuplicateKey(hKey, &tls_key.hKey, tls_key.keyObjectBuffer.data(), cbKeyObject, 0) != STATUS_SUCCESS) {
             return NULL;
         }
+        tls_key.generation = currentGen;
         return tls_key.hKey;
     }
 
@@ -101,6 +130,12 @@ namespace Security {
         }
 
         SecureZeroMemory(derivedKey, sizeof(derivedKey));
+
+        // Seed the counter-based nonce with a 4-byte random session prefix.
+        // This single BCryptGenRandom call replaces the per-packet calls that
+        // were causing 1000+ kernel-mode CSPRNG invocations per second.
+        BCryptGenRandom(NULL, g_noncePrefix, sizeof(g_noncePrefix), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        g_nonceCounter.store(0, std::memory_order_relaxed);
         
         if (State::globalDebugMode) UI::LogDebug("[Security] Hardware AES-GCM Provider Initialized.");
         return true;
@@ -119,8 +154,17 @@ namespace Security {
         BCRYPT_KEY_HANDLE localKey = GetThreadLocalKey();
         if (!localKey) return false;
 
+        // Build a deterministic 12-byte nonce: [4-byte session prefix][8-byte counter]
+        // NIST SP 800-38D Section 8.2.1 allows deterministic nonce construction
+        // as long as the (key, nonce) pair is never reused. The session prefix
+        // is random per Initialize(), and the counter is monotonically increasing.
+        // This replaces the per-packet BCryptGenRandom() kernel call that was
+        // causing mouse micro-freezes at high polling rates (1000Hz = 1000
+        // kernel-mode CSPRNG calls/second).
         uint8_t iv[12];
-        BCryptGenRandom(NULL, iv, sizeof(iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        memcpy(iv, g_noncePrefix, 4);
+        uint64_t counterVal = g_nonceCounter.fetch_add(1, std::memory_order_relaxed);
+        memcpy(iv + 4, &counterVal, 8);
 
         uint8_t authTag[16];
         DWORD cbResult = 0;
@@ -218,6 +262,11 @@ namespace Security {
      */
     void Shutdown() {
         g_isSecurityShutdown.store(true, std::memory_order_release);
+        // Bump the generation counter so all thread-local key caches
+        // auto-invalidate on the next GetThreadLocalKey() call. Without this,
+        // threads surviving across reconnect cycles would encrypt with the
+        // old key, causing decryption failures on the remote end.
+        g_keyGeneration.fetch_add(1, std::memory_order_release);
         if (hKey) {
             BCryptDestroyKey(hKey);
             hKey = NULL;
@@ -228,5 +277,7 @@ namespace Security {
         }
         SecureZeroMemory(keyObjectBuffer.data(), keyObjectBuffer.size());
         keyObjectBuffer.clear();
+        // Zero the nonce prefix so it doesn't leak into a future session
+        SecureZeroMemory(g_noncePrefix, sizeof(g_noncePrefix));
     }
 }
