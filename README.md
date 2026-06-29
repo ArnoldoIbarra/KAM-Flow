@@ -1,134 +1,207 @@
 # KAM-Flow
-KAM-Flow is a high-performance, low-latency Software KAM (Keyboard, Audio, Mouse) solution. It is designed to turn multiple physical machines into a single, unified workspace.
 
-Tired of juggling multiple keyboards, mice, and headsets? KAM-Flow effortlessly unites your Windows PCs into one perfectly synchronized workspace.
+KAM-Flow is a high-performance, low-latency Software KAM (Keyboard, Audio, Mouse) solution built to turn multiple Windows PCs into one unified workspace.
 
-Glide your cursor seamlessly across your desktop and laptop screens, type on any device using your main keyboard, hear audio from every computer through a single headset, and share files instantly with a simple drag-and-drop. Operating securely and silently in the background, KAM-Flow removes the clutter from your desk and the friction from your workflow, making multiple computers feel like one.
+Tired of juggling multiple keyboards, mice, and headsets? KAM-Flow connects your Windows machines over your local network so you can control them all from a single keyboard and mouse — just move your cursor off the edge of one screen and onto the next. Audio from every machine plays through one headset, files transfer with a drag-and-drop, and your clipboard stays in sync across all of them.
+
+It runs quietly in the background, stays out of your way, and makes multiple computers feel like one.
+
+---
+
+## Core Features
+
+* **Cursor & Keyboard Sharing** — Move your mouse off the edge of your main monitor and it appears on your second PC. Type on any machine using the same keyboard. The input response is fast enough that you won't notice the network is involved.
+* **Audio Mixing** — Hear system audio from every connected Client through the Server's headset. No manual routing or third-party mixer required.
+* **Microphone Broadcast** — Stream your Server's microphone to Client PCs so apps like Discord or Zoom on those machines can use it. *(Requires a free Virtual Audio Cable on the Client — see the [Microphone Setup](#setting-up-microphone-broadcasting-vb-cable) section below.)*
+* **File Transfers** — Drag a file onto the KAM-Flow window to send it to any connected machine. Transfers run on a separate channel so they don't interfere with your mouse or keyboard.
+* **Clipboard Sync** — Copy text on one machine, paste it on another. Works in real-time.
+* **Spatial Layout** — Arrange your screens in a visual grid that matches your physical desk. KAM-Flow uses this to know which edge of which screen leads where.
+
+---
+
+## Security
+
+All network traffic — inputs, audio, clipboard data, and file transfers — is encrypted end-to-end. Here's how:
+
+* **AES-GCM 256-bit Encryption** — Every packet is encrypted using hardware-accelerated Windows CNG (Cryptography Next Generation).
+* **Secure PIN Storage** — The Master PIN is never written to a config file. It's hashed and stored in the Windows Credential Vault, which is protected by your Windows account login.
+* **Tamper Detection** — Each packet carries an authenticated header (AAD) that detects any modification in transit.
+* **Replay Protection** — Sequence counters prevent captured packets from being resent.
+* **Size Limits** — Strict payload bounds protect against memory-based attacks.
+* **Lock Screen Safety** — If a Windows UAC prompt or Lock Screen appears, KAM-Flow instantly returns mouse and keyboard control to the Server so you never get locked out.
+
+---
+
+## Getting Started
+
+KAM-Flow is portable — no installer, no dependencies. Just download the `.exe` and run it.
+
+### Requirements
+* Windows 10 or later on all machines
+* All machines must be on the same local network (Wi-Fi or Ethernet)
+* Run as Administrator (required for low-level input hooks)
+
+### Installation
+
+1. Place `KAM-Flow.exe` in a dedicated folder on each machine (for example, `C:\KAM-Flow\` or your Desktop). Avoid restricted locations like `C:\Program Files\` — KAM-Flow creates a local settings file (`.ini`) next to the executable.
+2. Right-click the file and select **Run as Administrator**. For convenience, create a Desktop shortcut and set it to always run as Administrator.
+3. On the first launch, you'll see the **Pre-Flight Launcher**. Choose whether this machine is the **Server** (your main PC with the physical keyboard and mouse) or a **Client** (any secondary PC you want to control).
 
 <img src="docs/images/Main_Dashboard.png" alt="Main Application Dashboard" width="400">
 
-## Core Features
-* **Zero-Latency KVM:** High-frequency, mathematically fractional cursor synchronization and keystroke injection ensures native-feeling control across all paired machines. Media streams and mouse deltas are transmitted over a dedicated high-speed UDP pipeline, with automatic fallback to reliable TCP if blocked by firewalls.
-* **Centralized Audio Mixing:** Captures system audio from Client PCs using jitter-immune WASAPI loopback streams, mixing it seamlessly into the Server's playback device.
-* **Microphone Broadcasting & Injection:** Stream the Server's primary microphone to any connected Client. *(Note: Injecting this received audio into Client applications like Discord or Zoom requires the installation of a free Virtual Audio Cable, such as VB-CABLE, on the Client PC).*
-* **Out-Of-Band File Transfers:** Drag-and-drop files directly onto the UI to transfer them asynchronously over a dedicated, memory-safe TCP stream without interrupting KVM inputs.
-* **Clipboard Synchronization:** Securely share copied text between machines in real-time.
-* **Spatial Layout Matrix:** Visually arrange your physical monitors in a 2D grid to ensure cursor edge-transitions happen exactly where your screens meet.
-
----
-
-## Security Architecture
-KAM-Flow is built with an enterprise-grade, zero-trust security mindset:
-* **AES-GCM 256-bit Cryptography:** All KVM, audio, clipboard, and file transfer payloads are encrypted using Windows Cryptography Next Generation (CNG). 
-* **Zero-Permission Persistence:** Master PINs are never stored in plaintext configuration files. They are hashed via SHA-256 and securely saved exclusively in the Windows OS Credential Vault.
-* **Authenticated Headers (AAD):** Prevents bit-flipping and packet manipulation.
-* **Replay Attack Defense:** Monotonically increasing sequence counters ensure intercepted network packets cannot be replayed.
-* **Memory Bounds Checking:** Strict payload limits actively defend against Out-Of-Memory (OOM) attacks.
-* **UAC & Secure Desktop Failsafes:** Automatically handles User Account Control prompts and Windows Lock screens by immediately returning local control to the Server to prevent user lockouts.
-
----
-
-## General Setup & Installation
-KAM-Flow is a portable, standalone executable that does not require any installation or external dependencies (except for the optional microphone broadcasting feature, which requires a Virtual Audio Cable).
-
-1. Place the `KAM-Flow.exe` file into a dedicated folder on both the machine you wish to use as the **Server** (the PC with the physical mouse and keyboard) and the machine(s) you wish to use as **Clients** (the secondary laptops/PCs). Because KAM-Flow generates a local `.ini` configuration file, it is highly recommended to place it in a user-accessible directory (like `C:\KAM-Flow\` or your Desktop) and avoid system-restricted folders like `C:\Program Files\` to prevent permission issues.
-2. Right-click the executable and select **Run as Administrator**. *(For convenience, we recommend creating a Windows Desktop shortcut set to always "Run as Administrator").* On the first launch, it will display the **Pre-Flight Launcher**, which allows you to explicitly define whether this specific machine will act as the Server (sending inputs) or a Client (receiving inputs).
-3. *Note: For KAM-Flow to communicate over the local network, you may need to allow it through the Windows Defender Firewall when prompted.*
+**Firewall note:** Windows may ask you to allow KAM-Flow through the firewall. Click **Allow** — this is needed for the machines to find and talk to each other on your local network.
 
 ---
 
 ## Using the Server (Main PC)
-The Server is the "Master" machine. Its physical mouse and keyboard will control all connected Clients, and its headset will play the audio mixed from all Clients.
 
-### 1. Initialization
-* Select **"START AS SERVER"** on the Pre-Flight Launcher.
-* Navigate to the **Security & Pairing** tab. KAM-Flow will have automatically generated a secure 8-digit **Master PIN** and saved it to your OS Credential Vault. You will need this PIN to link your Client devices.
+The Server is your primary machine. Its physical keyboard and mouse will control all connected Clients, and its headset will play audio from every Client.
 
-<img src="docs/images/Server_Security.png" alt="Server Security Tab" width="400">
+### 1. Launch & Master PIN
 
-### 2. Managing Connections
-* The Server automatically broadcasts its presence over the local network via UDP beacons.
-* In the **Connections** tab, you can view the connection status, see all actively authenticated clients, and forcefully disconnect them if necessary.
-* Use the **FORCE LOCAL CONTROL** button (or press `Ctrl+Alt+M`) to instantly sever remote cursor locks and bring your mouse back to the Server screen. Because this hotkey operates at the lowest OS level, it will work instantly even if a full-screen game has locked your UI.
+After selecting **"START AS SERVER"**, KAM-Flow opens the **Connections** tab. At the top, you'll see the **Master PIN** section.
 
-<img src="docs/images/Server_Connections.png" alt="Server Connections Tab" width="400">
+KAM-Flow automatically generates a secure, random 8-digit PIN the first time you start the Server. This PIN is what your Client machines will need in order to pair. You can:
+
+* Click **Reveal** to see the PIN and share it with your Client devices.
+* Click **Regenerate Master PIN** to create a new one. This will immediately disconnect any active Clients and require them to pair again with the new PIN.
+
+<img src="docs/images/Server_Connections.png" alt="Server connections" width="400">
+
+### 2. Connections & Control
+
+Below the Master PIN section, the **Connections** tab shows:
+
+* **Control Status** — Whether the Server currently has local control or if a Client is being controlled remotely.
+* **Connected Clients** — A list of all authenticated Clients with a **Disconnect** button next to each one.
+
+When a Client is being controlled, a **FORCE LOCAL CONTROL** button appears. Clicking it (or pressing `Ctrl+Alt+M`) instantly snaps the mouse and keyboard back to the Server. This works even during full-screen games or when a Client becomes unresponsive.
+
+<img src="docs/images/Server_Connections2.png" alt="Server connections" width="400">
 
 ### 3. Spatial Layout
-* Navigate to the **Spatial Layout** tab. 
-* Drag and drop the connected Client boxes around the central Server box to match the physical layout of the monitors on your desk. This dictates which screen edges transition the cursor to which machines.
 
-<img src="docs/images/Server_Spatial_Layout.png" alt="Server Spatial Layout Tab" width="400">
+Open the **Spatial Layout** tab and drag the Client boxes around the central Server box to match the physical arrangement of monitors on your desk. This tells KAM-Flow which screen edge leads to which machine.
 
-### 4. Options, Preferences & Quality of Life
-The Server's **Preferences** tab provides powerful customization for your workspace:
+For example: if your laptop sits to the left of your desktop, drag the Client box to the left of the Server box. Now, moving the cursor off the left edge of your desktop will make it appear on the laptop.
 
-<img src="docs/images/Server_Preferences.png" alt="Server Preferences Tab" width="400">
+<img src="docs/images/Server_Spatial_Layout.png" alt="Server spatial layout" width="400">
 
-* **Startup & System:** Set the "Default Start Mode" to automatically launch as a Server. Combine this with a Windows Startup shortcut and "Minimize to System Tray" for a seamless, hands-free experience.
-* **Control & File Synchronization:** Toggle global keyboard and clipboard sharing. Drag-and-drop files directly onto the KAM-Flow window to transfer them to any selected Client(s) over a lag-free Out-Of-Band (OOB) stream.
-* **Fractional Mouse Sensitivity:** Adjust the pointer speed on the Client screens independently without altering your Server's native gaming/desktop DPI settings.
-* **Advanced Audio Routing:** Enable the **Master Audio Mix** to hear all connected Clients through your Server headset. You can tweak the **Network Jitter Buffer** to prevent audio stutter on unstable Wi-Fi, and enable **Server Mic Broadcast** to stream your main microphone to Clients.
-* **Individual Client Overrides:** Dynamically mute audio, adjust volume, or disable clipboard sync for specific clients on the fly.
-* **Corner Deadzones (Spatial Tab):** Protect the physical corners of your screens (0-10%). This prevents accidental transitions to a Client PC when aiming for the Start Menu or closing maximized windows.
-* **Emergency Hotkey:** Customize the `Ctrl+Alt+M` combination that invokes a low-level OS failsafe to instantly snap the cursor back to the Server.
+### 4. Preferences
+
+The **Preferences** tab gives you control over how KAM-Flow behaves:
+
+<img src="docs/images/Server_Preferences.png" alt="Server preferences" width="400">
+
+* **Startup & System** — Set a default start mode (Server), enable minimize-to-tray, or configure KAM-Flow to launch automatically with Windows for a hands-free setup.
+* **Input & File Sync** — Toggle keyboard sharing, clipboard sync, and drag-and-drop file transfers.
+* **Mouse Sensitivity** — Adjust the cursor speed on Client screens independently, without changing your Server's native DPI or gaming sensitivity.
+* **Audio Mixing** — Enable the **Master Audio Mix** to hear Client audio through your headset. Adjust the **Jitter Buffer** if audio stutters on Wi-Fi, and enable **Mic Broadcast** to send your microphone to Clients.
+* **Per-Client Controls** — Mute individual Clients, adjust their volume, or disable clipboard sync on the fly.
+* **Corner Deadzones** — Protect the corners of your screen (0–10%) so you can reach the Start Menu or close maximized windows without accidentally transitioning to a Client.
+* **Emergency Hotkey** — Customize the `Ctrl+Alt+M` key combination used to instantly reclaim local control.
 
 ---
 
 ## Using the Client (Secondary PC)
-The Client is the machine being controlled. It receives inputs from the Server and can optionally stream its local audio back to the Server.
 
-### 1. Initialization & Pairing
-* Select **"START AS CLIENT"** on the Pre-Flight Launcher.
-* Navigate to the **Security & Pairing** tab.
-* Under "Discovered Servers (Local Network)", you should see your Server PC listed. Click **Select**. *(If your network blocks UDP broadcasts, you can manually type the Server's local IP address into the box).*
-* Enter the 8-digit **Master PIN** generated by the Server and click **Save Pairing**.
+The Client is the machine being controlled. It receives mouse and keyboard input from the Server and can optionally stream its local audio back.
 
-<img src="docs/images/Client_Security_0.png" alt="Client Security Tab unpaired" width="400">
-<img src="docs/images/Client_Security_1.png" alt="Client Security Tab paired" width="400">
+### 1. Pairing to a Server
+
+After selecting **"START AS CLIENT"**, KAM-Flow opens the **Connections** tab. Everything you need to pair and connect is right here — there's no separate setup screen.
+
+**If your Server is on the same network**, it will appear automatically under **Discovered Servers**. Next to each server, you'll see a green **Pair** button.
+
+1. Click the **Pair** button next to the Server you want to connect to.
+2. A popup will ask you to enter the Server's 8-digit **Master PIN**. Type it in (you can click **Show** to verify what you're typing) and click **Pair**.
+3. The pairing is saved securely in your Windows Credential Vault. You won't need to enter the PIN again unless the Server regenerates it.
+
+<img src="docs/images/Client_Connections.png" alt="Client connections" width="400">
+
+<img src="docs/images/Client_Connections2.png" alt="Client connections" width="400">
+
+> **Already paired to a different Server?** KAM-Flow will warn you that only one Server can be paired at a time and ask if you'd like to switch. Clicking **Continue** will unpair the old Server and let you enter the new PIN.
 
 ### 2. Connecting
-* Once paired, navigate to the **Connections** tab.
-* Click **Connect to [Server Name]**. 
-* The Client is now securely tethered. You can move your mouse off the edge of your Server's monitor to take control of the Client PC.
 
-<img src="docs/images/Client_Conections.png" alt="Client Connections Tab" width="400">
+Once paired, the **Currently Paired Server** section at the top of the Connections tab shows your Server's name, IP address, and whether it's currently **[ONLINE]** or **[OFFLINE]**.
 
-### 3. Options, Preferences & Quality of Life
-The Client's **Preferences** tab allows you to configure its local behavior, audio routing, and safety settings:
+Click **Connect to [Server Name]** to establish the encrypted connection. That's it — move your mouse off the edge of the Server's screen and it will appear on the Client.
 
-<img src="docs/images/Client_Preferences.png" alt="Client Preferences Tab" width="400">
+<img src="docs/images/Client_Connections3.png" alt="Client connections" width="400">
 
-* **Startup & System:** Automatically launch as a Client on boot, minimize to the system tray, and enable **Auto-Reconnect** to seamlessly recover the connection if your laptop goes to sleep or drops Wi-Fi.
-* **Input & File Synchronization:** Accept keyboard and clipboard data from the Server. You can also drag-and-drop files onto the Client UI to send them securely back to the Server. Incoming files trigger a safe Accept/Decline pop-up to protect your disk.
-* **Corner Deadzones (Spatial Tab):** Protect the corners of the Client screen (0-10%) to prevent accidental cursor transitions back to the Server when interacting with maximized windows.
-* **Local Audio Routing:** Choose whether to **Send Client Audio** to the Server for mixing. Adjust the **Network Jitter Buffer** to ensure smooth playback when you enable **Receive Server Microphone** (requires VB-CABLE).
-* **Emergency Hotkey:** Customize the `Ctrl+Alt+M` hotkey to safely sever the encrypted connection and disconnect from the Server at any time.
+### 3. Editing the Server IP
+
+If your Server's IP address changes (common on Wi-Fi networks with DHCP), you don't need to re-pair. Just click the **Edit IP** button next to the Connect button, update the IP address, and click **Save**. Your PIN stays the same.
+
+### 4. Forgetting a Server
+
+To unpair from the current Server, find it in the Discovered Servers list — it will have a red **Forget** button instead of Pair. Clicking **Forget** removes the saved PIN and lets you pair to a different Server.
+
+### 5. Preferences
+
+The Client's **Preferences** tab lets you configure local behavior:
+
+<img src="docs/images/Client_Preferences.png" alt="Client preferences" width="400">
+
+* **Startup & System** — Auto-launch as Client, minimize to tray, and enable **Auto-Reconnect** so the connection recovers automatically after sleep or a Wi-Fi drop.
+* **Input & File Sync** — Accept keyboard and clipboard data from the Server. Drag files onto the Client window to send them back. Incoming file transfers always show an Accept/Decline prompt to keep your disk safe.
+* **Audio** — Choose whether to send this Client's audio to the Server. Enable **Receive Server Microphone** to hear the Server's mic through a Virtual Audio Cable (see below).
+* **Corner Deadzones** — Protect the Client screen corners to prevent accidental cursor transitions back to the Server.
+* **Emergency Hotkey** — Customize `Ctrl+Alt+M` to instantly disconnect from the Server at any time.
 
 ---
 
 ## Setting up Microphone Broadcasting (VB-CABLE)
-Due to strict Windows security architecture, applications cannot programmatically create "fake" hardware microphones. To use the Server's microphone in your local Client applications (like Zoom, Discord, or OBS), a safe, free Virtual Audio Cable is required to act as a bridge on the Client PC.
 
-VB-CABLE is 100% legal, zero-latency, digitally signed by Microsoft WHQL, and poses zero kernel-level security risks.
+Windows does not allow applications to create virtual microphone devices on their own. To use the Server's physical microphone in apps running on the Client (like Zoom, Discord, or OBS), you'll need a free Virtual Audio Cable installed on the Client PC.
+
+**VB-CABLE** is a well-known, free audio driver. It's digitally signed by Microsoft (WHQL certified) and safe to install.
 
 ### 1. Download and Install (Client PC Only)
-1. Visit [vb-audio.com/Cable/](https://vb-audio.com/Cable/) and download the **VB-CABLE Driver** for Windows.
-2. Extract the downloaded ZIP file to a folder.
+
+1. Go to [vb-audio.com/Cable/](https://vb-audio.com/Cable/) and download the **VB-CABLE Driver** for Windows.
+2. Extract the ZIP file.
 3. Right-click `VBCABLE_Setup_x64.exe` and select **Run as Administrator**.
-4. Click **Install Driver** and reboot your PC if prompted.
+4. Click **Install Driver** and reboot if prompted.
 
-### 2. Windows Sound Configuration (Client PC Only)
-*Installing VB-CABLE often changes your default Windows sound devices automatically. You must change them back!*
-1. Open Windows Sound Settings.
-2. Ensure your **Default Output (Playback)** is set back to your physical Speakers/Headphones, *not* CABLE Input.
-3. Ensure your **Default Input (Recording)** is set back to your actual physical Microphone, *not* CABLE Output.
+### 2. Fix Your Windows Sound Settings (Client PC Only)
 
-### 3. Route Audio in KAM-Flow
-1. On your **Server PC**, go to Preferences and check **Broadcast Server Microphone to Clients**.
-2. On your **Client PC**, go to Preferences and check **Receive Server Microphone**. 
-*KAM-Flow will automatically detect the Virtual Cable and route the incoming Server microphone audio directly into "CABLE Input".*
+Installing VB-CABLE sometimes changes your default audio devices. Check and correct them:
 
-### 4. Configure Your Apps (Discord, Zoom, etc.)
-1. On the **Client PC**, open the voice settings of the app you want to use.
-2. Change the **Input Device / Microphone** to **CABLE Output (VB-Audio Virtual Cable)**.
-3. You can now speak into your Server's physical microphone, and the app on your Client PC will hear it perfectly!
+1. Open **Windows Sound Settings** (right-click the speaker icon in the taskbar).
+2. Set your **Output device** back to your physical speakers or headphones (not "CABLE Input").
+3. Set your **Input device** back to your physical microphone (not "CABLE Output").
+
+### 3. Enable in KAM-Flow
+
+1. On the **Server PC**: open Preferences and check **Broadcast Server Microphone to Clients**.
+2. On the **Client PC**: open Preferences and check **Receive Server Microphone**.
+
+KAM-Flow will automatically detect the Virtual Audio Cable and route the incoming microphone audio into it.
+
+### 4. Configure Your Apps
+
+1. On the **Client PC**, open the voice/audio settings of the app you want to use (Discord, Zoom, etc.).
+2. Set the **Input Device / Microphone** to **CABLE Output (VB-Audio Virtual Cable)**.
+3. Done — speak into the Server's physical microphone, and the Client app will hear it.
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| Server not appearing in Discovered Servers | Make sure both machines are on the same local network and that KAM-Flow is allowed through the Windows Firewall on both sides. |
+| Client says "Authentication Failed" | The PIN may have changed. Verify the current Master PIN on the Server and re-pair. |
+| Cursor feels laggy on the Client | Check if the Server PC is under heavy CPU load. KAM-Flow prioritizes input latency, but extreme system load can still affect it. Try connecting both machines via Ethernet instead of Wi-Fi. |
+| Audio pops or clicks | Increase the **Jitter Buffer** slider in Preferences. The slider ranges from 20 ms to 200 ms (default is 80 ms). On Wi-Fi or under heavy CPU load, try values around 120–160 ms to give the audio stream more breathing room. |
+| Mouse gets stuck after a Client crash | The Server automatically reclaims local control when a controlling Client disconnects. If it doesn't, press `Ctrl+Alt+M`. |
+| Server IP changed and Client can't connect | Use the **Edit IP** button on the Client's Connections tab to update the IP address without re-pairing. |
+
+---
+
+## License
+
+© Arnoldo Ibarra — Proprietary and Confidential. All rights reserved.
