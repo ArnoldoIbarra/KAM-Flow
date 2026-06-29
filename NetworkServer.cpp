@@ -856,14 +856,22 @@ void UDPListenerLoop() {
         if (c.hasUdp &&
             c.udpAddr.sin_addr.s_addr == senderAddr.sin_addr.s_addr &&
             c.udpAddr.sin_port == senderAddr.sin_port) {
-          // Drop out-of-order packets immediately to prevent backward time
-          // travel in audio/mouse
-          if (header.sequenceNumber <= c.udpRxSequence &&
-              header.sequenceNumber != 0) {
-            matchingSocket = (SOCKET)-1; // Flag as replay drop
+          // Tolerate minor UDP reordering instead of strict drop.
+          // Audio (100Hz) and control packets share the same client UDP
+          // sequence counter, so audio frequently arrives "behind" the
+          // latest control packet. A window of 32 accepts slightly late
+          // packets while still dropping genuinely stale/duplicate data.
+          const uint32_t UDP_REORDER_WINDOW = 32;
+          if (header.sequenceNumber != 0 &&
+              c.udpRxSequence > UDP_REORDER_WINDOW &&
+              header.sequenceNumber < c.udpRxSequence - UDP_REORDER_WINDOW) {
+            matchingSocket = (SOCKET)-1; // Flag as stale drop
             break;
           }
-          c.udpRxSequence = header.sequenceNumber;
+          // Advance the high watermark if this is a newer packet
+          if (header.sequenceNumber > c.udpRxSequence) {
+            c.udpRxSequence = header.sequenceNumber;
+          }
           matchingSocket = c.socket;
           sourceX = c.gridX;
           sourceY = c.gridY;

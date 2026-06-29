@@ -631,26 +631,42 @@ void ClientLoop() {
       }
       finalPayload = tls_decrypted.data();
       finalSize = tls_decrypted.size();
-
-      if (State::globalDebugMode && h.type != MessageType::EVENT_MOUSE) {
-        UI::LogDebug("[Network Client] RX Decrypted -> Type: %d | Size: %zu b",
-                     (int)h.type, finalSize);
-      }
     }
 
+    // Filter high-frequency and routine events BEFORE the generic log
+    // to prevent flooding the debug window with heartbeat/mouse noise.
     if (h.type == MessageType::EVENT_HEARTBEAT) {
       static int rxHbCount = 0;
       if (++rxHbCount % 10 == 0 && State::globalDebugMode) {
         UI::LogDebug(
             "[Network Client] Received Keep-Alive Heartbeat from Server.");
       }
-      continue; // Keep-alive heartbeat acknowledged.
+      continue;
     } else if (h.type == MessageType::EVENT_UDP_HANDSHAKE_ACK) {
       isUdpActive.store(true, std::memory_order_relaxed);
       if (State::globalDebugMode)
         UI::LogDebug(
             "[Network Client] UDP Connection fully established with Server.");
       continue;
+    }
+
+    // Log non-routine TCP packets with human-readable type names
+    if (State::globalDebugMode && h.type != MessageType::EVENT_MOUSE) {
+      const char* typeName = "UNKNOWN";
+      switch (h.type) {
+        case MessageType::EVENT_STATE:          typeName = "STATE"; break;
+        case MessageType::EVENT_SYNC_CURSOR:    typeName = "SYNC_CURSOR"; break;
+        case MessageType::EVENT_AUDIO_FORMAT:   typeName = "AUDIO_FORMAT"; break;
+        case MessageType::EVENT_AUDIO_DATA:     typeName = "AUDIO_DATA"; break;
+        case MessageType::EVENT_MIC_DATA:       typeName = "MIC_DATA"; break;
+        case MessageType::EVENT_CLIPBOARD:      typeName = "CLIPBOARD"; break;
+        case MessageType::EVENT_FILE_OFFER:     typeName = "FILE_OFFER"; break;
+        case MessageType::EVENT_FILE_ACCEPT:    typeName = "FILE_ACCEPT"; break;
+        case MessageType::EVENT_FILE_DECLINE:   typeName = "FILE_DECLINE"; break;
+        case MessageType::EVENT_CLIENT_LOCKED:  typeName = "CLIENT_LOCKED"; break;
+        default: break;
+      }
+      UI::LogDebug("[Network Client] RX -> %s | %zu bytes", typeName, finalSize);
     }
 
     if (h.type == MessageType::EVENT_MOUSE) {

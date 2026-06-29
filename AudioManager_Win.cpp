@@ -643,8 +643,15 @@ namespace Audio {
                                 queue->isBuffering = true;
                                 queue->starvationCount = 0;
                                 isBuffering = true;
-                                if (State::globalDebugMode) { 
-                                    UI::LogDebug("[Audio Debug] Starvation! (Requested %zu, Have 0). Returning to Jitter Buffering mode.", bytesToProcess);
+                                if (State::globalDebugMode) {
+                                    // Rate-limit to once per 5 seconds to prevent flooding
+                                    // the debug log during sustained network issues.
+                                    static uint64_t lastStarvationLog = 0;
+                                    uint64_t now = GetTickCount64();
+                                    if (now - lastStarvationLog > 5000) {
+                                        UI::LogDebug("[Audio] Starvation! (Requested %zu, Have 0). Re-buffering.", bytesToProcess);
+                                        lastStarvationLog = now;
+                                    }
                                 }
                             }
                         } else {
@@ -1061,7 +1068,12 @@ namespace Audio {
                     }
 
                     if (justStartedBuffering && State::globalDebugMode) {
-                        UI::LogDebug("[Audio Debug] Client Mic Starvation! (50 consecutive drops). Returning to Jitter Buffering mode.");
+                        static uint64_t lastMicStarvationLog = 0;
+                        uint64_t now = GetTickCount64();
+                        if (now - lastMicStarvationLog > 5000) {
+                            UI::LogDebug("[Audio] Mic starvation! (50 consecutive drops). Re-buffering.");
+                            lastMicStarvationLog = now;
+                        }
                     }
 
                     // Apply fade-in ramp when exiting buffering mode to eliminate clicks
