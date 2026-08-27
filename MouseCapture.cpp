@@ -127,7 +127,7 @@ namespace Input {
     }
 
     /**
-     * @brief Background thread loop that consumes mouse payloads and broadcasts them over the network.
+     * @brief Background thread loop that consumes mouse payloads and sends them to the controlling client over the network.
      * This fully decouples the high-frequency OS mouse hook from blocking network calls.
      * @return void
      */
@@ -171,18 +171,27 @@ namespace Input {
                 } else {
                     // Send any accumulated movement BEFORE sending the discrete click/scroll
                     if (hasCoalescedMove) {
-                        Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
+                        SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
+                        if (ctrl != INVALID_SOCKET) {
+                            Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
+                        }
                         coalescedMove = { 0, 0, 0, 0 };
                         hasCoalescedMove = false;
                     }
                     // Send the discrete action
-                    Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
+                    SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
+                    if (ctrl != INVALID_SOCKET) {
+                        Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
+                    }
                 }
             }
 
             // Flush any remaining accumulated movement
             if (hasCoalescedMove) {
-                Network::BroadcastMessage(Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
+                SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
+                if (ctrl != INVALID_SOCKET) {
+                    Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
+                }
             }
         }
     }

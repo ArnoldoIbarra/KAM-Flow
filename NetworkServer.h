@@ -1,11 +1,8 @@
-/*
- * Copyright (c) 2026 Arnoldo Ibarra. All Rights Reserved.
- *
- * This software is the confidential and proprietary information of Arnoldo Ibarra.
- * ("Confidential Information"). You shall not disclose such Confidential 
- * Information and shall use it only in accordance with the terms of the 
- * license agreement you entered into.
- */
+// =============================================================================
+// KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
+// =============================================================================
+// Simple Keyboard and Mouse sharing with Audio Mixing 
+// =============================================================================
 
 /// @file NetworkServer.h
 /// Manages the TCP Server for receiving and authenticating client connections.
@@ -57,6 +54,9 @@ namespace Network {
 
     /// Zero-cost atomic flag indicating if any clients are currently connected.
     extern std::atomic<bool> g_hasClients;
+
+    /// Tracks which client socket currently has active KVM control.
+    extern std::atomic<SOCKET> g_controllingClientSocket;
 
     /// Retrieves a list of all currently connected and authenticated clients.
     std::vector<ConnectedClientInfo> GetConnectedClients();

@@ -50,7 +50,7 @@ namespace State {
     std::mutex clientConnectionStatusMutex;
 
     /**
-     * @brief Transitions the application between LOCAL and REMOTE control modes and broadcasts the change.
+     * @brief Transitions the application between LOCAL and REMOTE control modes and notifies the controlling client.
      * @param newMode The target ControlMode to switch to.
      * @return void
      */
@@ -59,7 +59,12 @@ namespace State {
         if (oldMode == newMode) return;
         
         Network::StatePayload payload = { static_cast<uint8_t>(newMode == ControlMode::REMOTE ? 1 : 0) };
-        Network::BroadcastMessage(Network::MessageType::EVENT_STATE, &payload, sizeof(payload));
+        
+        // Notify the controlling client of the mode change instead of broadcasting to all clients.
+        SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
+        if (ctrl != INVALID_SOCKET) {
+            Network::SendToClient(ctrl, Network::MessageType::EVENT_STATE, &payload, sizeof(payload));
+        }
 
         if (newMode == ControlMode::REMOTE) {
             if (globalDebugMode) UI::LogDebug("[KAM-Flow State] Entered REMOTE mode.");

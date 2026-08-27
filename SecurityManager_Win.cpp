@@ -267,14 +267,22 @@ namespace Security {
         // threads surviving across reconnect cycles would encrypt with the
         // old key, causing decryption failures on the remote end.
         g_keyGeneration.fetch_add(1, std::memory_order_release);
-        if (hKey) {
-            BCryptDestroyKey(hKey);
-            hKey = NULL;
+
+        // Null the global handle BEFORE destroying it to prevent use-after-free races.
+        // Any thread calling GetThreadLocalKey() concurrently will see hKey==NULL
+        // and safely return NULL rather than attempting to duplicate an invalidated handle.
+        BCRYPT_KEY_HANDLE keyToDestroy = hKey;
+        hKey = NULL;
+        if (keyToDestroy) {
+            BCryptDestroyKey(keyToDestroy);
         }
-        if (hAesAlg) {
-            BCryptCloseAlgorithmProvider(hAesAlg, 0);
-            hAesAlg = NULL;
+
+        BCRYPT_ALG_HANDLE algToClose = hAesAlg;
+        hAesAlg = NULL;
+        if (algToClose) {
+            BCryptCloseAlgorithmProvider(algToClose, 0);
         }
+
         SecureZeroMemory(keyObjectBuffer.data(), keyObjectBuffer.size());
         keyObjectBuffer.clear();
         // Zero the nonce prefix so it doesn't leak into a future session

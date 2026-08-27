@@ -1,11 +1,8 @@
-/*
- * Copyright (c) 2026 Arnoldo Ibarra. All Rights Reserved.
- *
- * This software is the confidential and proprietary information of Arnoldo Ibarra.
- * ("Confidential Information"). You shall not disclose such Confidential 
- * Information and shall use it only in accordance with the terms of the 
- * license agreement you entered into.
- */
+// =============================================================================
+// KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
+// =============================================================================
+// Simple Keyboard and Mouse sharing with Audio Mixing 
+// =============================================================================
 
 /// @file NetworkClient.h
 /// Manages the TCP Client for connecting to the Server PC and UDP Auto-Discovery listening.

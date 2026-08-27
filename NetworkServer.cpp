@@ -425,6 +425,11 @@ void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
           }
         }
       } else if (header.type == MessageType::EVENT_RETURN_CONTROL) {
+        // Gate return control to only accept events from the client that currently holds KVM focus
+        if (g_controllingClientSocket.load(std::memory_order_relaxed) != clientSocket) {
+          continue;
+        }
+
         if (finalSize == sizeof(ReturnControlPayload)) {
           ReturnControlPayload p;
           memcpy(&p, finalPayload, sizeof(p));
@@ -888,6 +893,11 @@ void UDPListenerLoop() {
       Audio::HandleAudioData(matchingSocket, decrypted.data(),
                              decrypted.size());
     } else if (header.type == MessageType::EVENT_RETURN_CONTROL) {
+      // Gate UDP return control to only accept events from the actively controlling client
+      if (g_controllingClientSocket.load(std::memory_order_relaxed) != matchingSocket) {
+        continue;
+      }
+
       if (decrypted.size() == sizeof(ReturnControlPayload)) {
         ReturnControlPayload p;
         memcpy(&p, decrypted.data(), sizeof(p));
@@ -1302,6 +1312,15 @@ bool SendToClient(SOCKET clientSocket, MessageType type, const void *payload,
   return false;
 }
 
+/**
+ * @brief Calculates spatial grid trajectory and routes control to the appropriate machine.
+ * @param sourceX The grid X coordinate of the originating machine.
+ * @param sourceY The grid Y coordinate of the originating machine.
+ * @param exitEdge The edge the cursor exited from (0=Left, 1=Right, 2=Top, 3=Bottom).
+ * @param normX Normalized horizontal coordinate on the exit edge (0.0f to 1.0f).
+ * @param normY Normalized vertical coordinate on the exit edge (0.0f to 1.0f).
+ * @return bool True if the transition successfully reached a valid node, false if hit boundary.
+ */
 bool RouteCursorTransition(int sourceX, int sourceY, uint8_t exitEdge,
                            float normX, float normY) {
   int dx = 0, dy = 0;
@@ -1335,6 +1354,12 @@ bool RouteCursorTransition(int sourceX, int sourceY, uint8_t exitEdge,
   // active node.
   while (targetX >= -10 && targetX <= 10 && targetY >= -10 && targetY <= 10) {
     if (targetX == 0 && targetY == 0) {
+      // Notify the previously controlling client that it lost focus before switching to LOCAL
+      SOCKET prevCtrl = g_controllingClientSocket.load(std::memory_order_relaxed);
+      if (prevCtrl != INVALID_SOCKET) {
+        StatePayload localPayload = { 0 }; // 0 represents ControlMode::LOCAL
+        SendToClient(prevCtrl, MessageType::EVENT_STATE, &localPayload, sizeof(localPayload));
+      }
       // Ray hit the Server's coordinates; pull control back locally.
       Input::HandleReturnControl(entryEdge, normX, normY);
       g_controllingClientSocket.store(INVALID_SOCKET,
@@ -1359,6 +1384,12 @@ bool RouteCursorTransition(int sourceX, int sourceY, uint8_t exitEdge,
       CursorSyncPayload p = {entryEdge, normX, normY};
       if (SendToClient(targetSocket, MessageType::EVENT_SYNC_CURSOR, &p,
                        sizeof(p))) {
+        // Notify the PREVIOUS controlling client that it lost control
+        SOCKET prevCtrl = g_controllingClientSocket.load(std::memory_order_relaxed);
+        if (prevCtrl != INVALID_SOCKET && prevCtrl != targetSocket) {
+          StatePayload localPayload = { 0 }; // 0 represents ControlMode::LOCAL
+          SendToClient(prevCtrl, MessageType::EVENT_STATE, &localPayload, sizeof(localPayload));
+        }
         g_controllingClientSocket.store(targetSocket,
                                         std::memory_order_relaxed);
         State::SetMode(State::ControlMode::REMOTE);

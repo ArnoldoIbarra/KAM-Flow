@@ -1147,14 +1147,13 @@ void StopClient() {
   Audio::StopLoopbackCapture();
   Audio::StopMicReceiver();
 
+  // Signal graceful abort on the TCP socket to unblock recv() in ClientLoop
   if (clientSocket != INVALID_SOCKET) {
-    closesocket(clientSocket);
-    clientSocket = INVALID_SOCKET;
+    shutdown(clientSocket, SD_BOTH);
   }
-  if (clientUdpSocket != INVALID_SOCKET) {
-    closesocket(clientUdpSocket);
-    clientUdpSocket = INVALID_SOCKET;
-  }
+
+  // Join all threads BEFORE closing sockets to prevent race conditions or crashes
+  // from in-flight send/recv operations on invalidated or OS-recycled socket descriptors.
   if (clientThread.joinable())
     clientThread.join();
   if (clientUdpListenerThread.joinable())
@@ -1163,6 +1162,17 @@ void StopClient() {
     clientHeartbeatThread.join();
   if (autoReconnectThread.joinable())
     autoReconnectThread.join();
+
+  // Clean up socket descriptors now that all network threads have safely exited
+  if (clientSocket != INVALID_SOCKET) {
+    closesocket(clientSocket);
+    clientSocket = INVALID_SOCKET;
+  }
+  if (clientUdpSocket != INVALID_SOCKET) {
+    closesocket(clientUdpSocket);
+    clientUdpSocket = INVALID_SOCKET;
+  }
+
   Security::Shutdown();
   WSACleanup();
   if (State::globalDebugMode)

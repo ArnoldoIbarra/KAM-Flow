@@ -1,17 +1,12 @@
-/*
- * Copyright (c) 2026 Arnoldo Ibarra. All Rights Reserved.
- *
- * This software is the confidential and proprietary information of Arnoldo Ibarra.
- * ("Confidential Information"). You shall not disclose such Confidential 
- * Information and shall use it only in accordance with the terms of the 
- * license agreement you entered into.
- */
+// =============================================================================
+// KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
+// =============================================================================
+// Simple Keyboard and Mouse sharing with Audio Mixing 
+// =============================================================================
 
-/**
- * @file NetworkMessages.h
- * @brief Defines the data structures and protocol signatures for KAM-Flow.
- * Includes structural definitions for KVM deltas and UDP Auto-Discovery.
- */
+/// @file NetworkMessages.h
+/// Defines the data structures and protocol signatures for KAM-Flow.
+/// Includes structural definitions for KVM deltas and UDP Auto-Discovery.
 
 #pragma once
 

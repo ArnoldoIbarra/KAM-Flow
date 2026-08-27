@@ -46,7 +46,7 @@ namespace Input {
     std::thread g_keyboardNetworkThread;
 
     /**
-     * @brief Background thread loop that consumes keyboard payloads and broadcasts them over the network.
+     * @brief Background thread loop that consumes keyboard payloads and sends them to the controlling client over the network.
      * This fully decouples the high-frequency OS keyboard hook from blocking network calls,
      * preventing Windows from silently removing the hook due to LL callback timeout violations.
      * @return void
@@ -77,7 +77,10 @@ namespace Input {
             // Keyboard events are never coalesced — each keypress/release must
             // be delivered individually to preserve correct modifier state.
             if (hasPayload) {
-                Network::BroadcastMessage(Network::MessageType::EVENT_KEYBOARD, &p, sizeof(p));
+                SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
+                if (ctrl != INVALID_SOCKET) {
+                    Network::SendToClient(ctrl, Network::MessageType::EVENT_KEYBOARD, &p, sizeof(p));
+                }
             }
         }
     }
