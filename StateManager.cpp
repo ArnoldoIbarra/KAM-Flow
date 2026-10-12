@@ -26,25 +26,25 @@
 namespace State {
     
     // --- GLOBAL STATE VARIABLES ---
-    AppRole currentRole = AppRole::NONE;
+    std::atomic<AppRole> currentRole{AppRole::NONE};
     AppRole defaultRole = AppRole::NONE;
     std::atomic<ControlMode> currentMode{ControlMode::LOCAL};
-    bool globalDebugMode = false;
-    bool minimizeToTray = true;
-    bool enableClipboardSync = true;
-    bool enableKeyboardSync = true; 
-    bool enableFileTransfer = true;
-    bool enableServerAudioMix = true;
-    bool enableServerMicBroadcast = false;
-    bool enableClientAudioStream = true;
-    bool enableClientMicReceive = false;
-    int audioJitterBufferMs = 80;
-    int edgeDeadzonePercent = 5;
-    float mouseSensitivity = 1.0f;
-    char emergencyHotkey = 'M';
-    bool enableGameMode = false;
-    char gameModeHotkey = 'G';
-    bool enableClientAutoReconnect = true;
+    std::atomic<bool> globalDebugMode{false};
+    std::atomic<bool> minimizeToTray{true};
+    std::atomic<bool> enableClipboardSync{true};
+    std::atomic<bool> enableKeyboardSync{true}; 
+    std::atomic<bool> enableFileTransfer{true};
+    std::atomic<bool> enableServerAudioMix{true};
+    std::atomic<bool> enableServerMicBroadcast{false};
+    std::atomic<bool> enableClientAudioStream{true};
+    std::atomic<bool> enableClientMicReceive{false};
+    std::atomic<int> audioJitterBufferMs{80};
+    std::atomic<int> edgeDeadzonePercent{5};
+    std::atomic<float> mouseSensitivity{1.0f};
+    std::atomic<char> emergencyHotkey{'M'};
+    std::atomic<bool> enableGameMode{false};
+    std::atomic<char> gameModeHotkey{'G'};
+    std::atomic<bool> enableClientAutoReconnect{true};
 
     std::string clientConnectionStatus = "Idle";
     std::mutex clientConnectionStatusMutex;

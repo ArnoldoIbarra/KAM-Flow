@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -29,7 +30,7 @@ namespace State {
     };
 
     /// The current macro role of the application.
-    extern AppRole currentRole;
+    extern std::atomic<AppRole> currentRole;
     /// The default role loaded from kamflow.ini to facilitate auto-start.
     extern AppRole defaultRole;
 
@@ -43,22 +44,22 @@ namespace State {
     bool IsRemote();
 
     /// Master toggle for rendering the console window and enabling verbose std::cout logging.
-    extern bool globalDebugMode;
+    extern std::atomic<bool> globalDebugMode;
 
     /// Toggle to minimize the application to the System Tray instead of the Taskbar.
-    extern bool minimizeToTray;
+    extern std::atomic<bool> minimizeToTray;
 
     /// Master toggle for clipboard text synchronization.
-    extern bool enableClipboardSync;
+    extern std::atomic<bool> enableClipboardSync;
 
     /// Toggle to enable or disable keyboard keystroke synchronization.
-    extern bool enableKeyboardSync;
+    extern std::atomic<bool> enableKeyboardSync;
 
     /// Toggle to enable or disable file transfers.
-    extern bool enableFileTransfer;
+    extern std::atomic<bool> enableFileTransfer;
 
     /// Toggle to enable automatic reconnection on unintentional drop (Client side).
-    extern bool enableClientAutoReconnect;
+    extern std::atomic<bool> enableClientAutoReconnect;
 
     /// Thread-safe setter for the client connection status.
     void SetClientStatus(const std::string& status);
@@ -68,27 +69,27 @@ namespace State {
 
     // --- AUDIO ROUTING TOGGLES ---
     /// Server: Master toggle to receive and mix incoming client audio.
-    extern bool enableServerAudioMix;
+    extern std::atomic<bool> enableServerAudioMix;
     /// Server: Toggle to broadcast local microphone to clients.
-    extern bool enableServerMicBroadcast;
+    extern std::atomic<bool> enableServerMicBroadcast;
     /// Client: Toggle to capture and send laptop audio to the server.
-    extern bool enableClientAudioStream;
+    extern std::atomic<bool> enableClientAudioStream;
     /// Client: Toggle to receive server microphone data into the Virtual Audio Cable.
-    extern bool enableClientMicReceive;
+    extern std::atomic<bool> enableClientMicReceive;
 
     /// Target jitter buffer latency in milliseconds for incoming audio.
-    extern int audioJitterBufferMs;
+    extern std::atomic<int> audioJitterBufferMs;
 
     /// Percentage of the screen corners (0-10) to ignore for edge detection transitions.
-    extern int edgeDeadzonePercent;
+    extern std::atomic<int> edgeDeadzonePercent;
 
     /// Mouse sensitivity multiplier for Client injection.
-    extern float mouseSensitivity;
+    extern std::atomic<float> mouseSensitivity;
     /// Character representing the emergency hotkey (default 'M').
-    extern char emergencyHotkey;
+    extern std::atomic<char> emergencyHotkey;
 
     /// Toggle to prevent cursor transitions to clients when gaming.
-    extern bool enableGameMode;
+    extern std::atomic<bool> enableGameMode;
     /// Character representing the game mode toggle hotkey (default 'G').
-    extern char gameModeHotkey;
+    extern std::atomic<char> gameModeHotkey;
 }

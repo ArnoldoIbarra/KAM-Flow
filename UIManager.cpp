@@ -20,6 +20,7 @@
 #include "FileTransferManager.h"
 #include "MouseCapture.h"
 #include <string>
+#include <string_view>
 #include <imgui.h>
 #include <imgui_impl_win32.h>
 #include <imgui_impl_dx11.h>
@@ -33,6 +34,7 @@
 #include <mutex>
 #include <commdlg.h>
 #include <cstdio>
+#include <cmath>
 #include "resource.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -94,6 +96,57 @@ namespace UI {
         return true;
     }
     
+    /**
+     * @brief Adapts an std::atomic<bool> state variable to the Dear ImGui Checkbox widget.
+     * @param label UI label string for the checkbox.
+     * @param val Reference to the std::atomic<bool> variable to read and update.
+     * @return bool True if the checkbox value was toggled in the current frame, false otherwise.
+     */
+    static bool AtomicCheckbox(const char* label, std::atomic<bool>& val) {
+        bool current = val.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox(label, &current)) {
+            val.store(current, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Adapts an std::atomic<int> state variable to the Dear ImGui SliderInt widget.
+     * @param label UI label string for the slider.
+     * @param val Reference to the std::atomic<int> variable to read and update.
+     * @param v_min Minimum integer range bound.
+     * @param v_max Maximum integer range bound.
+     * @param format Optional format specifier for the slider display text.
+     * @return bool True if the slider value was modified in the current frame, false otherwise.
+     */
+    static bool AtomicSliderInt(const char* label, std::atomic<int>& val, int v_min, int v_max, const char* format = "%d") {
+        int current = val.load(std::memory_order_relaxed);
+        if (ImGui::SliderInt(label, &current, v_min, v_max, format)) {
+            val.store(current, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Adapts an std::atomic<float> state variable to the Dear ImGui SliderFloat widget.
+     * @param label UI label string for the slider.
+     * @param val Reference to the std::atomic<float> variable to read and update.
+     * @param v_min Minimum floating-point range bound.
+     * @param v_max Maximum floating-point range bound.
+     * @param format Optional format specifier for the slider display text.
+     * @return bool True if the slider value was modified in the current frame, false otherwise.
+     */
+    static bool AtomicSliderFloat(const char* label, std::atomic<float>& val, float v_min, float v_max, const char* format = "%.2f") {
+        float current = val.load(std::memory_order_relaxed);
+        if (ImGui::SliderFloat(label, &current, v_min, v_max, format)) {
+            val.store(current, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+
     // --- IN-ENGINE DEBUG CONSOLE ---
     std::mutex g_logMutex;
     std::vector<char> g_logBufferVec; // Starts entirely empty to save memory
@@ -366,6 +419,16 @@ namespace UI {
             }
         }
         break; // Let it fall through to DefWindowProc
+            case 0x02E0: // WM_DPICHANGED
+                if (lParam) {
+                    RECT* const prcNewWindow = (RECT*)lParam;
+                    ::SetWindowPos(hWnd, nullptr,
+                        prcNewWindow->left, prcNewWindow->top,
+                        prcNewWindow->right - prcNewWindow->left,
+                        prcNewWindow->bottom - prcNewWindow->top,
+                        SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+                return 0;
             case WM_SIZE:
         if (wParam != SIZE_MINIMIZED && wParam != SIZE_MAXIMIZED) {
             RECT rect;
@@ -414,6 +477,92 @@ namespace UI {
     }
 
     /**
+     * @brief Configures a cohesive modern dark palette and ergonomic geometry for Dear ImGui.
+     * @param style Reference to the ImGuiStyle structure to configure.
+     * @return void
+     */
+    void ApplyDarkTheme(ImGuiStyle& style) {
+        ImVec4* colors = style.Colors;
+
+        // Window and backgrounds
+        colors[ImGuiCol_WindowBg]           = ImVec4(0.08f, 0.09f, 0.12f, 1.00f); // Deep sleek obsidian
+        colors[ImGuiCol_ChildBg]            = ImVec4(0.10f, 0.11f, 0.15f, 0.90f); // Subtle card background
+        colors[ImGuiCol_PopupBg]            = ImVec4(0.09f, 0.10f, 0.14f, 0.98f); // Solid popup surface
+        colors[ImGuiCol_Border]             = ImVec4(0.20f, 0.23f, 0.30f, 0.50f); // Subtle slate border
+        colors[ImGuiCol_BorderShadow]       = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+
+        // Text
+        colors[ImGuiCol_Text]               = ImVec4(0.92f, 0.93f, 0.95f, 1.00f); // Crisp white
+        colors[ImGuiCol_TextDisabled]       = ImVec4(0.50f, 0.53f, 0.60f, 1.00f); // Muted slate
+
+        // Headers & Tabs
+        colors[ImGuiCol_Header]             = ImVec4(0.16f, 0.22f, 0.32f, 0.80f);
+        colors[ImGuiCol_HeaderHovered]      = ImVec4(0.22f, 0.32f, 0.48f, 0.90f);
+        colors[ImGuiCol_HeaderActive]       = ImVec4(0.18f, 0.28f, 0.44f, 1.00f);
+
+        colors[ImGuiCol_Tab]                = ImVec4(0.12f, 0.14f, 0.19f, 1.00f);
+        colors[ImGuiCol_TabHovered]         = ImVec4(0.22f, 0.32f, 0.48f, 1.00f);
+        colors[ImGuiCol_TabActive]          = ImVec4(0.17f, 0.25f, 0.38f, 1.00f);
+        colors[ImGuiCol_TabUnfocused]       = ImVec4(0.10f, 0.12f, 0.16f, 1.00f);
+        colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.14f, 0.18f, 0.26f, 1.00f);
+
+        // Frame (input boxes, checkboxes, sliders background)
+        colors[ImGuiCol_FrameBg]            = ImVec4(0.13f, 0.15f, 0.20f, 1.00f);
+        colors[ImGuiCol_FrameBgHovered]     = ImVec4(0.18f, 0.22f, 0.30f, 1.00f);
+        colors[ImGuiCol_FrameBgActive]      = ImVec4(0.22f, 0.28f, 0.38f, 1.00f);
+
+        // Title & Menu
+        colors[ImGuiCol_TitleBg]            = ImVec4(0.08f, 0.09f, 0.12f, 1.00f);
+        colors[ImGuiCol_TitleBgActive]      = ImVec4(0.10f, 0.12f, 0.16f, 1.00f);
+        colors[ImGuiCol_TitleBgCollapsed]   = ImVec4(0.08f, 0.09f, 0.12f, 0.60f);
+        colors[ImGuiCol_MenuBarBg]          = ImVec4(0.10f, 0.12f, 0.16f, 1.00f);
+
+        // Buttons (modern royal blue / slate accent)
+        colors[ImGuiCol_Button]             = ImVec4(0.16f, 0.24f, 0.38f, 1.00f);
+        colors[ImGuiCol_ButtonHovered]      = ImVec4(0.22f, 0.34f, 0.54f, 1.00f);
+        colors[ImGuiCol_ButtonActive]       = ImVec4(0.14f, 0.28f, 0.48f, 1.00f);
+
+        // Sliders & Scrollbars
+        colors[ImGuiCol_SliderGrab]         = ImVec4(0.26f, 0.52f, 0.88f, 1.00f); // Electric royal blue
+        colors[ImGuiCol_SliderGrabActive]   = ImVec4(0.35f, 0.62f, 0.98f, 1.00f);
+        colors[ImGuiCol_CheckMark]          = ImVec4(0.35f, 0.72f, 1.00f, 1.00f); // Bright cyan checkmark
+        colors[ImGuiCol_ScrollbarBg]        = ImVec4(0.08f, 0.09f, 0.12f, 0.50f);
+        colors[ImGuiCol_ScrollbarGrab]      = ImVec4(0.20f, 0.24f, 0.32f, 1.00f);
+        colors[ImGuiCol_ScrollbarGrabHovered]= ImVec4(0.28f, 0.34f, 0.45f, 1.00f);
+        colors[ImGuiCol_ScrollbarGrabActive]= ImVec4(0.35f, 0.44f, 0.58f, 1.00f);
+
+        // Separators & Resize Grips
+        colors[ImGuiCol_Separator]          = ImVec4(0.20f, 0.23f, 0.30f, 0.60f);
+        colors[ImGuiCol_SeparatorHovered]   = ImVec4(0.26f, 0.52f, 0.88f, 0.80f);
+        colors[ImGuiCol_SeparatorActive]    = ImVec4(0.35f, 0.62f, 0.98f, 1.00f);
+        colors[ImGuiCol_ResizeGrip]         = ImVec4(0.20f, 0.24f, 0.32f, 0.30f);
+        colors[ImGuiCol_ResizeGripHovered]  = ImVec4(0.26f, 0.52f, 0.88f, 0.67f);
+        colors[ImGuiCol_ResizeGripActive]   = ImVec4(0.35f, 0.62f, 0.98f, 0.95f);
+
+        // Modal dimming
+        colors[ImGuiCol_ModalWindowDimBg]   = ImVec4(0.00f, 0.00f, 0.00f, 0.65f);
+
+        // Modern Rounding & Sizing
+        style.WindowRounding    = 6.0f;
+        style.ChildRounding     = 6.0f;
+        style.FrameRounding     = 4.0f;
+        style.PopupRounding     = 6.0f;
+        style.ScrollbarRounding = 4.0f;
+        style.GrabRounding      = 4.0f;
+        style.TabRounding       = 4.0f;
+
+        style.WindowBorderSize  = 1.0f;
+        style.ChildBorderSize   = 1.0f;
+        style.PopupBorderSize   = 1.0f;
+        style.FrameBorderSize   = 1.0f;
+
+        style.WindowPadding     = ImVec2(10.0f, 10.0f);
+        style.FramePadding      = ImVec2(8.0f, 4.0f);
+        style.ItemSpacing       = ImVec2(8.0f, 6.0f);
+        style.ItemInnerSpacing  = ImVec2(6.0f, 4.0f);
+    }
+
+    /**
      * @brief Initializes the Win32 window, DirectX 11 device, and Dear ImGui context.
      * @return true if initialization succeeded, false if any subsystem failed.
      */
@@ -456,8 +605,8 @@ namespace UI {
         if (!hwnd) return false;
 
         // Register the Global Hotkey for Emergency Override
-        ::RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::emergencyHotkey);
-        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey);
+        ::RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::emergencyHotkey.load(std::memory_order_relaxed));
+        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey.load(std::memory_order_relaxed));
 
         InitTrayIcon(hwnd);
 
@@ -502,7 +651,28 @@ namespace UI {
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
-        ImGui::StyleColorsDark();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        ImGuiStyle& style = ImGui::GetStyle();
+        ApplyDarkTheme(style);
+
+        // Dynamic High-DPI detection
+        float dpiScale = 1.0f;
+        HMODULE hUser32 = GetModuleHandleA("user32.dll");
+        if (hUser32) {
+            typedef UINT(WINAPI* PFN_GetDpiForWindow)(HWND);
+            PFN_GetDpiForWindow pfnGetDpiForWindow = (PFN_GetDpiForWindow)GetProcAddress(hUser32, "GetDpiForWindow");
+            if (pfnGetDpiForWindow && hwnd) {
+                UINT dpi = pfnGetDpiForWindow(hwnd);
+                if (dpi > 0) dpiScale = static_cast<float>(dpi) / 96.0f;
+            }
+        }
+        if (dpiScale > 1.0f) {
+            style.ScaleAllSizes(dpiScale);
+            io.FontGlobalScale = dpiScale;
+        }
+
         ImGui_ImplWin32_Init(hwnd);
         ImGui_ImplDX11_Init(pd3dDevice, pd3dDeviceContext);
 
@@ -548,7 +718,85 @@ namespace UI {
         ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
         ImGui::Begin("KAM-Flow Control Center", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
 
+        // --- UNIFIED STATUS HEADER & BADGES ---
+        ImGui::AlignTextToFramePadding();
         ImGui::Text("KAM-Flow %s", (State::currentRole == State::AppRole::SERVER ? "SERVER" : "CLIENT"));
+        ImGui::SameLine();
+
+        if (State::currentRole == State::AppRole::SERVER) {
+            bool isRemote = State::IsRemote();
+            if (isRemote) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.45f, 0.0f, 1.0f));
+                ImGui::SmallButton("REMOTE");
+                ImGui::PopStyleColor();
+                DrawWrappedTooltip("Remote mode active: Physical keyboard & mouse input is currently directed to the Client PC.");
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.55f, 0.22f, 1.0f));
+                ImGui::SmallButton("LOCAL");
+                ImGui::PopStyleColor();
+                DrawWrappedTooltip("Local mode active: You have physical control of the Server PC.");
+            }
+            ImGui::SameLine();
+
+            auto connectedClients = Network::GetConnectedClients();
+            char clientBadge[32];
+            snprintf(clientBadge, sizeof(clientBadge), "Clients: %zu", connectedClients.size());
+            if (!connectedClients.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.75f, 1.0f));
+                ImGui::SmallButton(clientBadge);
+                ImGui::PopStyleColor();
+                DrawWrappedTooltip("Active client sessions currently authenticated and connected.");
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.35f, 0.35f, 0.35f, 1.0f));
+                ImGui::SmallButton("No Clients");
+                ImGui::PopStyleColor();
+                DrawWrappedTooltip("Waiting for Client machines to connect and pair.");
+            }
+        } else {
+            // Client Status Badges
+            std::string currentStatus = State::GetClientStatus();
+            bool isConnected = Network::IsClientConnected();
+            if (isConnected) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.55f, 0.22f, 1.0f));
+                ImGui::SmallButton("CONNECTED");
+                ImGui::PopStyleColor();
+                DrawWrappedTooltip("Client is securely connected to the Server.");
+            } else if (currentStatus.find("Connecting") != std::string::npos || 
+                       currentStatus.find("Authenticating") != std::string::npos || 
+                       currentStatus.find("reconnecting") != std::string::npos) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.65f, 0.1f, 1.0f));
+                ImGui::SmallButton(currentStatus.c_str());
+                ImGui::PopStyleColor();
+                DrawWrappedTooltip("Client is negotiating a connection.");
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.2f, 0.2f, 1.0f));
+                ImGui::SmallButton(currentStatus.c_str());
+                ImGui::PopStyleColor();
+                DrawWrappedTooltip("Client is currently disconnected.");
+            }
+        }
+
+        // Persistent File Transfer Header Pill
+        auto activeTransfers = FileTransfer::GetActiveTransfers();
+        if (!activeTransfers.empty()) {
+            ImGui::SameLine();
+            const auto& t0 = activeTransfers[0];
+            float pct = t0.fileSize > 0 ? ((float)t0.transferredSize / (float)t0.fileSize) * 100.0f : 0.0f;
+            char pillText[128];
+            snprintf(pillText, sizeof(pillText), "Transfer: %.0f%% (%zu)", pct, activeTransfers.size());
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.5f, 0.85f, 1.0f));
+            ImGui::SmallButton(pillText);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                char tip[256];
+                snprintf(tip, sizeof(tip), "Active File: %s\nTransferred: %.2f / %.2f MB (%.1f%%)",
+                         t0.fileName.c_str(),
+                         (float)t0.transferredSize / (1024.0f * 1024.0f),
+                         (float)t0.fileSize / (1024.0f * 1024.0f), pct);
+                DrawWrappedTooltip(tip);
+            }
+        }
+
         ImGui::Separator();
         ImGui::Spacing();
 
@@ -600,7 +848,7 @@ namespace UI {
                     if (isRemote) {
                         ImGui::Spacing();
                         char btnText[64];
-                        snprintf(btnText, sizeof(btnText), "FORCE LOCAL CONTROL (Ctrl+Alt+%c)", State::emergencyHotkey);
+                        snprintf(btnText, sizeof(btnText), "FORCE LOCAL CONTROL (Ctrl+Alt+%c)", State::emergencyHotkey.load(std::memory_order_relaxed));
                         if (ImGui::Button(btnText, ImVec2(-1, 40))) { State::SetMode(State::ControlMode::LOCAL); }
                         DrawWrappedTooltip("Instantly regain control of the Server PC, same as the hotkey.");
                     }
@@ -861,8 +1109,13 @@ namespace UI {
                             ImGui::TextColored(ImVec4(0.0f, 1.0f, 1.0f, 1.0f), "%s (%s)", g_pairingTargetHostname, g_pairingTargetIP);
                             ImGui::Spacing();
 
-                            ImGui::InputText("Master PIN", g_pairingPinInput, sizeof(g_pairingPinInput),
-                                g_showPairingPin ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password);
+                            // Automatically focus keyboard into the PIN input on first appearance
+                            if (ImGui::IsWindowAppearing()) {
+                                ImGui::SetKeyboardFocusHere();
+                            }
+
+                            ImGuiInputTextFlags pinFlags = (g_showPairingPin ? ImGuiInputTextFlags_None : ImGuiInputTextFlags_Password) | ImGuiInputTextFlags_EnterReturnsTrue;
+                            bool enterPressed = ImGui::InputText("Master PIN", g_pairingPinInput, sizeof(g_pairingPinInput), pinFlags);
                             ImGui::SameLine();
                             if (ImGui::Button(g_showPairingPin ? "Hide" : "Show")) { g_showPairingPin = !g_showPairingPin; }
                             DrawWrappedTooltip("Toggle visibility of the PIN you are typing.");
@@ -892,14 +1145,17 @@ namespace UI {
                             }
                             ImGui::SameLine();
                             ImGui::BeginDisabled(!pinValid);
-                            if (ImGui::Button("Pair", ImVec2(120, 30))) {
+                            bool pairClicked = ImGui::Button("Pair", ImVec2(120, 30));
+                            ImGui::EndDisabled();
+
+                            // Allow submission via clicking 'Pair' button or pressing Enter
+                            if (pinValid && (pairClicked || enterPressed)) {
                                 CredentialManager::SaveSecret(
                                     "KAMFlow_Server_" + std::string(g_pairingTargetIP),
                                     std::string(g_pairingPinInput));
                                 memset(g_pairingPinInput, 0, sizeof(g_pairingPinInput));
                                 ImGui::CloseCurrentPopup();
                             }
-                            ImGui::EndDisabled();
                             ImGui::EndPopup();
                         }
 
@@ -909,7 +1165,7 @@ namespace UI {
                         ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
                         
                         char btnText[64];
-                        snprintf(btnText, sizeof(btnText), "Disconnect (Ctrl+Alt+%c)", State::emergencyHotkey);
+                        snprintf(btnText, sizeof(btnText), "Disconnect (Ctrl+Alt+%c)", State::emergencyHotkey.load(std::memory_order_relaxed));
                         if (ImGui::Button(btnText, ImVec2(-1, 40))) {
                             Network::StopClient();
                         }
@@ -963,24 +1219,80 @@ namespace UI {
                             }
 
                             if (isServer) {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-                                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+                                // Server is active when in local mode (not routing to a remote client)
+                                bool isServerActive = !State::IsRemote();
+                                if (isServerActive) {
+                                    // Vibrant emerald green button styling for active local control
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.62f, 0.28f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.72f, 0.35f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.15f, 0.55f, 0.22f, 1.0f));
+                                } else {
+                                    // Muted olive green styling when control is delegated to a remote client
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.30f, 0.14f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.38f, 0.18f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.10f, 0.26f, 0.12f, 1.0f));
+                                }
                                 static char serverName[MAX_COMPUTERNAME_LENGTH + 1] = "";
                                 if (serverName[0] == '\0') {
                                     DWORD size = sizeof(serverName);
                                     GetComputerNameA(serverName, &size);
                                 }
                                 char serverLabel[128];
-                                snprintf(serverLabel, sizeof(serverLabel), "%s\nServer", serverName);
+                                if (isServerActive) {
+                                    snprintf(serverLabel, sizeof(serverLabel), "%s\nServer\n[ACTIVE]", serverName);
+                                } else {
+                                    snprintf(serverLabel, sizeof(serverLabel), "%s\nServer", serverName);
+                                }
                                 ImGui::Button(serverLabel, ImVec2(cellSize, cellSize));
                                 ImGui::PopStyleColor(3);
+
+                                // Render glowing outline when Server is actively controlling input
+                                if (isServerActive) {
+                                    ImVec2 pMin = ImGui::GetItemRectMin();
+                                    ImVec2 pMax = ImGui::GetItemRectMax();
+                                    ImDrawList* drawList = ImGui::GetWindowDrawList();
+                                    float pulse = 0.65f + 0.35f * sinf(static_cast<float>(ImGui::GetTime()) * 4.0f);
+                                    drawList->AddRect(ImVec2(pMin.x - 2, pMin.y - 2), ImVec2(pMax.x + 2, pMax.y + 2), IM_COL32(40, 230, 100, static_cast<int>(120 * pulse)), 6.0f, 0, 2.0f);
+                                    drawList->AddRect(pMin, pMax, IM_COL32(60, 255, 130, 255), 4.0f, 0, 2.0f);
+                                }
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip(isServerActive ? "Local Server: Currently controlling mouse and keyboard." : "Local Server: Input currently delegated to a Remote Client.");
+                                }
                             } else if (matchedClient) {
-                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.4f, 0.8f, 1.0f));
+                                // Client is active when in remote mode and this client's socket matches the controlling socket
+                                bool isClientActive = State::IsRemote() && (matchedClient->socket == Network::g_controllingClientSocket.load(std::memory_order_relaxed));
+                                if (isClientActive) {
+                                    // Vibrant royal/cyan blue styling for actively controlled client
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.05f, 0.48f, 0.88f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.12f, 0.58f, 0.98f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.04f, 0.40f, 0.78f, 1.0f));
+                                } else {
+                                    // Muted steel blue styling for idle connected clients
+                                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.28f, 0.48f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.36f, 0.58f, 1.0f));
+                                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.12f, 0.22f, 0.40f, 1.0f));
+                                }
                                 char clientLabel[128];
-                                snprintf(clientLabel, sizeof(clientLabel), "%s\nClient", matchedClient->name.c_str());
+                                if (isClientActive) {
+                                    snprintf(clientLabel, sizeof(clientLabel), "%s\nClient\n[ACTIVE]", matchedClient->name.c_str());
+                                } else {
+                                    snprintf(clientLabel, sizeof(clientLabel), "%s\nClient", matchedClient->name.c_str());
+                                }
                                 ImGui::Button(clientLabel, ImVec2(cellSize, cellSize));
-                                ImGui::PopStyleColor();
+                                ImGui::PopStyleColor(3);
+
+                                // Render glowing pulsing outline when this client is actively receiving input
+                                if (isClientActive) {
+                                    ImVec2 pMin = ImGui::GetItemRectMin();
+                                    ImVec2 pMax = ImGui::GetItemRectMax();
+                                    ImDrawList* drawList = ImGui::GetWindowDrawList();
+                                    float pulse = 0.65f + 0.35f * sinf(static_cast<float>(ImGui::GetTime()) * 4.0f);
+                                    drawList->AddRect(ImVec2(pMin.x - 2, pMin.y - 2), ImVec2(pMax.x + 2, pMax.y + 2), IM_COL32(0, 200, 255, static_cast<int>(130 * pulse)), 6.0f, 0, 2.0f);
+                                    drawList->AddRect(pMin, pMax, IM_COL32(0, 235, 255, 255), 4.0f, 0, 2.0f);
+                                }
+                                if (ImGui::IsItemHovered()) {
+                                    ImGui::SetTooltip(isClientActive ? "Client %s: Actively receiving mouse and keyboard input." : "Client %s: Connected (drag to rearrange in layout).", matchedClient->name.c_str());
+                                }
 
                                 if (ImGui::BeginDragDropSource()) {
                                     ImGui::SetDragDropPayload("CLIENT_DRAG", &matchedClient->socket, sizeof(SOCKET));
@@ -1021,7 +1333,14 @@ namespace UI {
                 ImGui::Text("Edge Control Toggles");
                 ImGui::Separator();
                 ImGui::SetNextItemWidth(150.0f);
-                ImGui::SliderInt("Corner Deadzone (%)", &State::edgeDeadzonePercent, 0, 10);
+                AtomicSliderInt("##CornerDeadzone", State::edgeDeadzonePercent, 0, 10);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset##Deadzone")) {
+                    State::edgeDeadzonePercent.store(5, std::memory_order_relaxed);
+                }
+                DrawWrappedTooltip("Reset corner deadzone to factory default (5%).");
+                ImGui::SameLine();
+                ImGui::Text("Corner Deadzone (%%)");
                 DrawWrappedTooltip("Creates safety zones in the corners to prevent accidental screen jumps when using the Start Menu or closing windows.");
                 ImGui::EndTabItem();
             }
@@ -1044,28 +1363,35 @@ namespace UI {
                 }
                 DrawWrappedTooltip("Choose which mode KAM-Flow will automatically initialize when launched.");
 
-                ImGui::Checkbox("Minimize to System Tray", &State::minimizeToTray);
+                AtomicCheckbox("Minimize to System Tray", State::minimizeToTray);
                 DrawWrappedTooltip("If checked, minimizing the window will hide it from the taskbar and run KAM-Flow silently in the background.");
                 
                 if (State::currentRole == State::AppRole::CLIENT) {
-                    ImGui::Checkbox("Auto-Reconnect to Last Server", &State::enableClientAutoReconnect);
+                    AtomicCheckbox("Auto-Reconnect to Last Server", State::enableClientAutoReconnect);
                     DrawWrappedTooltip("If checked, KAM-Flow will automatically attempt a single reconnect if the connection drops unintentionally (e.g., PC sleep/wake).");
                 }
 
                 ImGui::Spacing(); ImGui::Spacing();
                 ImGui::Text("Input Synchronization");
                 ImGui::Separator();
-                ImGui::Checkbox("Enable Keyboard Control", &State::enableKeyboardSync);
+                AtomicCheckbox("Enable Keyboard Control", State::enableKeyboardSync);
                 DrawWrappedTooltip("If checked, keyboard keystrokes will be securely transmitted to the Client(s).");
-                ImGui::Checkbox("Enable Clipboard Sync", &State::enableClipboardSync);
+                AtomicCheckbox("Enable Clipboard Sync", State::enableClipboardSync);
                 DrawWrappedTooltip("If checked, copied text will automatically sync across the Server and Client(s).");
-                ImGui::Checkbox("Enable File Transfers", &State::enableFileTransfer);
+                AtomicCheckbox("Enable File Transfers", State::enableFileTransfer);
                 DrawWrappedTooltip("If checked, allows drag-and-drop file sending and receiving via the encrypted out-of-band stream.");
                 
                 if (State::currentRole == State::AppRole::SERVER) {
                     ImGui::Spacing();
                     ImGui::SetNextItemWidth(150.0f);
-                    ImGui::SliderFloat("Mouse Sensitivity", &State::mouseSensitivity, 0.1f, 3.0f, "%.2f");
+                    AtomicSliderFloat("##MouseSensitivity", State::mouseSensitivity, 0.1f, 3.0f, "%.2f");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Reset##MouseSens")) {
+                        State::mouseSensitivity.store(1.0f, std::memory_order_relaxed);
+                    }
+                    DrawWrappedTooltip("Reset mouse sensitivity to default (1.00).");
+                    ImGui::SameLine();
+                    ImGui::Text("Mouse Sensitivity");
                     DrawWrappedTooltip("Adjust the pointer speed on the Client screens (Global).");
                 }
 
@@ -1073,8 +1399,15 @@ namespace UI {
                 ImGui::Text("Audio Subsystem");
                 ImGui::Separator();
 
-                ImGui::SetNextItemWidth(200.0f);
-                ImGui::SliderInt("Network Jitter Buffer (ms)", &State::audioJitterBufferMs, 20, 200, "%d ms");
+                ImGui::SetNextItemWidth(150.0f);
+                AtomicSliderInt("##JitterBuffer", State::audioJitterBufferMs, 20, 200, "%d ms");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset##JitterBuffer")) {
+                    State::audioJitterBufferMs.store(80, std::memory_order_relaxed);
+                }
+                DrawWrappedTooltip("Reset network jitter buffer to default (80 ms).");
+                ImGui::SameLine();
+                ImGui::Text("Network Jitter Buffer");
                 if (State::currentRole == State::AppRole::SERVER) {
                     DrawWrappedTooltip("Increase to stop audio skipping on unstable networks (adds latency). Decrease for instant audio response when listening to Clients.");
                 } else {
@@ -1083,29 +1416,23 @@ namespace UI {
                 ImGui::Spacing();
 
                 if (State::currentRole == State::AppRole::SERVER) {
-                    bool lastServerAudioMixState = State::enableServerAudioMix;
-                    ImGui::Checkbox("Enable Master Audio Mix (Listen to Clients)", &State::enableServerAudioMix);
-                    DrawWrappedTooltip("If checked, the server will mix and play audio received from connected clients.");
-                    if (lastServerAudioMixState != State::enableServerAudioMix) {
+                    if (AtomicCheckbox("Enable Master Audio Mix (Listen to Clients)", State::enableServerAudioMix)) {
                         if (State::enableServerAudioMix) {
                             Audio::StartAudioRenderer();
                         } else {
                             Audio::StopAudioRenderer();
                         }
                     }
+                    DrawWrappedTooltip("If checked, the server will mix and play audio received from connected clients.");
 
-                    bool lastServerMicBroadcastState = State::enableServerMicBroadcast;
                     static char serverMicBuf[256] = "";
-                static bool serverMicInit = false;
-                if (!serverMicInit && State::enableServerMicBroadcast) {
-                    std::string micName = Audio::GetDefaultMicName();
-                    strncpy_s(serverMicBuf, sizeof(serverMicBuf), micName.c_str(), _TRUNCATE);
-                    serverMicInit = true;
-                }
-                    ImGui::Checkbox("Broadcast Server Microphone to Clients", &State::enableServerMicBroadcast);
-                DrawWrappedTooltip("If checked, the server's default microphone will be captured and sent to all clients.");
-
-                    if (lastServerMicBroadcastState != State::enableServerMicBroadcast) {
+                    static bool serverMicInit = false;
+                    if (!serverMicInit && State::enableServerMicBroadcast) {
+                        std::string micName = Audio::GetDefaultMicName();
+                        strncpy_s(serverMicBuf, sizeof(serverMicBuf), micName.c_str(), _TRUNCATE);
+                        serverMicInit = true;
+                    }
+                    if (AtomicCheckbox("Broadcast Server Microphone to Clients", State::enableServerMicBroadcast)) {
                         if (State::enableServerMicBroadcast) {
                             Audio::StartMicBroadcast();
                             std::string micName = Audio::GetDefaultMicName();
@@ -1114,6 +1441,7 @@ namespace UI {
                             Audio::StopMicBroadcast();
                         }
                     }
+                    DrawWrappedTooltip("If checked, the server's default microphone will be captured and sent to all clients.");
                     if (State::enableServerMicBroadcast) {
                         ImGui::BeginDisabled(); ImGui::InputText("Capturing", serverMicBuf, sizeof(serverMicBuf)); ImGui::EndDisabled();
                     }
@@ -1146,12 +1474,17 @@ namespace UI {
                                 }
                             DrawWrappedTooltip("Toggle audio streaming from this specific client.");
                                 ImGui::SameLine();
-                                ImGui::SetNextItemWidth(150.0f);
+                                ImGui::SetNextItemWidth(120.0f);
                                 float vol = client.audioVolume;
                                 if (ImGui::SliderFloat("##vol", &vol, 0.0f, 1.0f, "Vol: %.2f")) {
                                     Network::SetClientVolume(client.socket, vol);
                                 }
-                            DrawWrappedTooltip("Adjust the individual audio mix volume for this specific client.");
+                                DrawWrappedTooltip("Adjust the individual audio mix volume for this specific client.");
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("Reset##vol")) {
+                                    Network::SetClientVolume(client.socket, 1.0f);
+                                }
+                                DrawWrappedTooltip("Reset client audio volume to default (1.00).");
                                 ImGui::PopID();
                             }
                         }
@@ -1159,7 +1492,7 @@ namespace UI {
                 } else { // Client
                     // This checkbox now acts as a state toggle. The network thread handles the
                     // initial start. This logic handles runtime changes by the user.
-                    if (ImGui::Checkbox("Send Client Audio to Server", &State::enableClientAudioStream)) {
+                    if (AtomicCheckbox("Send Client Audio to Server", State::enableClientAudioStream)) {
                         // Only attempt to start/stop if we are already connected.
                         if (Network::IsClientConnected()) {
                             if (State::enableClientAudioStream) Audio::StartLoopbackCapture();
@@ -1168,7 +1501,7 @@ namespace UI {
                     }
                     DrawWrappedTooltip("If checked, all system audio playing on this Client will be streamed to the Server for centralized mixing.");
 
-                    if (ImGui::Checkbox("Receive Server Microphone", &State::enableClientMicReceive)) {
+                    if (AtomicCheckbox("Receive Server Microphone", State::enableClientMicReceive)) {
                         if (Network::IsClientConnected()) {
                             if (State::enableClientMicReceive) {
                                 Audio::StartMicReceiver();
@@ -1210,7 +1543,7 @@ namespace UI {
                 ImGui::Separator();
 
                 const char* hotkeyOptions = "A\0B\0C\0D\0E\0F\0G\0H\0I\0J\0K\0L\0M\0N\0O\0P\0Q\0R\0S\0T\0U\0V\0W\0X\0Y\0Z\0\0";
-                int currentItem = State::emergencyHotkey - 'A';
+                int currentItem = State::emergencyHotkey.load(std::memory_order_relaxed) - 'A';
                 ImGui::AlignTextToFramePadding();
                 ImGui::Text("Emergency Hotkey (Ctrl+Alt+)");
                 ImGui::SameLine();
@@ -1218,14 +1551,14 @@ namespace UI {
                 if (ImGui::Combo("##EmergencyHotkey", &currentItem, hotkeyOptions)) {
                     State::emergencyHotkey = 'A' + currentItem;
                     ::UnregisterHotKey(hwnd, 1);
-                    ::RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::emergencyHotkey);
+                    ::RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::emergencyHotkey.load(std::memory_order_relaxed));
                 }
                 DrawWrappedTooltip("Customize the global OS hotkey used to instantly regain local control or sever a connection.");
 
                 if (State::currentRole == State::AppRole::SERVER) {
                     ImGui::Spacing();
                     
-                    if (ImGui::Checkbox("Enable Game Mode", &State::enableGameMode)) {
+                    if (AtomicCheckbox("Enable Game Mode", State::enableGameMode)) {
                         if (State::enableGameMode) {
                             State::SetMode(State::ControlMode::LOCAL);
                             if (g_HookThreadId != 0) ::PostThreadMessage(g_HookThreadId.load(), WM_TOGGLE_GAMEMODE, 1, 0);
@@ -1235,7 +1568,7 @@ namespace UI {
                     }
                     DrawWrappedTooltip("When active, the mouse will not transition to Client screens, preventing games from losing focus.");
                     
-                    int gmCurrentItem = State::gameModeHotkey - 'A';
+                    int gmCurrentItem = State::gameModeHotkey.load(std::memory_order_relaxed) - 'A';
                     ImGui::AlignTextToFramePadding();
                     ImGui::Text("Game Mode Toggle Hotkey (Ctrl+Alt+)");
                     ImGui::SameLine();
@@ -1243,7 +1576,7 @@ namespace UI {
                     if (ImGui::Combo("##GameModeHotkey", &gmCurrentItem, hotkeyOptions)) {
                         State::gameModeHotkey = 'A' + gmCurrentItem;
                         ::UnregisterHotKey(hwnd, 2);
-                        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey);
+                        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey.load(std::memory_order_relaxed));
                     }
                     DrawWrappedTooltip("Customize the global OS hotkey used to toggle Game Mode on/off.");
                 }
@@ -1252,7 +1585,7 @@ namespace UI {
                 ImGui::Text("Engine & Debug");
                 ImGui::Separator();
                 
-                ImGui::Checkbox("Show Debug Console Tab", &State::globalDebugMode);
+                AtomicCheckbox("Show Debug Console Tab", State::globalDebugMode);
                 DrawWrappedTooltip("Show or hide the real-time diagnostic console tab for troubleshooting.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
@@ -1261,26 +1594,114 @@ namespace UI {
             if (State::globalDebugMode) {
                 bool tabDebug = ImGui::BeginTabItem("Debug Log");
                 if (tabDebug) {
+                    static std::vector<char> localLogCopy;
+                    static ImGuiTextFilter logFilter;
+                    static bool autoScroll = true;
+
                     if (ImGui::Button("Clear Log")) {
                         std::lock_guard<std::mutex> lock(g_logMutex);
                         g_logBufferLen = 0;
                         if (!g_logBufferVec.empty()) g_logBufferVec[0] = '\0';
+                        if (!localLogCopy.empty()) localLogCopy[0] = '\0';
                     }
                     DrawWrappedTooltip("Clear all current debug messages.");
+
+                    ImGui::SameLine();
+                    if (ImGui::Button("Copy All")) {
+                        if (!localLogCopy.empty() && localLogCopy[0] != '\0') {
+                            if (logFilter.IsActive()) {
+                                std::string filteredLog;
+                                const char* s = localLogCopy.data();
+                                while (*s) {
+                                    const char* e = strchr(s, '\n');
+                                    if (!e) e = s + strlen(s);
+                                    if (logFilter.PassFilter(s, e)) {
+                                        filteredLog.append(s, e - s);
+                                        filteredLog.push_back('\n');
+                                    }
+                                    if (*e == '\n') s = e + 1;
+                                    else break;
+                                }
+                                ImGui::SetClipboardText(filteredLog.c_str());
+                            } else {
+                                ImGui::SetClipboardText(localLogCopy.data());
+                            }
+                        }
+                    }
+                    DrawWrappedTooltip("Copy debug log messages to clipboard (copies filtered lines when filter is active).");
+
+                    ImGui::SameLine();
+                    ImGui::Checkbox("Auto-Scroll", &autoScroll);
+
+                    ImGui::SameLine();
+                    logFilter.Draw("Filter", 150.0f);
+                    DrawWrappedTooltip("Filter logs by keyword (comma-separated tokens, e.g. 'Network, -ping').");
+
                     ImGui::Separator();
                     
-                    static std::vector<char> localLogCopy;
-                    
                     // Only lock and copy if new text was actually appended to the buffer
-                    if (g_logDirty.exchange(false)) {
+                    bool needCopy = g_logDirty.exchange(false);
+                    if (needCopy || (localLogCopy.empty() && g_logBufferLen > 0)) {
                         std::lock_guard<std::mutex> lock(g_logMutex);
                         if (localLogCopy.empty()) localLogCopy.resize(1024 * 1024, 0);
-                        if (!g_logBufferVec.empty()) std::memcpy(localLogCopy.data(), g_logBufferVec.data(), g_logBufferLen + 1);
+                        if (!g_logBufferVec.empty()) {
+                            std::memcpy(localLogCopy.data(), g_logBufferVec.data(), g_logBufferLen + 1);
+                        } else {
+                            localLogCopy[0] = '\0';
+                        }
                     }
                     
-                    if (!localLogCopy.empty()) {
-                        ImGui::InputTextMultiline("##Log", localLogCopy.data(), localLogCopy.size(), ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.06f, 0.08f, 1.0f));
+                    ImGui::BeginChild("LogScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+
+                    if (!localLogCopy.empty() && localLogCopy[0] != '\0') {
+                        const char* line_start = localLogCopy.data();
+                        while (*line_start) {
+                            const char* line_end = strchr(line_start, '\n');
+                            if (!line_end) line_end = line_start + strlen(line_start);
+
+                            if (logFilter.PassFilter(line_start, line_end)) {
+                                ImVec4 col(0.82f, 0.82f, 0.82f, 1.0f); // Default light gray
+                                std::string_view sv(line_start, line_end - line_start);
+
+                                if (sv.find("[Security]") != std::string_view::npos ||
+                                    sv.find("PIN") != std::string_view::npos ||
+                                    sv.find("Blocked") != std::string_view::npos) {
+                                    col = ImVec4(1.0f, 0.75f, 0.22f, 1.0f); // Amber / Yellow
+                                } else if (sv.find("ERROR") != std::string_view::npos ||
+                                           sv.find("Error") != std::string_view::npos ||
+                                           sv.find("failed") != std::string_view::npos ||
+                                           sv.find("Failed") != std::string_view::npos ||
+                                           sv.find("CRITICAL") != std::string_view::npos ||
+                                           sv.find("dropped") != std::string_view::npos ||
+                                           sv.find("Dropped") != std::string_view::npos) {
+                                    col = ImVec4(1.0f, 0.35f, 0.35f, 1.0f); // Coral Red
+                                } else if (sv.find("[Network") != std::string_view::npos) {
+                                    col = ImVec4(0.28f, 0.80f, 1.0f, 1.0f); // Bright Cyan
+                                } else if (sv.find("[Audio]") != std::string_view::npos ||
+                                           sv.find("Audio") != std::string_view::npos) {
+                                    col = ImVec4(0.82f, 0.55f, 1.0f, 1.0f); // Purple / Violet
+                                } else if (sv.find("[KAM-Flow UI]") != std::string_view::npos ||
+                                           sv.find("[UI]") != std::string_view::npos) {
+                                    col = ImVec4(0.35f, 0.85f, 0.45f, 1.0f); // Mint Green
+                                }
+
+                                ImGui::PushStyleColor(ImGuiCol_Text, col);
+                                ImGui::TextUnformatted(line_start, line_end);
+                                ImGui::PopStyleColor();
+                            }
+
+                            if (*line_end == '\n') line_start = line_end + 1;
+                            else break;
+                        }
                     }
+
+                    if (autoScroll && (needCopy || ImGui::GetScrollY() >= ImGui::GetScrollMaxY())) {
+                        ImGui::SetScrollHereY(1.0f);
+                    }
+
+                    ImGui::EndChild();
+                    ImGui::PopStyleColor();
                     ImGui::EndTabItem();
                 }
             }
@@ -1340,75 +1761,90 @@ namespace UI {
             ImGui::EndPopup();
         }
 
-        // Render incoming file offers notification.
+        // Close main dashboard window FIRST so subsequent overlay windows reliably render on top
+        ImGui::End();
+
+        // --- OVERLAY RENDERING (Rendered outside the main window to ensure proper Z-stacking) ---
+        ImVec2 displaySize = ImGui::GetIO().DisplaySize;
         auto pendingTransfers = FileTransfer::GetPendingTransfers();
+        float pendingHeight = 0.0f;
+
+        // Render incoming file offers notification (anchored bottom-right, growing upwards)
         if (!pendingTransfers.empty()) {
             const auto& offer = pendingTransfers[0]; // Process one offer at a time
+            ImGui::SetNextWindowPos(ImVec2(displaySize.x - 20.0f, displaySize.y - 20.0f), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+            ImGui::SetNextWindowSize(ImVec2(340, 0)); // Auto-height growing upwards
             
-            ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 340, ImGui::GetIO().DisplaySize.y - 140), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(320, 120));
-            
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.1f, 0.3f, 0.1f, 0.95f));
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
-            ImGui::Begin("Incoming File Transfer", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings);
-            
-            ImGui::TextWrapped("File: %s", offer.fileName.c_str());
-            ImGui::Text("Size: %.2f MB", offer.fileSize / (1024.0f * 1024.0f));
-            
-            ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-            
-            if (ImGui::Button("Accept", ImVec2(140, 0))) {
-                char szFileName[MAX_PATH] = "";
-                strncpy_s(szFileName, offer.fileName.c_str(), _TRUNCATE);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.22f, 0.14f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.25f, 0.85f, 0.35f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.15f, 0.30f, 0.18f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.18f, 0.36f, 0.22f, 1.0f));
+            if (ImGui::Begin("Incoming File Transfer", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextWrapped("File: %s", offer.fileName.c_str());
+                ImGui::Text("Size: %.2f MB", offer.fileSize / (1024.0f * 1024.0f));
                 
-                OPENFILENAMEA ofn = {0};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner = hwnd;
-                ofn.lpstrFilter = "All Files (*.*)\0*.*\0";
-                ofn.lpstrFile = szFileName;
-                ofn.nMaxFile = MAX_PATH;
-                ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT;
+                ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
                 
-                if (GetSaveFileNameA(&ofn)) FileTransfer::AcceptTransfer(offer.transferId, std::string(szFileName));
-                else FileTransfer::DeclineTransfer(offer.transferId); // User cancelled dialog
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Decline", ImVec2(140, 0))) FileTransfer::DeclineTransfer(offer.transferId);
-            
-            ImGui::End(); ImGui::PopStyleColor(2);
-        }
-
-        // Render active file transfers progress visualization.
-        auto activeTransfers = FileTransfer::GetActiveTransfers();
-        if (!activeTransfers.empty()) {
-            // Dynamically stack the progress UI directly underneath the pending offer notification if it's visible
-            float yOffset = FileTransfer::GetPendingTransfers().empty() ? 140.0f : 270.0f;
-            ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x - 340, ImGui::GetIO().DisplaySize.y - yOffset), ImGuiCond_Always);
-            ImGui::SetNextWindowSize(ImVec2(320, 0)); // Auto-height to support multiple active transfers
-            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.1f, 0.15f, 0.3f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.2f, 0.4f, 0.8f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 0.6f, 1.0f, 1.0f)); // Bright, opaque blue fill
-            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));       // Solid black track for contrast
-            ImGui::Begin("Active Transfers", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
-            for (const auto& t : activeTransfers) {
-                float progress = t.fileSize > 0 ? (float)t.transferredSize / (float)t.fileSize : 0.0f;
-                ImGui::TextWrapped("%s", t.fileName.c_str());
-                char overlay[64];
-                snprintf(overlay, sizeof(overlay), "%.2f MB / %.2f MB", (float)t.transferredSize / (1024.0f*1024.0f), (float)t.fileSize / (1024.0f*1024.0f));
-                ImGui::ProgressBar(progress, ImVec2(-40, 0), overlay);
-                ImGui::SameLine();
-                ImGui::PushID(t.transferId);
-                if (ImGui::Button("X", ImVec2(35, 0))) {
-                    FileTransfer::CancelTransfer(t.transferId);
+                if (ImGui::Button("Accept", ImVec2(140, 0))) {
+                    char szFileName[MAX_PATH] = "";
+                    strncpy_s(szFileName, offer.fileName.c_str(), _TRUNCATE);
+                    
+                    OPENFILENAMEA ofn = {0};
+                    ofn.lStructSize = sizeof(ofn);
+                    ofn.hwndOwner = hwnd;
+                    ofn.lpstrFilter = "All Files (*.*)\0*.*\0";
+                    ofn.lpstrFile = szFileName;
+                    ofn.nMaxFile = MAX_PATH;
+                    ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT;
+                    
+                    if (GetSaveFileNameA(&ofn)) FileTransfer::AcceptTransfer(offer.transferId, std::string(szFileName));
+                    else FileTransfer::DeclineTransfer(offer.transferId); // User cancelled dialog
                 }
-                DrawWrappedTooltip("Cancel Transfer");
-                ImGui::PopID();
+                ImGui::SameLine();
+                if (ImGui::Button("Decline", ImVec2(140, 0))) FileTransfer::DeclineTransfer(offer.transferId);
+                pendingHeight = ImGui::GetWindowHeight();
             }
             ImGui::End();
             ImGui::PopStyleColor(4);
         }
 
-        ImGui::End();
+        // Render active file transfers progress visualization (anchored bottom-right, stacked above pending offers if visible)
+        auto activeTransfersList = FileTransfer::GetActiveTransfers();
+        if (!activeTransfersList.empty()) {
+            float yPos = displaySize.y - 20.0f;
+            if (pendingHeight > 0.0f) {
+                yPos -= (pendingHeight + 10.0f);
+            }
+            ImGui::SetNextWindowPos(ImVec2(displaySize.x - 20.0f, yPos), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+            ImGui::SetNextWindowSize(ImVec2(340, 0)); // Auto-height growing upwards
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.16f, 0.24f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.25f, 0.55f, 0.95f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_TitleBg, ImVec4(0.15f, 0.22f, 0.35f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_TitleBgActive, ImVec4(0.18f, 0.28f, 0.45f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 0.65f, 1.0f, 1.0f)); // Bright, opaque blue fill
+            ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.05f, 0.05f, 0.08f, 1.0f));       // Solid dark track for contrast
+            if (ImGui::Begin("Active Transfers", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize)) {
+                for (const auto& t : activeTransfersList) {
+                    float progress = t.fileSize > 0 ? (float)t.transferredSize / (float)t.fileSize : 0.0f;
+                    ImGui::TextWrapped("%s", t.fileName.c_str());
+                    char overlay[64];
+                    snprintf(overlay, sizeof(overlay), "%.2f / %.2f MB (%.0f%%)", 
+                             (float)t.transferredSize / (1024.0f*1024.0f), 
+                             (float)t.fileSize / (1024.0f*1024.0f),
+                             progress * 100.0f);
+                    ImGui::ProgressBar(progress, ImVec2(-45, 0), overlay);
+                    ImGui::SameLine();
+                    ImGui::PushID(t.transferId);
+                    if (ImGui::Button("X", ImVec2(35, 0))) {
+                        FileTransfer::CancelTransfer(t.transferId);
+                    }
+                    DrawWrappedTooltip("Cancel Transfer");
+                    ImGui::PopID();
+                }
+            }
+            ImGui::End();
+            ImGui::PopStyleColor(6);
+        }
     }
 
     /**

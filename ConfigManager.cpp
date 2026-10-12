@@ -112,31 +112,31 @@ namespace Config {
         const std::string& fullPath = GetResolvedPath();
 
         WritePrivateProfileStringA("System", "DefaultRole", std::to_string(static_cast<int>(State::defaultRole)).c_str(), fullPath.c_str());
-        WritePrivateProfileStringA("System", "GlobalDebugMode", State::globalDebugMode ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("System", "MinimizeToTray", State::minimizeToTray ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("System", "GlobalDebugMode", State::globalDebugMode.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("System", "MinimizeToTray", State::minimizeToTray.load() ? "1" : "0", fullPath.c_str());
 
         WritePrivateProfileStringA("Network", "TargetIP", targetIp.c_str(), fullPath.c_str());
         WritePrivateProfileStringA("Network", "Port", std::to_string(port).c_str(), fullPath.c_str());
-        WritePrivateProfileStringA("Network", "EnableClientAutoReconnect", State::enableClientAutoReconnect ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Network", "EnableClientAutoReconnect", State::enableClientAutoReconnect.load() ? "1" : "0", fullPath.c_str());
 
-        WritePrivateProfileStringA("Control", "EnableKeyboardSync", State::enableKeyboardSync ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Control", "EnableClipboardSync", State::enableClipboardSync ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Control", "EnableFileTransfer", State::enableFileTransfer ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Control", "EdgeDeadzonePercent", std::to_string(State::edgeDeadzonePercent).c_str(), fullPath.c_str());
+        WritePrivateProfileStringA("Control", "EnableKeyboardSync", State::enableKeyboardSync.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Control", "EnableClipboardSync", State::enableClipboardSync.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Control", "EnableFileTransfer", State::enableFileTransfer.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Control", "EdgeDeadzonePercent", std::to_string(State::edgeDeadzonePercent.load()).c_str(), fullPath.c_str());
 
-        WritePrivateProfileStringA("Control", "MouseSensitivity", std::to_string(State::mouseSensitivity).c_str(), fullPath.c_str());
-        std::string hkStr(1, State::emergencyHotkey);
+        WritePrivateProfileStringA("Control", "MouseSensitivity", std::to_string(State::mouseSensitivity.load()).c_str(), fullPath.c_str());
+        std::string hkStr(1, State::emergencyHotkey.load());
         WritePrivateProfileStringA("Control", "EmergencyHotkey", hkStr.c_str(), fullPath.c_str());
 
-        WritePrivateProfileStringA("Control", "EnableGameMode", State::enableGameMode ? "1" : "0", fullPath.c_str());
-        std::string gmHkStr(1, State::gameModeHotkey);
+        WritePrivateProfileStringA("Control", "EnableGameMode", State::enableGameMode.load() ? "1" : "0", fullPath.c_str());
+        std::string gmHkStr(1, State::gameModeHotkey.load());
         WritePrivateProfileStringA("Control", "GameModeHotkey", gmHkStr.c_str(), fullPath.c_str());
 
-        WritePrivateProfileStringA("Audio", "EnableServerAudioMix", State::enableServerAudioMix ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "EnableServerMicBroadcast", State::enableServerMicBroadcast ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "EnableClientAudioStream", State::enableClientAudioStream ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "EnableClientMicReceive", State::enableClientMicReceive ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "JitterBufferMs", std::to_string(State::audioJitterBufferMs).c_str(), fullPath.c_str());
+        WritePrivateProfileStringA("Audio", "EnableServerAudioMix", State::enableServerAudioMix.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Audio", "EnableServerMicBroadcast", State::enableServerMicBroadcast.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Audio", "EnableClientAudioStream", State::enableClientAudioStream.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Audio", "EnableClientMicReceive", State::enableClientMicReceive.load() ? "1" : "0", fullPath.c_str());
+        WritePrivateProfileStringA("Audio", "JitterBufferMs", std::to_string(State::audioJitterBufferMs.load()).c_str(), fullPath.c_str());
     }
 
     /**

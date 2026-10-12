@@ -48,6 +48,11 @@ namespace FileTransfer {
     std::vector<SOCKET> g_activeSockets;
     std::atomic<bool> g_isTransferManagerRunning(true);
 
+    /// Guards the hardcoded OOB port (8082) against concurrent bind collisions.
+    /// Only one file transfer stream may be active at a time. Checked before
+    /// spawning OOB tasks and cleared when the task completes.
+    std::atomic<bool> g_isOobPortInUse(false);
+
     void ExecuteTransferIO(SOCKET sock, uint32_t transferId);
     void OOB_ServerTask(uint32_t transferId, uint16_t port);
     void OOB_ClientTask(uint32_t transferId, uint16_t port);
@@ -193,6 +198,9 @@ namespace FileTransfer {
      * @return void
      */
     void OOB_ServerTask(uint32_t transferId, uint16_t port) {
+        // Ensure the OOB port guard is released on every exit path
+        struct OobGuard { ~OobGuard() { g_isOobPortInUse.store(false, std::memory_order_relaxed); } } guard;
+
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (listenSock == INVALID_SOCKET) return;
 
@@ -209,6 +217,29 @@ namespace FileTransfer {
         if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR || listen(listenSock, 1) == SOCKET_ERROR) {
             if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Bind/Listen failed on port %u", port);
             closesocket(listenSock); 
+            return;
+        }
+
+        // Bounded wait for the peer to connect. Without this, accept() blocks forever
+        // when the peer never connects (e.g. it rejected the transfer because its own
+        // OOB port was busy). That kept g_isOobPortInUse stuck at true and silently
+        // disabled all future file transfers until the app was restarted.
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(listenSock, &readSet);
+        timeval acceptTimeout = { 15, 0 };
+        if (select(0, &readSet, nullptr, nullptr, &acceptTimeout) <= 0) {
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB accept timed out on port %u (transfer %u).", port, transferId);
+            // Only close the listener if Shutdown() has not already closed and
+            // removed it, to avoid a double closesocket() on a recycled handle.
+            bool ownsListenSock = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                auto it = std::find(g_activeSockets.begin(), g_activeSockets.end(), listenSock);
+                if (it != g_activeSockets.end()) { g_activeSockets.erase(it); ownsListenSock = true; }
+                g_transfers.erase(transferId);
+            }
+            if (ownsListenSock) closesocket(listenSock);
             return;
         }
 
@@ -244,6 +275,9 @@ namespace FileTransfer {
      * @return void
      */
     void OOB_ClientTask(uint32_t transferId, uint16_t port) {
+        // Ensure the OOB port guard is released on every exit path
+        struct OobGuard { ~OobGuard() { g_isOobPortInUse.store(false, std::memory_order_relaxed); } } guard;
+
         // Micro-delay ensures the Server thread has executed bind() before we connect
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -395,15 +429,32 @@ namespace FileTransfer {
      * @return void
      */
     void AcceptTransfer(uint32_t transferId, const std::string& saveDirectory) {
+        // Enforce one-at-a-time: if the OOB port is already bound, auto-decline.
+        bool expected = false;
+        if (!g_isOobPortInUse.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u rejected: another transfer is already in progress.", transferId);
+            DeclineTransfer(transferId);
+            return;
+        }
+
         SOCKET targetSocket = INVALID_SOCKET;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             std::string fileName = "Unknown";
             uint64_t expectedSize = 0;
+            bool found = false;
             for (const auto& p : g_pendingOffers) { 
                 if (p.transferId == transferId) { 
-                    targetSocket = p.remoteSocket; fileName = p.fileName; expectedSize = p.fileSize; break; 
+                    targetSocket = p.remoteSocket; fileName = p.fileName; expectedSize = p.fileSize; found = true; break; 
                 } 
+            }
+
+            // Stale or unknown ID (e.g. offer already declined/expired): release the
+            // OOB guard claimed above instead of spawning an orphan OOB thread.
+            if (!found) {
+                g_isOobPortInUse.store(false, std::memory_order_relaxed);
+                if (State::globalDebugMode) UI::LogDebug("[FileTransfer] AcceptTransfer ignored: unknown transfer %u.", transferId);
+                return;
             }
             
             TransferContext ctx;
@@ -500,6 +551,27 @@ namespace FileTransfer {
      * @return void
      */
     void HandleFileAccept(SOCKET senderSocket, const Network::FileAcceptPayload& payload) {
+        // Enforce one-at-a-time: prevent a second OOB stream from colliding on port 8082.
+        bool expected = false;
+        if (!g_isOobPortInUse.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] HandleFileAccept rejected for transfer %u: OOB port already in use.", payload.transferId);
+            // Drop our sender-side context so the UI does not show a phantom "active"
+            // transfer, then tell the peer so it can drop its own context. The mutex is
+            // released BEFORE sending to avoid the double-lock deadlock class fixed in v2.7.
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_transfers.erase(payload.transferId);
+            }
+            Network::FileDeclinePayload decline;
+            decline.transferId = payload.transferId;
+            if (State::currentRole == State::AppRole::SERVER) {
+                Network::SendToClient(senderSocket, Network::MessageType::EVENT_FILE_DECLINE, &decline, sizeof(decline));
+            } else {
+                Network::SendToServer(Network::MessageType::EVENT_FILE_DECLINE, &decline, sizeof(decline));
+            }
+            return;
+        }
+
         if (State::currentRole == State::AppRole::SERVER) {
             auto t = std::make_shared<std::thread>(OOB_ServerTask, payload.transferId, payload.tcpPort);
             { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
@@ -517,6 +589,12 @@ namespace FileTransfer {
      * @return void
      */
     void HandleFileDecline(SOCKET senderSocket, const Network::FileDeclinePayload& payload) {
+        // Remove the local context so a declined/rejected transfer does not linger
+        // forever in GetActiveTransfers() as a stuck "active" entry in the UI.
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_transfers.erase(payload.transferId);
+        }
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u was declined by receiver.", payload.transferId);
     }
 }

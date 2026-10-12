@@ -182,16 +182,27 @@ bool SendToServer(MessageType type, const void *payload, size_t payloadSize) {
   }
 
   if (!tls_sendBuffer.empty()) {
-    int res = 0;
     if (isUdp) {
-      res = sendto(clientUdpSocket, (const char *)tls_sendBuffer.data(),
-                   (int)tls_sendBuffer.size(), 0, (sockaddr *)&serverUdpAddr,
-                   sizeof(serverUdpAddr));
+      int res = sendto(clientUdpSocket, (const char *)tls_sendBuffer.data(),
+                       (int)tls_sendBuffer.size(), 0, (sockaddr *)&serverUdpAddr,
+                       sizeof(serverUdpAddr));
+      return res != SOCKET_ERROR;
     } else {
-      res = send(targetSock, (const char *)tls_sendBuffer.data(),
-                 (int)tls_sendBuffer.size(), 0);
+      size_t totalSent = 0;
+      while (totalSent < tls_sendBuffer.size()) {
+        int sent = send(targetSock, (const char *)tls_sendBuffer.data() + totalSent,
+                        static_cast<int>(tls_sendBuffer.size() - totalSent), 0);
+        if (sent <= 0) {
+          if (State::globalDebugMode) {
+            UI::LogDebug("[Network Client] send() failed on TCP socket. Sent %zu/%zu bytes. WSA Error: %d",
+                         totalSent, tls_sendBuffer.size(), WSAGetLastError());
+          }
+          return false;
+        }
+        totalSent += sent;
+      }
+      return true;
     }
-    return res != SOCKET_ERROR;
   }
   return false;
 }
@@ -560,7 +571,11 @@ void ClientLoop() {
 
     if (bytes <= 0) {
       int wsaErr = WSAGetLastError();
-      if (wsaErr == WSAETIMEDOUT) {
+      if (bytes == 0) {
+        State::SetClientStatus("Disconnected (Server Closed Connection).");
+        if (State::globalDebugMode)
+          UI::LogDebug("[Network Client] Server closed connection (graceful close / auth rejected).");
+      } else if (wsaErr == WSAETIMEDOUT) {
         State::SetClientStatus("Disconnected (Timeout).");
         if (State::globalDebugMode)
           UI::LogDebug("[Network Client] Connection timed out (No Heartbeat "
@@ -914,6 +929,10 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
   if (clientHeartbeatThread.joinable()) {
     clientHeartbeatThread.join();
   }
+  if (clientSocket != INVALID_SOCKET) {
+    closesocket(clientSocket);
+    clientSocket = INVALID_SOCKET;
+  }
   if (clientUdpSocket != INVALID_SOCKET) {
     closesocket(clientUdpSocket);
     clientUdpSocket = INVALID_SOCKET;
@@ -969,15 +988,15 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
       UI::LogDebug("[Network Client] Connection Failed. Server is offline or "
                    "blocked by firewall.");
     closesocket(clientSocket);
+    // Reset the handle so the stale-socket cleanup at the top of the next
+    // StartClient() call cannot close a recycled descriptor owned by another socket.
+    clientSocket = INVALID_SOCKET;
     return false;
   }
 
   int flag = 1;
   setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag,
              sizeof(flag));
-
-  int tos = 0xB8; // DSCP 46 (Expedited Forwarding) for Voice/Real-Time priority
-  setsockopt(clientSocket, IPPROTO_IP, IP_TOS, (char *)&tos, sizeof(tos));
 
   // 10-second timeout gives 5× the heartbeat interval as margin,
   // preventing premature disconnects during gaming CPU stalls.
@@ -998,11 +1017,33 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
   GetComputerNameA(hostname, &size);
   strncpy_s(p.clientName, sizeof(p.clientName), hostname, _TRUNCATE);
 
-  if (State::globalDebugMode)
-    UI::LogDebug("[Network Client] Handshake Sent. AES-GCM Active.");
+  sockaddr_in localAddr;
+  int localAddrLen = sizeof(localAddr);
+  int localPort = 0;
+  if (getsockname(clientSocket, (sockaddr *)&localAddr, &localAddrLen) != SOCKET_ERROR) {
+    localPort = ntohs(localAddr.sin_port);
+  }
 
   State::SetClientStatus("Authenticating...");
-  SendToServer(MessageType::EVENT_AUTH, &p, sizeof(p));
+  if (State::globalDebugMode) {
+    UI::LogDebug("[Network Client] Connected from local port %u to %s:%u. Sending AUTH (%zu bytes)...",
+                 localPort, ip.c_str(), port, sizeof(p));
+  }
+
+  if (!SendToServer(MessageType::EVENT_AUTH, &p, sizeof(p))) {
+    if (State::globalDebugMode)
+      UI::LogDebug("[Network Client] CRITICAL: Failed to send AUTH handshake (WSA Error: %d).",
+                   WSAGetLastError());
+    State::SetClientStatus("Disconnected (Auth Send Failed).");
+    isClientRunning = false;
+    closesocket(clientSocket);
+    clientSocket = INVALID_SOCKET;
+    Security::Shutdown();
+    return false;
+  }
+
+  if (State::globalDebugMode)
+    UI::LogDebug("[Network Client] Handshake Sent. AES-GCM Active.");
 
   // Configure the Server's UDP address
   memset(&serverUdpAddr, 0, sizeof(serverUdpAddr));

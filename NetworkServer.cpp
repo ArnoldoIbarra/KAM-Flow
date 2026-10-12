@@ -528,6 +528,51 @@ void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
 }
 
 /**
+ * @brief Reads an exact number of bytes from a TCP socket, handling partial reads.
+ * @param sock The connected TCP socket.
+ * @param buffer Destination buffer.
+ * @param length Exact number of bytes to receive.
+ * @param outErr Receives 0 on graceful close, or WSAGetLastError() on failure.
+ * @return bool True if all requested bytes were read, false on disconnect or timeout.
+ */
+static bool RecvExact(SOCKET sock, void *buffer, size_t length, int &outErr) {
+  size_t total = 0;
+  char *ptr = static_cast<char *>(buffer);
+  outErr = 0;
+  while (total < length) {
+    int r = recv(sock, ptr + total, static_cast<int>(length - total), 0);
+    if (r <= 0) {
+      outErr = (r == 0) ? 0 : WSAGetLastError();
+      return false;
+    }
+    total += r;
+  }
+  return true;
+}
+
+/**
+ * @brief Writes an exact number of bytes to a TCP socket, handling partial sends.
+ * @param sock The connected TCP socket.
+ * @param buffer Source buffer.
+ * @param length Exact number of bytes to send.
+ * @return bool True if all bytes were sent, false on socket error or SO_SNDTIMEO timeout.
+ */
+static bool SendExact(SOCKET sock, const void *buffer, size_t length) {
+  // A single send() may write only part of the buffer under congestion or when
+  // SO_SNDTIMEO expires mid-write. Leaving the remainder unsent desynchronizes
+  // the TCP packet framing and forces the peer to drop the connection.
+  size_t total = 0;
+  const char *ptr = static_cast<const char *>(buffer);
+  while (total < length) {
+    int sent = send(sock, ptr + total, static_cast<int>(length - total), 0);
+    if (sent <= 0)
+      return false;
+    total += sent;
+  }
+  return true;
+}
+
+/**
  * @brief Main listener loop that accepts incoming TCP connections and handles
  * the authentication handshake.
  * @return void
@@ -556,43 +601,77 @@ void AcceptClientsLoop() {
         accept(serverSocket, (sockaddr *)&clientAddr, &clientAddrSize);
 
     if (clientSocket != INVALID_SOCKET) {
-      DWORD timeout = 2000;
+      DWORD timeout = 5000;
       setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
                  sizeof(timeout));
 
+      char clientIpStr[INET_ADDRSTRLEN] = "Unknown";
+      inet_ntop(AF_INET, &(clientAddr.sin_addr), clientIpStr, INET_ADDRSTRLEN);
+      int clientPort = ntohs(clientAddr.sin_port);
+
+      if (State::globalDebugMode)
+        UI::LogDebug("[Network Server] Client connection accepted from %s:%d. Awaiting AUTH...",
+                     clientIpStr, clientPort);
+
       PacketHeader header;
-      if (recv(clientSocket, (char *)&header, sizeof(header), MSG_WAITALL) >
-              0 &&
-          header.magic == PACKET_MAGIC &&
-          header.type == MessageType::EVENT_AUTH) {
+      int errCode = 0;
+      if (!RecvExact(clientSocket, &header, sizeof(header), errCode)) {
+        if (State::globalDebugMode) {
+          if (errCode == 0) {
+            UI::LogDebug("[Network Server] Auth failed for %s:%d: client disconnected before sending header.",
+                         clientIpStr, clientPort);
+          } else {
+            UI::LogDebug("[Network Server] Auth failed for %s:%d: header recv failed (WSA Error: %d).",
+                         clientIpStr, clientPort, errCode);
+          }
+        }
+      } else if (header.magic != PACKET_MAGIC) {
+        if (State::globalDebugMode) {
+          UI::LogDebug("[Network Server] Auth failed for %s:%d: bad magic 0x%08X (expected 0x%08X).",
+                       clientIpStr, clientPort, header.magic, PACKET_MAGIC);
+        }
+      } else if (header.type != MessageType::EVENT_AUTH) {
+        if (State::globalDebugMode) {
+          UI::LogDebug("[Network Server] Auth failed for %s:%d: unexpected message type %u (expected EVENT_AUTH).",
+                       clientIpStr, clientPort, static_cast<unsigned int>(header.type));
+        }
+      } else if (header.payloadSize < sizeof(AuthPayload) ||
+                 header.payloadSize > MAX_PAYLOAD_SIZE) {
+        if (State::globalDebugMode) {
+          UI::LogDebug("[Network Server] Auth failed for %s:%d: invalid payload size %u (expected %zu..%u).",
+                       clientIpStr, clientPort, header.payloadSize, sizeof(AuthPayload), MAX_PAYLOAD_SIZE);
+        }
+      } else {
+        std::vector<uint8_t> authBuffer(header.payloadSize);
+        if (!RecvExact(clientSocket, authBuffer.data(), header.payloadSize, errCode)) {
+          if (State::globalDebugMode) {
+            UI::LogDebug("[Network Server] Auth failed for %s:%d: payload recv failed (WSA Error: %d).",
+                         clientIpStr, clientPort, errCode);
+          }
+        } else {
+          AuthPayload auth;
+          memcpy(&auth, authBuffer.data(), sizeof(AuthPayload));
+          if (auth.clientName[sizeof(auth.clientName) - 1] != '\0') {
+            auth.clientName[sizeof(auth.clientName) - 1] = '\0';
+          }
+          if (auth.pin[sizeof(auth.pin) - 1] != '\0') {
+            auth.pin[sizeof(auth.pin) - 1] = '\0';
+          }
 
-        // Validate authentication payload bounds to prevent overflow attacks.
-        if (header.payloadSize >= sizeof(AuthPayload) &&
-            header.payloadSize <= MAX_PAYLOAD_SIZE) {
-          std::vector<uint8_t> authBuffer(header.payloadSize);
+          volatile uint8_t diff = 0;
+          for (int i = 0; i < 8; ++i) {
+            diff |= auth.pin[i] ^ activeServerPin.c_str()[i];
+          }
 
-          int pBytes = recv(clientSocket, (char *)authBuffer.data(),
-                            header.payloadSize, MSG_WAITALL);
-          if (pBytes > 0 && pBytes == static_cast<int>(header.payloadSize)) {
-
-            AuthPayload auth;
-            memcpy(&auth, authBuffer.data(), sizeof(AuthPayload));
-            if (auth.clientName[sizeof(auth.clientName) - 1] != '\0') {
-              auth.clientName[sizeof(auth.clientName) - 1] = '\0';
+          if (diff != 0) {
+            if (State::globalDebugMode) {
+              UI::LogDebug("[Network Server] Auth rejected for client '%s' (%s:%d): PIN mismatch.",
+                           auth.clientName, clientIpStr, clientPort);
             }
-            if (auth.pin[sizeof(auth.pin) - 1] != '\0') {
-              auth.pin[sizeof(auth.pin) - 1] = '\0';
-            }
-
-            volatile uint8_t diff = 0;
-            for (int i = 0; i < 8; ++i) {
-              diff |= auth.pin[i] ^ activeServerPin.c_str()[i];
-            }
-
-            if (diff == 0) {
-
-              if (State::globalDebugMode)
-                UI::LogDebug("[Network Server] Client Authenticated.");
+          } else {
+            if (State::globalDebugMode)
+              UI::LogDebug("[Network Server] Client Authenticated: '%s' from %s:%d.",
+                           auth.clientName, clientIpStr, clientPort);
 
               // Immediately send the server's native audio format directly to
               // the newly authenticated client. This is a critical handshake
@@ -623,8 +702,9 @@ void AcceptClientsLoop() {
                   }
 
                   if (!buffer.empty()) {
-                    send(clientSocket, (const char *)buffer.data(),
-                         (int)buffer.size(), 0);
+                    if (!SendExact(clientSocket, buffer.data(), buffer.size()) && State::globalDebugMode) {
+                      UI::LogDebug("[Network Server] WARNING: Failed to send audio format handshake.");
+                    }
                   }
                 }
               }
@@ -641,11 +721,6 @@ void AcceptClientsLoop() {
               int flag = 1;
               setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag,
                          sizeof(flag));
-
-              int tos = 0xB8; // DSCP 46 (Expedited Forwarding) for
-                              // Voice/Real-Time priority
-              setsockopt(clientSocket, IPPROTO_IP, IP_TOS, (char *)&tos,
-                         sizeof(tos));
 
               char ipStr[INET_ADDRSTRLEN];
               inet_ntop(AF_INET, &(clientAddr.sin_addr), ipStr,
@@ -777,7 +852,6 @@ void AcceptClientsLoop() {
             }
           }
         }
-      }
       closesocket(clientSocket);
     }
   }
@@ -1170,8 +1244,7 @@ bool BroadcastMessage(MessageType type, const void *payload,
              (int)tls_sendBuffer.size(), 0, (sockaddr *)&t.udpAddr,
              sizeof(t.udpAddr));
     } else {
-      if (send(t.sock, (const char *)tls_sendBuffer.data(),
-               (int)tls_sendBuffer.size(), 0) == SOCKET_ERROR) {
+      if (!SendExact(t.sock, tls_sendBuffer.data(), tls_sendBuffer.size())) {
         shutdown(t.sock,
                  SD_BOTH); // Force the listener loop to sever the dead socket.
       }
@@ -1237,8 +1310,7 @@ bool BroadcastClipboardMessage(const void *payload, size_t payloadSize) {
       memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(),
              tls_ciphertext.size());
 
-      if (send(t.sock, (const char *)tls_sendBuffer.data(),
-               (int)tls_sendBuffer.size(), 0) == SOCKET_ERROR) {
+      if (!SendExact(t.sock, tls_sendBuffer.data(), tls_sendBuffer.size())) {
         shutdown(t.sock, SD_BOTH);
       }
     }
@@ -1292,14 +1364,18 @@ bool SendToClient(SOCKET clientSocket, MessageType type, const void *payload,
            tls_ciphertext.size());
 
     uint64_t tStart = GetTickCount64();
-    int res = 0;
+    bool ok = false;
     if (useUdp) {
-      res = sendto(serverUdpSocket, (const char *)tls_sendBuffer.data(),
-                   (int)tls_sendBuffer.size(), 0, (sockaddr *)&udpAddr,
-                   sizeof(udpAddr));
+      ok = sendto(serverUdpSocket, (const char *)tls_sendBuffer.data(),
+                  (int)tls_sendBuffer.size(), 0, (sockaddr *)&udpAddr,
+                  sizeof(udpAddr)) != SOCKET_ERROR;
     } else {
-      res = send(targetSock, (const char *)tls_sendBuffer.data(),
-                 (int)tls_sendBuffer.size(), 0);
+      ok = SendExact(targetSock, tls_sendBuffer.data(), tls_sendBuffer.size());
+      if (!ok) {
+        // A failed/partial TCP write leaves the stream misframed; sever it so the
+        // listener loop tears the client down cleanly (matches BroadcastMessage).
+        shutdown(targetSock, SD_BOTH);
+      }
     }
     uint64_t tEnd = GetTickCount64();
     if (State::globalDebugMode && (tEnd - tStart) > 200 && !useUdp) {
@@ -1307,7 +1383,7 @@ bool SendToClient(SOCKET clientSocket, MessageType type, const void *payload,
                    "ms! TCP congested.",
                    (unsigned long long)(tEnd - tStart));
     }
-    return res != SOCKET_ERROR;
+    return ok;
   }
   return false;
 }
