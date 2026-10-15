@@ -451,8 +451,8 @@ void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
       } else if (header.type == MessageType::EVENT_CLIENT_LOCKED) {
         if (State::IsRemote()) {
           if (State::globalDebugMode)
-            UI::LogDebug("[Network Server] Client locked by UAC/Secure "
-                         "Desktop. Auto-reverting control.");
+            UI::LogDebug("[Network Server] Client input locked (UAC / SYSTEM window). Auto-reverting control to Server.");
+          Input::HandleReturnControl(0, 0.5f, 0.5f);
           g_controllingClientSocket.store(INVALID_SOCKET,
                                           std::memory_order_relaxed);
           State::SetMode(State::ControlMode::LOCAL);

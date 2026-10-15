@@ -28,7 +28,7 @@ All network traffic — inputs, audio, clipboard data, and file transfers — is
 * **Tamper Detection** — Each packet carries an authenticated header (AAD) that detects any modification in transit.
 * **Replay Protection** — Sequence counters prevent captured packets from being resent.
 * **Size Limits** — Strict payload bounds protect against memory-based attacks.
-* **Lock Screen Safety** — If a Windows UAC prompt or Lock Screen appears, KAM-Flow instantly returns mouse and keyboard control to the Server so you never get locked out.
+* **Lock Screen & Elevated Menu Safety** — If a Windows UAC prompt, Lock Screen, or elevated system tray menu (e.g. NVIDIA App) appears on a Client, KAM-Flow automatically returns mouse and keyboard control to the Server so you are never trapped or locked out, while leaving the menu open for physical interaction on the client.
 
 ---
 

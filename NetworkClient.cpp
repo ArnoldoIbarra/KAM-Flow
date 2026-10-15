@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <atomic>
 #include <avrt.h>
+#include <cctype>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -252,6 +254,7 @@ void InjectMouseInput(const MousePayload &p) {
   SendInput(1, &i, sizeof(INPUT));
 }
 
+
 /**
  * @brief Uses Win32 SendInput to synthesize keyboard actions natively.
  * @param p The KeyboardPayload containing Virtual Key Codes and state flags.
@@ -264,6 +267,95 @@ void InjectKeyboardInput(const KeyboardPayload &p) {
   i.ki.wScan = p.scanCode;
   i.ki.dwFlags = p.flags;
   SendInput(1, &i, sizeof(INPUT));
+}
+
+/**
+ * @brief Checks if synthetic mouse movement is actively stalled by a SYSTEM-integrity
+ * or protected window (such as NVIDIA App tray context menu) and auto-reverts control to Server.
+ * @param p The MousePayload containing movement deltas and flags.
+ * @param currentPt The current cursor position on the client screen.
+ * @return void
+ */
+void CheckForBlockedInput(const MousePayload &p, const POINT &currentPt) {
+  // Only evaluate on pure relative movement commands with non-zero movement
+  if (p.flags != MOUSEEVENTF_MOVE || (p.deltaX == 0 && p.deltaY == 0)) {
+    return;
+  }
+
+  static POINT lastPt = { -1, -1 };
+  static int stallCount = 0;
+  static auto lastNotifyTime = std::chrono::steady_clock::now() - std::chrono::seconds(2);
+
+  // Fast-path integer comparison: exactly 1 CPU cycle during normal movement
+  if (currentPt.x == lastPt.x && currentPt.y == lastPt.y) {
+    stallCount++;
+
+    // After 10 consecutive frozen movement packets (~10ms), check if a protected window has focus
+    if (stallCount >= 10) {
+      auto now = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(now - lastNotifyTime).count() >= 500) {
+        bool isProtectedWindow = false;
+
+        HWND fg = GetForegroundWindow();
+        if (fg) {
+          DWORD pid = 0;
+          GetWindowThreadProcessId(fg, &pid);
+          if (pid != 0) {
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (hProc) {
+              char procPath[MAX_PATH] = { 0 };
+              DWORD pathSize = sizeof(procPath);
+              if (QueryFullProcessImageNameA(hProc, 0, procPath, &pathSize)) {
+                std::string path(procPath);
+                std::transform(path.begin(), path.end(), path.begin(), ::tolower);
+                if (path.find("nvcontainer") != std::string::npos ||
+                    path.find("nvdisplay") != std::string::npos) {
+                  isProtectedWindow = true;
+                }
+              }
+
+              if (!isProtectedWindow) {
+                HANDLE hToken = NULL;
+                if (OpenProcessToken(hProc, TOKEN_QUERY, &hToken)) {
+                  DWORD len = 0;
+                  GetTokenInformation(hToken, TokenIntegrityLevel, NULL, 0, &len);
+                  if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0) {
+                    std::vector<uint8_t> buffer(len);
+                    if (GetTokenInformation(hToken, TokenIntegrityLevel, buffer.data(), len, &len)) {
+                      TOKEN_MANDATORY_LABEL* label = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer.data());
+                      DWORD subAuth = *GetSidSubAuthority(label->Label.Sid, (DWORD)(UCHAR)(*GetSidSubAuthorityCount(label->Label.Sid) - 1));
+                      if (subAuth >= SECURITY_MANDATORY_SYSTEM_RID) {
+                        isProtectedWindow = true; // SYSTEM integrity level
+                      }
+                    }
+                  }
+                  CloseHandle(hToken);
+                }
+              }
+              CloseHandle(hProc);
+            }
+          }
+        }
+
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
+        bool notAtEdge = (currentPt.x > 5 && currentPt.x < sw - 5 && currentPt.y > 5 && currentPt.y < sh - 5);
+
+        if (isProtectedWindow || (stallCount >= 20 && notAtEdge)) {
+          lastNotifyTime = now;
+          stallCount = 0;
+          if (State::globalDebugMode) {
+            UI::LogDebug("[Network Client] Synthetic input blocked by SYSTEM/UIPI window. Auto-reverting control to Server.");
+          }
+          SendToServer(MessageType::EVENT_CLIENT_LOCKED, nullptr, 0);
+        }
+      }
+    }
+  } else {
+    stallCount = 0;
+  }
+
+  lastPt = currentPt;
 }
 
 /**
@@ -498,6 +590,7 @@ void ClientUDPListenerLoop() {
 
         POINT pt;
         GetCursorPos(&pt);
+        CheckForBlockedInput(p, pt);
         int sw = GetSystemMetrics(SM_CXSCREEN),
             sh = GetSystemMetrics(SM_CYSCREEN);
 
@@ -692,6 +785,7 @@ void ClientLoop() {
 
         POINT pt;
         GetCursorPos(&pt);
+        CheckForBlockedInput(p, pt);
         int sw = GetSystemMetrics(SM_CXSCREEN),
             sh = GetSystemMetrics(SM_CYSCREEN);
 
@@ -749,9 +843,9 @@ void ClientLoop() {
       if (finalSize == sizeof(CursorSyncPayload)) {
         CursorSyncPayload p;
         memcpy(&p, finalPayload, sizeof(p));
-        int sw = GetSystemMetrics(SM_CXSCREEN),
-            sh = GetSystemMetrics(SM_CYSCREEN);
 
+        int sw = GetSystemMetrics(SM_CXSCREEN);
+        int sh = GetSystemMetrics(SM_CYSCREEN);
         int ty = std::clamp((int)(sh * p.normalizedY), 10, sh - 10);
         int tx = std::clamp((int)(sw * p.normalizedX), 15, sw - 15);
         if (p.entryEdge == 0)
@@ -776,21 +870,42 @@ void ClientLoop() {
       }
     } else if (h.type == MessageType::EVENT_AUDIO_FORMAT) {
       if (finalSize == sizeof(AudioFormatPayload)) {
-        memcpy(&g_serverAudioFormat, finalPayload, sizeof(AudioFormatPayload));
+        Audio::AudioFormat newFormat;
+        memcpy(&newFormat, finalPayload, sizeof(newFormat));
+
+        bool formatChanged = g_hasServerAudioFormat &&
+                             ((g_serverAudioFormat.sampleRate != newFormat.sampleRate) ||
+                              (g_serverAudioFormat.bitDepth != newFormat.bitDepth) ||
+                              (g_serverAudioFormat.channels != newFormat.channels));
+
+        g_serverAudioFormat = newFormat;
         g_hasServerAudioFormat = true;
         if (State::globalDebugMode)
           UI::LogDebug(
-              "[Audio] Received Server Audio Format: %uHz, %u-bit, %uch",
+              "[Audio] Received Server Audio Format: %uHz, %u-bit, %uch%s",
               g_serverAudioFormat.sampleRate, g_serverAudioFormat.bitDepth,
-              g_serverAudioFormat.channels);
+              g_serverAudioFormat.channels,
+              formatChanged ? " (Format Changed)" : "");
 
-        // Now that we have the format, start capturing if the user has it
-        // enabled.
-        if (State::enableClientAudioStream) {
-          Audio::StartLoopbackCapture();
-        }
-        if (State::enableClientMicReceive) {
-          Audio::StartMicReceiver();
+        if (formatChanged) {
+          // If capture or mic receiver was already running, stop first so StartLoopbackCapture
+          // and StartMicReceiver re-initialize with the updated format instead of returning early.
+          if (State::enableClientAudioStream) {
+            Audio::StopLoopbackCapture();
+            Audio::StartLoopbackCapture();
+          }
+          if (State::enableClientMicReceive) {
+            Audio::StopMicReceiver();
+            Audio::StartMicReceiver();
+          }
+        } else {
+          // Format has not changed; start streams if enabled and not already running
+          if (State::enableClientAudioStream) {
+            Audio::StartLoopbackCapture();
+          }
+          if (State::enableClientMicReceive) {
+            Audio::StartMicReceiver();
+          }
         }
       }
     } else if (h.type == MessageType::EVENT_CLIPBOARD) {

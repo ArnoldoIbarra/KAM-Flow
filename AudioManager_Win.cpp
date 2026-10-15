@@ -28,6 +28,7 @@
 
 #include <iostream>
 #include <thread>
+#include <chrono>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -301,6 +302,9 @@ namespace Audio {
 
     /**
      * @brief The main loop for the client's audio capture thread.
+     * Continuously captures system audio and streams it to the server. Incorporates
+     * a self-healing device recovery loop to survive system sleep/standby, headphone unplug,
+     * or Windows audio driver restarts without requiring an application restart.
      * @param targetFormat The audio format requested by the server.
      * @return void
      */
@@ -309,126 +313,216 @@ namespace Audio {
         // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
         HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "CaptureThread");
 
-        // 1. Get the default audio playback device (e.g., speakers).
-        IMMDevice* pDevice = nullptr;
-        HRESULT hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: GetDefaultAudioEndpoint failed.");
-            return;
-        }
-
-        // 2. Activate an IAudioClient for the device.
-        IAudioClient* pAudioClient = nullptr;
-    hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);    
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: Activate IAudioClient failed.");
-        pDevice->Release();
-            return;
-        }
-
-    // Mute the client's system audio to prevent echo. We do this now while we still have the device object.
-    hr = pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&g_pClientEndpointVolume);
-    if (SUCCEEDED(hr)) {
-        g_pClientEndpointVolume->GetMute(&g_bOriginalMuteState);
-        g_pClientEndpointVolume->SetMute(TRUE, nullptr);
-    }
-    pDevice->Release(); // We are now finished with the IMMDevice, so we can safely release it.
-
-        // 3. Set up the target WAVEFORMATEX based on the server's request.
-        WAVEFORMATEX* pTargetWaveFormat = new WAVEFORMATEX();
-        pTargetWaveFormat->wFormatTag = (targetFormat.bitDepth == 32) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
-        pTargetWaveFormat->nChannels = targetFormat.channels;
-        pTargetWaveFormat->nSamplesPerSec = targetFormat.sampleRate;
-        pTargetWaveFormat->wBitsPerSample = targetFormat.bitDepth;
-        pTargetWaveFormat->nBlockAlign = (pTargetWaveFormat->nChannels * pTargetWaveFormat->wBitsPerSample) / 8;
-        pTargetWaveFormat->nAvgBytesPerSec = pTargetWaveFormat->nSamplesPerSec * pTargetWaveFormat->nBlockAlign;
-        pTargetWaveFormat->cbSize = 0;
-
-        // 4. Initialize the audio client for loopback capture.
-        // We ask WASAPI to automatically convert the audio to our target format,
-        // and allocate a 100ms buffer to safely absorb Windows OS thread scheduling jitter.
-        REFERENCE_TIME hnsRequestedDuration = 1000000; // 100ms
-        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, hnsRequestedDuration, 0, pTargetWaveFormat, nullptr);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: IAudioClient Initialize failed. Format mismatch?");
-            if (g_pClientEndpointVolume) g_pClientEndpointVolume->Release();
-            pAudioClient->Release();
-            return;
-        }
-
-        // 5. Get the capture service.
-        IAudioCaptureClient* pCaptureClient = nullptr;
-        hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: GetService for IAudioCaptureClient failed.");
-            if (g_pClientEndpointVolume) g_pClientEndpointVolume->Release();
-            pAudioClient->Release();
-            return;
-        }
-
-        // 6. Start the audio stream.
-        hr = pAudioClient->Start();
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: IAudioClient Start failed.");
-            pCaptureClient->Release();
-            if (g_pClientEndpointVolume) g_pClientEndpointVolume->Release();
-            pAudioClient->Release();
-            return;
-        }
-
-        // With a 100ms WASAPI buffer, polling every 10ms is completely immune 
-        // to Windows' 15.6ms timer resolution worst-case limits.
-        DWORD sleepTimeMs = 10;
-
-        if (State::globalDebugMode) UI::LogDebug("[Audio] Loopback capture started. Jitter-immune 10ms Polling active.");
-
-        // 7. Main capture loop.
         while (g_isCaptureRunning) {
-            UINT32 packetLength = 0;
-            
-            // DRAIN LOOP: Pull *all* available packets from the WASAPI buffer.
-            // If we only pull one per sleep cycle, audio will silently drift and starve the server!
-            while (SUCCEEDED(pCaptureClient->GetNextPacketSize(&packetLength)) && packetLength > 0) {
-                BYTE* pData;
-                UINT32 numFramesAvailable;
-                DWORD flags;
-
-                // Get the available data in the shared buffer.
-                hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr);
-                if (SUCCEEDED(hr)) {
-                    UINT32 dataSize = numFramesAvailable * pTargetWaveFormat->nBlockAlign;
-                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                        // CRITICAL: We MUST send silence to keep the server's playback clock perfectly synced.
-                        // Ignoring silent packets causes the server to consume audio faster than real-time, leading to starvation.
-                        static thread_local std::vector<BYTE> silenceBuffer;
-                        if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
-                        else std::memset(silenceBuffer.data(), 0, dataSize);
-                        
-                        Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, silenceBuffer.data(), dataSize);
-                    } else {
-                        Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, pData, dataSize);
-                    }
-                    pCaptureClient->ReleaseBuffer(numFramesAvailable);
-                } else {
-                    break; // If GetBuffer fails, stop trying to drain for this cycle
-                }
+            if (!pEnumerator) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
+
+            // 1. Get the default audio playback device (e.g., speakers).
+            IMMDevice* pDevice = nullptr;
+            HRESULT hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+            if (FAILED(hr) || !pDevice) {
+                if (State::globalDebugMode) {
+                    static uint64_t lastCapDeviceLog = 0;
+                    uint64_t now = GetTickCount64();
+                    if (now - lastCapDeviceLog > 3000) {
+                        UI::LogDebug("[Audio] CaptureThread: Waiting for default audio playback endpoint...");
+                        lastCapDeviceLog = now;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // 2. Activate an IAudioClient for the device.
+            IAudioClient* pAudioClient = nullptr;
+            hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);    
+            if (FAILED(hr) || !pAudioClient) {
+                pDevice->Release();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // Mute the client's system audio to prevent echo. We do this now while we still have the device object.
+            hr = pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, nullptr, (void**)&g_pClientEndpointVolume);
+            if (SUCCEEDED(hr)) {
+                g_pClientEndpointVolume->GetMute(&g_bOriginalMuteState);
+                g_pClientEndpointVolume->SetMute(TRUE, nullptr);
+            }
+            pDevice->Release(); // We are now finished with the IMMDevice, so we can safely release it.
+
+            // 3. Set up the target WAVEFORMATEX based on the server's request.
+            WAVEFORMATEX* pTargetWaveFormat = new WAVEFORMATEX();
+            pTargetWaveFormat->wFormatTag = (targetFormat.bitDepth == 32) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+            pTargetWaveFormat->nChannels = targetFormat.channels;
+            pTargetWaveFormat->nSamplesPerSec = targetFormat.sampleRate;
+            pTargetWaveFormat->wBitsPerSample = targetFormat.bitDepth;
+            pTargetWaveFormat->nBlockAlign = (pTargetWaveFormat->nChannels * pTargetWaveFormat->wBitsPerSample) / 8;
+            pTargetWaveFormat->nAvgBytesPerSec = pTargetWaveFormat->nSamplesPerSec * pTargetWaveFormat->nBlockAlign;
+            pTargetWaveFormat->cbSize = 0;
+
+            // 4. Initialize the audio client for loopback capture.
+            // We ask WASAPI to automatically convert the audio to our target format,
+            // and allocate a 100ms buffer to safely absorb Windows OS thread scheduling jitter.
+            REFERENCE_TIME hnsRequestedDuration = 1000000; // 100ms
+            hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, hnsRequestedDuration, 0, pTargetWaveFormat, nullptr);
+            if (FAILED(hr)) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: IAudioClient Initialize failed (0x%08X). Retrying...", hr);
+                if (g_pClientEndpointVolume) {
+                    g_pClientEndpointVolume->SetMute(g_bOriginalMuteState, nullptr);
+                    g_pClientEndpointVolume->Release();
+                    g_pClientEndpointVolume = nullptr;
+                }
+                pAudioClient->Release();
+                delete pTargetWaveFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // 5. Get the capture service.
+            IAudioCaptureClient* pCaptureClient = nullptr;
+            hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
+            if (FAILED(hr) || !pCaptureClient) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: GetService for IAudioCaptureClient failed. Retrying...");
+                if (g_pClientEndpointVolume) {
+                    g_pClientEndpointVolume->SetMute(g_bOriginalMuteState, nullptr);
+                    g_pClientEndpointVolume->Release();
+                    g_pClientEndpointVolume = nullptr;
+                }
+                pAudioClient->Release();
+                delete pTargetWaveFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // 6. Start the audio stream.
+            hr = pAudioClient->Start();
+            if (FAILED(hr)) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: IAudioClient Start failed. Retrying...");
+                pCaptureClient->Release();
+                if (g_pClientEndpointVolume) {
+                    g_pClientEndpointVolume->SetMute(g_bOriginalMuteState, nullptr);
+                    g_pClientEndpointVolume->Release();
+                    g_pClientEndpointVolume = nullptr;
+                }
+                pAudioClient->Release();
+                delete pTargetWaveFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            // With a 100ms WASAPI buffer, polling every 10ms is completely immune 
+            // to Windows' 15.6ms timer resolution worst-case limits.
+            DWORD sleepTimeMs = 10;
+
+            if (State::globalDebugMode) UI::LogDebug("[Audio] Loopback capture started. Jitter-immune 10ms Polling active.");
+
+            // 7. Main capture streaming loop for this device
+            bool deviceInvalidated = false;
+            auto lastRealPacketTime = std::chrono::steady_clock::now() - std::chrono::milliseconds(200);
+            auto lastSilenceSendTime = std::chrono::steady_clock::now();
+
+            while (g_isCaptureRunning && !deviceInvalidated) {
+                UINT32 packetLength = 0;
+                hr = pCaptureClient->GetNextPacketSize(&packetLength);
+                if (FAILED(hr)) {
+                    // Device invalidated by sleep/wake, driver reset, or hardware unplug
+                    if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: Device invalidated (0x%08X). Recovering...", hr);
+                    deviceInvalidated = true;
+                    break;
+                }
+                
+                if (packetLength == 0) {
+                    // When no application is rendering audio on the client, WASAPI Loopback returns packetLength == 0.
+                    // To prevent fake silence from injecting into active video/media streams during transient
+                    // 10ms-20ms audio engine buffer gaps (which previously caused server-side jitter buffer overruns
+                    // and audio artifacts), we dynamically compute the idle threshold based on the user's Jitter Buffer setting.
+                    int idleThresholdMs = (std::clamp)(State::audioJitterBufferMs.load() / 2, 25, 60);
+
+                    auto now = std::chrono::steady_clock::now();
+                    auto idleDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRealPacketTime).count();
+
+                    if (idleDurationMs >= idleThresholdMs) {
+                        // True system silence: transmit a 10ms silent buffer of the target format paced every 10ms.
+                        // This maintains clock synchronization with the server's audio renderer (preventing starvation/re-buffering)
+                        // and keeps modern Wi-Fi 6/7 adapters in high-throughput active mode to prevent mouse stuttering.
+                        auto silenceElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSilenceSendTime).count();
+                        if (silenceElapsedMs >= 10) {
+                            static thread_local std::vector<BYTE> idleSilenceBuffer;
+                            UINT32 framesPer10ms = pTargetWaveFormat->nSamplesPerSec / 100;
+                            UINT32 dataSize = framesPer10ms * pTargetWaveFormat->nBlockAlign;
+                            if (idleSilenceBuffer.size() != dataSize) {
+                                idleSilenceBuffer.assign(dataSize, 0);
+                            }
+                            Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, idleSilenceBuffer.data(), dataSize);
+                            lastSilenceSendTime = now;
+                        }
+                    }
+                } else {
+                    // DRAIN LOOP: Pull *all* available packets from the WASAPI buffer.
+                    // If we only pull one per sleep cycle, audio will silently drift and starve the server!
+                    while (packetLength > 0) {
+                        BYTE* pData = nullptr;
+                        UINT32 numFramesAvailable = 0;
+                        DWORD flags = 0;
+
+                        // Get the available data in the shared buffer.
+                        hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr);
+                        if (SUCCEEDED(hr)) {
+                            // Active audio frames captured from WASAPI: update real packet timestamp
+                            lastRealPacketTime = std::chrono::steady_clock::now();
+                            lastSilenceSendTime = lastRealPacketTime;
+
+                            UINT32 dataSize = numFramesAvailable * pTargetWaveFormat->nBlockAlign;
+                            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                                // CRITICAL: We MUST send silence to keep the server's playback clock perfectly synced.
+                                // Ignoring silent packets causes the server to consume audio faster than real-time, leading to starvation.
+                                static thread_local std::vector<BYTE> silenceBuffer;
+                                if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
+                                else std::memset(silenceBuffer.data(), 0, dataSize);
+                                
+                                Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, silenceBuffer.data(), dataSize);
+                            } else {
+                                Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, pData, dataSize);
+                            }
+                            pCaptureClient->ReleaseBuffer(numFramesAvailable);
+                        } else {
+                            if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_RESOURCES_INVALIDATED) {
+                                deviceInvalidated = true;
+                            }
+                            break; // If GetBuffer fails, stop trying to drain for this cycle
+                        }
+
+                        if (FAILED(pCaptureClient->GetNextPacketSize(&packetLength))) {
+                            deviceInvalidated = true;
+                            break;
+                        }
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
+            }
+
+            // 8. Device teardown
+            pAudioClient->Stop();
+            pCaptureClient->Release();
+            pAudioClient->Release();
+
+            // Restore the client's original mute state when device is lost or thread exits
+            if (g_pClientEndpointVolume) {
+                g_pClientEndpointVolume->SetMute(g_bOriginalMuteState, nullptr);
+                g_pClientEndpointVolume->Release();
+                g_pClientEndpointVolume = nullptr;
+            }
+
+            delete pTargetWaveFormat;
+
+            if (deviceInvalidated && g_isCaptureRunning) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] CaptureThread: Audio device lost (sleep/standby/unplug). Re-acquiring in 500ms...");
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
         }
 
-        // 8. Cleanup.
-        pAudioClient->Stop();
-        pCaptureClient->Release();
-        pAudioClient->Release();
-
-        // Restore the client's original mute state.
-        if (g_pClientEndpointVolume) {
-            g_pClientEndpointVolume->SetMute(g_bOriginalMuteState, nullptr);
-            g_pClientEndpointVolume->Release();
-            g_pClientEndpointVolume = nullptr;
-        }
-
-        delete pTargetWaveFormat;
         if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (State::globalDebugMode) UI::LogDebug("[Audio] Loopback capture thread stopped.");
     }
@@ -439,6 +533,9 @@ namespace Audio {
         if (!Network::GetServerAudioFormat(serverFormat)) {
             if (State::globalDebugMode) UI::LogDebug("[Audio] Cannot start capture: Server audio format not yet received.");
             return;
+        }
+        if (g_captureThread.joinable()) {
+            g_captureThread.join();
         }
         g_isCaptureRunning = true;
         g_captureThread = std::thread(CaptureThreadLoop, serverFormat);
@@ -454,6 +551,10 @@ namespace Audio {
 
     /**
      * @brief The main loop for the server's audio rendering thread.
+     * Continuously mixes and plays incoming client audio streams.
+     * Incorporates an outer self-healing recovery loop that automatically re-acquires
+     * the default audio playback endpoint if the device is invalidated (sleep/standby,
+     * headphone unplug, or Windows audio driver restarts).
      * @return void
      */
     void RenderThreadLoop() {
@@ -461,292 +562,364 @@ namespace Audio {
         // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
         HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "RenderThread");
 
-        AudioFormat format;
-        if (!GetDefaultDeviceFormat(format)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: Could not get default device format.");
-            return;
-        }
-        g_serverRenderFormat = format;
-        g_hasRenderFormat = true;
-
-        IMMDevice* pDevice = nullptr;
-        HRESULT hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
-        if (FAILED(hr)) return;
-
-        IAudioClient* pAudioClient = nullptr;
-        hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);
-        pDevice->Release();
-        if (FAILED(hr)) return;
-
-        // We will request to mix in 32-bit float format for highest quality.
-        WAVEFORMATEX* pMixFormat = nullptr;
-        hr = pAudioClient->GetMixFormat(&pMixFormat);
-        
-        WAVEFORMATEXTENSIBLE extFormat;
-        ZeroMemory(&extFormat, sizeof(WAVEFORMATEXTENSIBLE));
-        if (pMixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pMixFormat->cbSize >= 22) {
-            memcpy(&extFormat, pMixFormat, sizeof(WAVEFORMATEXTENSIBLE));
-        } else {
-            memcpy(&extFormat.Format, pMixFormat, sizeof(WAVEFORMATEX));
-            // Provide a sensible default channel mask if the device didn't natively provide one
-            if (extFormat.Format.nChannels == 1) extFormat.dwChannelMask = KSAUDIO_SPEAKER_MONO;
-            else if (extFormat.Format.nChannels == 2) extFormat.dwChannelMask = KSAUDIO_SPEAKER_STEREO;
-            else if (extFormat.Format.nChannels == 4) extFormat.dwChannelMask = KSAUDIO_SPEAKER_QUAD;
-            else if (extFormat.Format.nChannels == 6) extFormat.dwChannelMask = KSAUDIO_SPEAKER_5POINT1;
-            else if (extFormat.Format.nChannels == 8) extFormat.dwChannelMask = KSAUDIO_SPEAKER_7POINT1;
-        }
-
-        extFormat.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
-        extFormat.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-        extFormat.Format.wBitsPerSample = 32;
-        extFormat.Format.cbSize = 22;
-        extFormat.Format.nBlockAlign = (extFormat.Format.nChannels * extFormat.Format.wBitsPerSample) / 8;
-        extFormat.Format.nAvgBytesPerSec = extFormat.Format.nSamplesPerSec * extFormat.Format.nBlockAlign;
-        extFormat.Samples.wValidBitsPerSample = 32;
-
-        g_hRenderEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-        if (!g_hRenderEvent) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: Failed to create WASAPI Event.");
-            pAudioClient->Release();
-            CoTaskMemFree(pMixFormat);
-            return;
-        }
-
-        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, 0, 0, &extFormat.Format, nullptr);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: IAudioClient Initialize failed.");
-            CloseHandle(g_hRenderEvent);
-            g_hRenderEvent = NULL;
-            pAudioClient->Release();
-            CoTaskMemFree(pMixFormat);
-            return;
-        }
-
-        hr = pAudioClient->SetEventHandle(g_hRenderEvent);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: SetEventHandle failed.");
-            CloseHandle(g_hRenderEvent);
-            g_hRenderEvent = NULL;
-            pAudioClient->Release();
-            CoTaskMemFree(pMixFormat);
-            return;
-        }
-
-        UINT32 bufferFrameCount;
-        pAudioClient->GetBufferSize(&bufferFrameCount);
-
-        IAudioRenderClient* pRenderClient = nullptr;
-        hr = pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&pRenderClient);
-        if (FAILED(hr)) {
-            CloseHandle(g_hRenderEvent);
-            g_hRenderEvent = NULL;
-            pAudioClient->Release();
-            CoTaskMemFree(pMixFormat);
-            return;
-        }
-
-        hr = pAudioClient->Start();
-        if (FAILED(hr)) {
-            CloseHandle(g_hRenderEvent);
-            g_hRenderEvent = NULL;
-            pRenderClient->Release();
-            pAudioClient->Release();
-            CoTaskMemFree(pMixFormat);
-            return;
-        }
-
-        if (State::globalDebugMode) UI::LogDebug("[Audio] Audio renderer thread started successfully.");
-
         std::vector<uint8_t> linearBuffer; // Reusable extraction buffer for the RingBuffer
         std::vector<float> mixBuffer;      // Reusable master mix buffer
 
         while (g_isRenderRunning) {
-            // Wait precisely for the hardware to demand data, eliminating sleep drift!
-            DWORD waitResult = WaitForSingleObject(g_hRenderEvent, 2000);
-            if (waitResult != WAIT_OBJECT_0) {
-                if (!g_isRenderRunning) break;
-                continue; // Timeout or error, try again
-            }
-
-            UINT32 numPaddingFrames;
-            HRESULT hrPad = pAudioClient->GetCurrentPadding(&numPaddingFrames);
-            if (FAILED(hrPad)) {
-                // Device invalidated (sleep/wake, driver update, device unplugged).
-                // Exit the loop cleanly; the thread will release all resources on exit.
-                if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: Device invalidated (0x%08X). Exiting.", hrPad);
-                break;
-            }
-
-            UINT32 numFramesAvailable = bufferFrameCount - numPaddingFrames;
-            if (numFramesAvailable == 0) {
+            if (!pEnumerator) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 continue;
             }
 
-            BYTE* pData;
-            hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
-            if (FAILED(hr)) {
-                // GetBuffer failed — device may be in an invalid state after sleep/wake.
-                if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: GetBuffer failed (0x%08X). Exiting.", hr);
-                break;
+            IMMDevice* pDevice = nullptr;
+            HRESULT hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
+            if (FAILED(hr) || !pDevice) {
+                if (State::globalDebugMode) {
+                    static uint64_t lastFormatRetryLog = 0;
+                    uint64_t now = GetTickCount64();
+                    if (now - lastFormatRetryLog > 3000) {
+                        UI::LogDebug("[Audio] RenderThread: Waiting for default playback device...");
+                        lastFormatRetryLog = now;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
             }
-            {
-                // Resize if needed, then initialize to silence (0.0f).
-                size_t mixBufferSize = numFramesAvailable * pMixFormat->nChannels;
-                if (mixBuffer.size() < mixBufferSize) mixBuffer.resize(mixBufferSize, 0.0f);
-                std::fill(mixBuffer.begin(), mixBuffer.begin() + mixBufferSize, 0.0f);
-                
-                size_t bytesPerFrame = (format.bitDepth / 8) * format.channels;
-                size_t bytesToProcess = numFramesAvailable * bytesPerFrame;
 
-                std::vector<std::shared_ptr<ClientAudioQueue>> activeQueues;
-                std::vector<float> activeVolumes;
+            IAudioClient* pAudioClient = nullptr;
+            hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);
+            pDevice->Release();
+            pDevice = nullptr;
+            if (FAILED(hr) || !pAudioClient) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
+            // Mix in 32-bit float format for highest quality
+            WAVEFORMATEX* pMixFormat = nullptr;
+            hr = pAudioClient->GetMixFormat(&pMixFormat);
+            if (FAILED(hr) || !pMixFormat) {
+                pAudioClient->Release();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            AudioFormat format;
+            format.sampleRate = pMixFormat->nSamplesPerSec;
+            format.channels = pMixFormat->nChannels;
+            format.bitDepth = 32;
+
+            bool formatChanged = g_hasRenderFormat && 
+                                 ((g_serverRenderFormat.sampleRate != format.sampleRate) ||
+                                  (g_serverRenderFormat.bitDepth != format.bitDepth) ||
+                                  (g_serverRenderFormat.channels != format.channels));
+
+            g_serverRenderFormat = format;
+            g_hasRenderFormat = true;
+
+            // If the audio format changed (e.g. user plugged in a 44.1kHz headset or HDMI woke up at 48kHz),
+            // broadcast the new format standard to all connected clients so their capture streams adapt.
+            if (formatChanged && State::enableServerAudioMix) {
+                Network::BroadcastMessage(Network::MessageType::EVENT_AUDIO_FORMAT, &g_serverRenderFormat, sizeof(g_serverRenderFormat));
+                // Restart server microphone capture if active so it matches the new format
+                if (g_isServerMicRunning) {
+                    StopMicBroadcast();
+                    StartMicBroadcast();
+                }
+            }
+
+            WAVEFORMATEXTENSIBLE extFormat;
+            ZeroMemory(&extFormat, sizeof(WAVEFORMATEXTENSIBLE));
+            // Provide a sensible default channel mask if the device didn't natively provide one
+            if (pMixFormat->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pMixFormat->cbSize >= 22) {
+                memcpy(&extFormat, pMixFormat, sizeof(WAVEFORMATEXTENSIBLE));
+            } else {
+                memcpy(&extFormat.Format, pMixFormat, sizeof(WAVEFORMATEX));
+                if (extFormat.Format.nChannels == 1) extFormat.dwChannelMask = KSAUDIO_SPEAKER_MONO;
+                else if (extFormat.Format.nChannels == 2) extFormat.dwChannelMask = KSAUDIO_SPEAKER_STEREO;
+                else if (extFormat.Format.nChannels == 4) extFormat.dwChannelMask = KSAUDIO_SPEAKER_QUAD;
+                else if (extFormat.Format.nChannels == 6) extFormat.dwChannelMask = KSAUDIO_SPEAKER_5POINT1;
+                else if (extFormat.Format.nChannels == 8) extFormat.dwChannelMask = KSAUDIO_SPEAKER_7POINT1;
+            }
+
+            extFormat.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+            extFormat.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+            extFormat.Format.wBitsPerSample = 32;
+            extFormat.Format.cbSize = 22;
+            extFormat.Format.nBlockAlign = (extFormat.Format.nChannels * extFormat.Format.wBitsPerSample) / 8;
+            extFormat.Format.nAvgBytesPerSec = extFormat.Format.nSamplesPerSec * extFormat.Format.nBlockAlign;
+            extFormat.Samples.wValidBitsPerSample = 32;
+
+            if (!g_hRenderEvent) {
+                pAudioClient->Release();
+                CoTaskMemFree(pMixFormat);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+            ResetEvent(g_hRenderEvent);
+
+            hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, 0, 0, &extFormat.Format, nullptr);
+            if (FAILED(hr)) {
+                pAudioClient->Release();
+                CoTaskMemFree(pMixFormat);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            hr = pAudioClient->SetEventHandle(g_hRenderEvent);
+            if (FAILED(hr)) {
+                pAudioClient->Release();
+                CoTaskMemFree(pMixFormat);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            UINT32 bufferFrameCount = 0;
+            pAudioClient->GetBufferSize(&bufferFrameCount);
+
+            IAudioRenderClient* pRenderClient = nullptr;
+            hr = pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&pRenderClient);
+            if (FAILED(hr) || !pRenderClient) {
+                CloseHandle(g_hRenderEvent);
+                g_hRenderEvent = NULL;
+                pAudioClient->Release();
+                CoTaskMemFree(pMixFormat);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            hr = pAudioClient->Start();
+            if (FAILED(hr)) {
+                CloseHandle(g_hRenderEvent);
+                g_hRenderEvent = NULL;
+                pRenderClient->Release();
+                pAudioClient->Release();
+                CoTaskMemFree(pMixFormat);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            if (State::globalDebugMode) UI::LogDebug("[Audio] Audio renderer initialized and running.");
+
+            bool deviceInvalidated = false;
+            while (g_isRenderRunning && !deviceInvalidated) {
+                // Wait for the hardware to demand data. 500ms timeout prevents infinite hangs on sleep/standby
+                DWORD waitResult = WaitForSingleObject(g_hRenderEvent, 500);
+                if (waitResult != WAIT_OBJECT_0) {
+                    if (!g_isRenderRunning) break;
+                    // On timeout, probe device health using GetCurrentPadding.
+                    // When Windows enters sleep or invalidates the endpoint, the event stops firing
+                    // and GetCurrentPadding returns AUDCLNT_E_DEVICE_INVALIDATED.
+                    UINT32 testPadding = 0;
+                    HRESULT hrTest = pAudioClient->GetCurrentPadding(&testPadding);
+                    if (FAILED(hrTest)) {
+                        if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: Device invalidated on timeout (0x%08X). Recovering...", hrTest);
+                        deviceInvalidated = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                UINT32 numPaddingFrames = 0;
+                HRESULT hrPad = pAudioClient->GetCurrentPadding(&numPaddingFrames);
+                if (FAILED(hrPad)) {
+                    if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: Device invalidated (0x%08X). Recovering...", hrPad);
+                    deviceInvalidated = true;
+                    break;
+                }
+
+                UINT32 numFramesAvailable = bufferFrameCount - numPaddingFrames;
+                if (numFramesAvailable == 0) {
+                    continue;
+                }
+
+                BYTE* pData = nullptr;
+                hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
+                if (FAILED(hr)) {
+                    if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: GetBuffer failed (0x%08X). Recovering...", hr);
+                    deviceInvalidated = true;
+                    break;
+                }
+                {
+                    // Resize if needed, then initialize to silence (0.0f).
+                    size_t mixBufferSize = numFramesAvailable * pMixFormat->nChannels;
+                    if (mixBuffer.size() < mixBufferSize) mixBuffer.resize(mixBufferSize, 0.0f);
+                    std::fill(mixBuffer.begin(), mixBuffer.begin() + mixBufferSize, 0.0f);
+                    
+                    size_t bytesPerFrame = (format.bitDepth / 8) * format.channels;
+                    size_t bytesToProcess = numFramesAvailable * bytesPerFrame;
+
+                    std::vector<std::shared_ptr<ClientAudioQueue>> activeQueues;
+                    std::vector<float> activeVolumes;
+
+                    {
+                        std::shared_lock<std::shared_mutex> mapLock(g_queuesMutex);
+                        for (auto& pair : g_clientAudioQueues) {
+                            bool isEnabled = false;
+                            float vol = 1.0f;
+                            if (Network::GetClientAudioState(pair.first, isEnabled, vol) && isEnabled) {
+                                activeQueues.push_back(pair.second);
+                                activeVolumes.push_back(vol);
+                            }
+                        }
+                    }
+
+                    for (size_t i = 0; i < activeQueues.size(); ++i) {
+                        auto& queue = activeQueues[i];
+                        float vol = activeVolumes[i];
+
+                        size_t availableBytes = 0;
+                        size_t bytesRead = 0;
+                        bool isBuffering = false;
+
+                        {
+                            // Scope the lock tightly to just the memory extraction to prevent network thread convoying
+                            std::lock_guard<std::mutex> queueLock(queue->mtx);
+                            
+                            availableBytes = queue->buffer.Size();
+                            if (queue->isBuffering) {
+                                // Still in initial buffering mode - play silence until jitter buffer fills
+                                isBuffering = true;
+                            } else if (availableBytes == 0) {
+                                // Instead of instantly pausing for 50ms due to microsecond clock drift,
+                                // we pad with 5ms of silence. We only rebuild the jitter buffer if it's a true network drop.
+                                queue->starvationCount++;
+                                // 50 consecutive empty polls (~500ms at 10ms/callback) before triggering re-buffer.
+                                if (queue->starvationCount > 50) {
+                                    queue->isBuffering = true;
+                                    queue->starvationCount = 0;
+                                    isBuffering = true;
+                                    if (State::globalDebugMode) {
+                                        // Rate-limit to once per 5 seconds to prevent flooding
+                                        // the debug log during sustained network issues.
+                                        static uint64_t lastStarvationLog = 0;
+                                        uint64_t now = GetTickCount64();
+                                        if (now - lastStarvationLog > 5000) {
+                                            UI::LogDebug("[Audio] Starvation! (Requested %zu, Have 0). Re-buffering.", bytesToProcess);
+                                            lastStarvationLog = now;
+                                        }
+                                    }
+                                }
+                            } else {
+                                queue->starvationCount = 0;
+                                // PARTIAL FILL: Play whatever audio IS available, even if less than requested.
+                                bytesRead = (std::min)(availableBytes, bytesToProcess);
+                                
+                                // Align to frame boundaries to prevent mid-sample splits (causes static/clicks)
+                                bytesRead = bytesRead - (bytesRead % bytesPerFrame);
+
+                                if (bytesRead > 0) {
+                                    if (linearBuffer.size() < bytesToProcess) {
+                                        linearBuffer.resize(bytesToProcess);
+                                    }
+                                    // Zero the entire extraction buffer first so the unfilled tail is silence
+                                    memset(linearBuffer.data(), 0, bytesToProcess);
+                                    queue->buffer.Pop(linearBuffer.data(), bytesRead);
+                                }
+                            }
+                        } // Mutex instantly released! Network thread is free to push new data.
+
+                        if (isBuffering) {
+                            continue; 
+                        }
+
+                        if (bytesRead == 0) continue;
+
+                        // Apply a 64-sample linear fade-in ramp to eliminate the silence→audio click.
+                        // This smooths the transition when the buffer resumes after starvation.
+                        if (queue->wasBuffering && bytesRead > 0) {
+                            size_t rampSamples = (std::min)((size_t)64, bytesRead / (format.bitDepth / 8));
+                            if (format.bitDepth == 32) {
+                                float* p = reinterpret_cast<float*>(linearBuffer.data());
+                                for (size_t s = 0; s < rampSamples; ++s) {
+                                    p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
+                                }
+                            } else if (format.bitDepth == 16) {
+                                int16_t* p = reinterpret_cast<int16_t*>(linearBuffer.data());
+                                for (size_t s = 0; s < rampSamples; ++s) {
+                                    p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
+                                }
+                            }
+                            queue->wasBuffering = false;
+                        }
+
+                        // Log partial fills (only when significant data is missing, rate-limited)
+                        if (bytesRead < bytesToProcess && State::globalDebugMode) {
+                            static uint64_t lastPartialLog = 0;
+                            uint64_t now = GetTickCount64();
+                            if (now - lastPartialLog > 2000) {
+                                UI::LogDebug("[Audio Debug] Partial fill: Got %zu/%zu bytes (%.0f%%). Padding remainder with silence.", 
+                                             bytesRead, bytesToProcess, (100.0 * bytesRead / bytesToProcess));
+                                lastPartialLog = now;
+                            }
+                        }
+
+                        // Mix the data we have (including the zero-padded tail) into the master buffer
+                        size_t framesToMix = bytesToProcess / bytesPerFrame;
+                        size_t samplesToMix = framesToMix * pMixFormat->nChannels;
+                        
+                        if (format.bitDepth == 16) {
+                            const int16_t* pcmData = reinterpret_cast<const int16_t*>(linearBuffer.data());
+                            for (size_t i = 0; i < samplesToMix; ++i) {
+                                mixBuffer[i] += (static_cast<float>(pcmData[i]) / 32768.0f) * vol;
+                            }
+                        } else if (format.bitDepth == 32) {
+                            const float* pcmData = reinterpret_cast<const float*>(linearBuffer.data());
+                            for (size_t i = 0; i < samplesToMix; ++i) {
+                                mixBuffer[i] += pcmData[i] * vol;
+                            }
+                        }
+                    }
+
+                    // Clamp the master mix buffer to prevent clipping and copy to the hardware buffer.
+                    float* pFloatData = reinterpret_cast<float*>(pData);
+                    for (size_t i = 0; i < mixBufferSize; ++i) {
+                        pFloatData[i] = std::clamp(mixBuffer[i], -1.0f, 1.0f);
+                    }
+
+                    hr = pRenderClient->ReleaseBuffer(numFramesAvailable, 0);
+                    if (FAILED(hr)) {
+                        if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: ReleaseBuffer failed (0x%08X). Recovering...", hr);
+                        deviceInvalidated = true;
+                        break;
+                    }
+                }
+            }
+
+            // Teardown the active device instance
+            pAudioClient->Stop();
+            pRenderClient->Release();
+            pAudioClient->Release();
+            CoTaskMemFree(pMixFormat);
+
+            if (deviceInvalidated && g_isRenderRunning) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] RenderThread: Audio endpoint lost (sleep/standby/unplug). Flushing queues and re-acquiring in 500ms...");
+                // Flush stale audio queues to prevent an ancient audio burst upon wake
                 {
                     std::shared_lock<std::shared_mutex> mapLock(g_queuesMutex);
                     for (auto& pair : g_clientAudioQueues) {
-                        bool isEnabled = false;
-                        float vol = 1.0f;
-                        if (Network::GetClientAudioState(pair.first, isEnabled, vol) && isEnabled) {
-                            activeQueues.push_back(pair.second);
-                            activeVolumes.push_back(vol);
-                        }
+                        std::lock_guard<std::mutex> qLock(pair.second->mtx);
+                        pair.second->buffer.Clear();
+                        pair.second->isBuffering = true;
+                        pair.second->starvationCount = 0;
                     }
                 }
-
-                for (size_t i = 0; i < activeQueues.size(); ++i) {
-                    auto& queue = activeQueues[i];
-                    float vol = activeVolumes[i];
-
-                    size_t availableBytes = 0;
-                    size_t bytesRead = 0;
-                    bool isBuffering = false;
-
-                    {
-                        // Scope the lock tightly to just the memory extraction to prevent network thread convoying
-                        std::lock_guard<std::mutex> queueLock(queue->mtx);
-                        
-                        availableBytes = queue->buffer.Size();
-                        if (queue->isBuffering) {
-                            // Still in initial buffering mode - play silence until jitter buffer fills
-                            isBuffering = true;
-                        } else if (availableBytes == 0) {
-                            // Instead of instantly pausing for 50ms due to microsecond clock drift,
-                            // we pad with 5ms of silence. We only rebuild the jitter buffer if it's a true network drop.
-                            queue->starvationCount++;
-                            // 50 consecutive empty polls (~500ms at 10ms/callback) before triggering re-buffer.
-                            // The old threshold of 10 was too aggressive — under CPU stress, momentary 100-200ms
-                            // packet delays would trigger a catastrophic re-buffer that causes audible pops.
-                            if (queue->starvationCount > 50) {
-                                queue->isBuffering = true;
-                                queue->starvationCount = 0;
-                                isBuffering = true;
-                                if (State::globalDebugMode) {
-                                    // Rate-limit to once per 5 seconds to prevent flooding
-                                    // the debug log during sustained network issues.
-                                    static uint64_t lastStarvationLog = 0;
-                                    uint64_t now = GetTickCount64();
-                                    if (now - lastStarvationLog > 5000) {
-                                        UI::LogDebug("[Audio] Starvation! (Requested %zu, Have 0). Re-buffering.", bytesToProcess);
-                                        lastStarvationLog = now;
-                                    }
-                                }
-                            }
-                        } else {
-                            queue->starvationCount = 0;
-                            // PARTIAL FILL: Play whatever audio IS available, even if less than requested.
-                            // This prevents one slow packet from triggering a catastrophic 50ms re-buffering pause
-                            // that causes the vicious starvation loop from hardware clock drift.
-                            bytesRead = (std::min)(availableBytes, bytesToProcess);
-                            
-                            // Align to frame boundaries to prevent mid-sample splits (causes static/clicks)
-                            bytesRead = bytesRead - (bytesRead % bytesPerFrame);
-
-                            if (bytesRead > 0) {
-                                if (linearBuffer.size() < bytesToProcess) {
-                                    linearBuffer.resize(bytesToProcess);
-                                }
-                                // Zero the entire extraction buffer first so the unfilled tail is silence
-                                memset(linearBuffer.data(), 0, bytesToProcess);
-                                queue->buffer.Pop(linearBuffer.data(), bytesRead);
-                            }
-                        }
-                    } // Mutex instantly released! Network thread is free to push new data.
-
-                    if (isBuffering) {
-                        continue; 
-                    }
-
-                    if (bytesRead == 0) continue;
-
-                    // Apply a 64-sample linear fade-in ramp to eliminate the silence→audio click.
-                    // This smooths the transition when the buffer resumes after starvation.
-                    if (queue->wasBuffering && bytesRead > 0) {
-                        size_t rampSamples = (std::min)((size_t)64, bytesRead / (format.bitDepth / 8));
-                        if (format.bitDepth == 32) {
-                            float* p = reinterpret_cast<float*>(linearBuffer.data());
-                            for (size_t s = 0; s < rampSamples; ++s) {
-                                p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
-                            }
-                        } else if (format.bitDepth == 16) {
-                            int16_t* p = reinterpret_cast<int16_t*>(linearBuffer.data());
-                            for (size_t s = 0; s < rampSamples; ++s) {
-                                p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
-                            }
-                        }
-                        queue->wasBuffering = false;
-                    }
-
-                    // Log partial fills (only when significant data is missing, rate-limited)
-                    if (bytesRead < bytesToProcess && State::globalDebugMode) {
-                        static uint64_t lastPartialLog = 0;
-                        uint64_t now = GetTickCount64();
-                        if (now - lastPartialLog > 2000) {
-                            UI::LogDebug("[Audio Debug] Partial fill: Got %zu/%zu bytes (%.0f%%). Padding remainder with silence.", 
-                                         bytesRead, bytesToProcess, (100.0 * bytesRead / bytesToProcess));
-                            lastPartialLog = now;
-                        }
-                    }
-
-                    // Mix the data we have (including the zero-padded tail) into the master buffer
-                    size_t framesToMix = bytesToProcess / bytesPerFrame;
-                    size_t samplesToMix = framesToMix * pMixFormat->nChannels;
-                    
-                    if (format.bitDepth == 16) {
-                        const int16_t* pcmData = reinterpret_cast<const int16_t*>(linearBuffer.data());
-                        for (size_t i = 0; i < samplesToMix; ++i) {
-                            mixBuffer[i] += (static_cast<float>(pcmData[i]) / 32768.0f) * vol;
-                        }
-                    } else if (format.bitDepth == 32) {
-                        const float* pcmData = reinterpret_cast<const float*>(linearBuffer.data());
-                        for (size_t i = 0; i < samplesToMix; ++i) {
-                            mixBuffer[i] += pcmData[i] * vol;
-                        }
-                    }
-                }
-
-                // Clamp the master mix buffer to prevent clipping and copy to the hardware buffer.
-                float* pFloatData = reinterpret_cast<float*>(pData);
-                for (size_t i = 0; i < mixBuffer.size(); ++i) {
-                    pFloatData[i] = std::clamp(mixBuffer[i], -1.0f, 1.0f);
-                }
-
-                pRenderClient->ReleaseBuffer(numFramesAvailable, 0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
         }
 
-        pAudioClient->Stop();
-        pRenderClient->Release();
-        pAudioClient->Release();
-        CoTaskMemFree(pMixFormat);
-        CloseHandle(g_hRenderEvent);
-        g_hRenderEvent = NULL;
-        g_hasRenderFormat = false;
         if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (State::globalDebugMode) UI::LogDebug("[Audio] Audio renderer thread stopped.");
     }
 
     void StartAudioRenderer() {
         if (g_isRenderRunning) return;
+        if (g_renderThread.joinable()) {
+            g_renderThread.join();
+        }
+        if (!g_hRenderEvent) {
+            g_hRenderEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        }
         g_isRenderRunning = true;
         g_renderThread = std::thread(RenderThreadLoop);
     }
@@ -761,6 +934,11 @@ namespace Audio {
         if (g_renderThread.joinable()) {
             g_renderThread.join();
         }
+        if (g_hRenderEvent) {
+            CloseHandle(g_hRenderEvent);
+            g_hRenderEvent = NULL;
+        }
+        g_hasRenderFormat = false;
         // Clear out any stale audio data.
         std::unique_lock<std::shared_mutex> lock(g_queuesMutex);
         g_clientAudioQueues.clear();
@@ -768,6 +946,9 @@ namespace Audio {
 
     /**
      * @brief The main loop for the server's microphone capture thread.
+     * Continuously captures the host's microphone and broadcasts it to connected clients.
+     * Incorporates a self-healing device recovery loop to survive system sleep/standby,
+     * USB microphone disconnect/reconnect, or Windows audio driver restarts.
      * @param targetFormat The format to capture the microphone in (aligned with the server's mix format).
      * @return void
      */
@@ -776,92 +957,134 @@ namespace Audio {
         // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
         HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "ServerMicCapture");
 
-        IMMDevice* pDevice = nullptr;
-        // eCapture for microphones, eConsole to respect the standard Windows Default Recording Device
-        HRESULT hr = pEnumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &pDevice);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] MicCaptureThread: GetDefaultAudioEndpoint failed.");
-            return;
-        }
+        while (g_isServerMicRunning) {
+            if (!pEnumerator) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        IAudioClient* pAudioClient = nullptr;
-        hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);
-        pDevice->Release();
-        if (FAILED(hr)) return;
+            IMMDevice* pDevice = nullptr;
+            // eCapture for microphones, eConsole to respect the standard Windows Default Recording Device
+            HRESULT hr = pEnumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &pDevice);
+            if (FAILED(hr) || !pDevice) {
+                if (State::globalDebugMode) {
+                    static uint64_t lastMicRetryLog = 0;
+                    uint64_t now = GetTickCount64();
+                    if (now - lastMicRetryLog > 3000) {
+                        UI::LogDebug("[Audio] MicCaptureThread: Waiting for default recording endpoint...");
+                        lastMicRetryLog = now;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        WAVEFORMATEX* pTargetWaveFormat = new WAVEFORMATEX();
-        pTargetWaveFormat->wFormatTag = (targetFormat.bitDepth == 32) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
-        pTargetWaveFormat->nChannels = targetFormat.channels;
-        pTargetWaveFormat->nSamplesPerSec = targetFormat.sampleRate;
-        pTargetWaveFormat->wBitsPerSample = targetFormat.bitDepth;
-        pTargetWaveFormat->nBlockAlign = (pTargetWaveFormat->nChannels * pTargetWaveFormat->wBitsPerSample) / 8;
-        pTargetWaveFormat->nAvgBytesPerSec = pTargetWaveFormat->nSamplesPerSec * pTargetWaveFormat->nBlockAlign;
-        pTargetWaveFormat->cbSize = 0;
+            IAudioClient* pAudioClient = nullptr;
+            hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);
+            pDevice->Release();
+            pDevice = nullptr;
+            if (FAILED(hr) || !pAudioClient) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        // Physical capture device (no loopback flag). Ask WASAPI to resample to match the network format.
-        REFERENCE_TIME hnsRequestedDuration = 1000000; // 100ms buffer
-        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, hnsRequestedDuration, 0, pTargetWaveFormat, nullptr);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] MicCaptureThread: IAudioClient Initialize failed.");
-            pAudioClient->Release();
-            delete pTargetWaveFormat;
-            return;
-        }
+            WAVEFORMATEX* pTargetWaveFormat = new WAVEFORMATEX();
+            pTargetWaveFormat->wFormatTag = (targetFormat.bitDepth == 32) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+            pTargetWaveFormat->nChannels = targetFormat.channels;
+            pTargetWaveFormat->nSamplesPerSec = targetFormat.sampleRate;
+            pTargetWaveFormat->wBitsPerSample = targetFormat.bitDepth;
+            pTargetWaveFormat->nBlockAlign = (pTargetWaveFormat->nChannels * pTargetWaveFormat->wBitsPerSample) / 8;
+            pTargetWaveFormat->nAvgBytesPerSec = pTargetWaveFormat->nSamplesPerSec * pTargetWaveFormat->nBlockAlign;
+            pTargetWaveFormat->cbSize = 0;
 
-        IAudioCaptureClient* pCaptureClient = nullptr;
-        hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
-        if (FAILED(hr)) {
-            pAudioClient->Release();
-            delete pTargetWaveFormat;
-            return;
-        }
+            // Physical capture device (no loopback flag). Ask WASAPI to resample to match the network format.
+            REFERENCE_TIME hnsRequestedDuration = 1000000; // 100ms buffer
+            hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, hnsRequestedDuration, 0, pTargetWaveFormat, nullptr);
+            if (FAILED(hr)) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] MicCaptureThread: IAudioClient Initialize failed (0x%08X). Retrying...", hr);
+                pAudioClient->Release();
+                delete pTargetWaveFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        hr = pAudioClient->Start();
-        if (FAILED(hr)) {
+            IAudioCaptureClient* pCaptureClient = nullptr;
+            hr = pAudioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
+            if (FAILED(hr) || !pCaptureClient) {
+                pAudioClient->Release();
+                delete pTargetWaveFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            hr = pAudioClient->Start();
+            if (FAILED(hr)) {
+                pCaptureClient->Release();
+                pAudioClient->Release();
+                delete pTargetWaveFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            DWORD sleepTimeMs = 10;
+            if (State::globalDebugMode) UI::LogDebug("[Audio] Server Microphone broadcast started (100ms buffer, 10ms poll).");
+
+            bool deviceInvalidated = false;
+            while (g_isServerMicRunning && !deviceInvalidated) {
+                UINT32 packetLength = 0;
+                hr = pCaptureClient->GetNextPacketSize(&packetLength);
+                if (FAILED(hr)) {
+                    if (State::globalDebugMode) UI::LogDebug("[Audio] MicCaptureThread: Device invalidated (0x%08X). Recovering...", hr);
+                    deviceInvalidated = true;
+                    break;
+                }
+
+                // Drain the buffer entirely to prevent drift
+                while (packetLength > 0) {
+                    BYTE* pData = nullptr;
+                    UINT32 numFramesAvailable = 0;
+                    DWORD flags = 0;
+
+                    hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr);
+                    if (SUCCEEDED(hr)) {
+                        UINT32 dataSize = numFramesAvailable * pTargetWaveFormat->nBlockAlign;
+                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                            static thread_local std::vector<BYTE> silenceBuffer;
+                            if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
+                            else std::memset(silenceBuffer.data(), 0, dataSize);
+                            
+                            Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, silenceBuffer.data(), dataSize);
+                        } else {
+                            Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, pData, dataSize);
+                        }
+                        pCaptureClient->ReleaseBuffer(numFramesAvailable);
+                    } else {
+                        if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_RESOURCES_INVALIDATED) {
+                            deviceInvalidated = true;
+                        }
+                        break;
+                    }
+
+                    if (FAILED(pCaptureClient->GetNextPacketSize(&packetLength))) {
+                        deviceInvalidated = true;
+                        break;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
+            }
+
+            pAudioClient->Stop();
             pCaptureClient->Release();
             pAudioClient->Release();
             delete pTargetWaveFormat;
-            return;
-        }
 
-        DWORD sleepTimeMs = 10;
-
-        if (State::globalDebugMode) UI::LogDebug("[Audio] Server Microphone broadcast started (100ms buffer, 10ms poll).");
-
-        while (g_isServerMicRunning) {
-            UINT32 packetLength = 0;
-            // Drain the buffer entirely to prevent drift
-            while (SUCCEEDED(pCaptureClient->GetNextPacketSize(&packetLength)) && packetLength > 0) {
-                BYTE* pData;
-                UINT32 numFramesAvailable;
-                DWORD flags;
-
-                hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr);
-                if (SUCCEEDED(hr)) {
-                    UINT32 dataSize = numFramesAvailable * pTargetWaveFormat->nBlockAlign;
-                    if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                        static thread_local std::vector<BYTE> silenceBuffer;
-                        if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
-                        else std::memset(silenceBuffer.data(), 0, dataSize);
-                        
-                        Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, silenceBuffer.data(), dataSize);
-                    } else {
-                        Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, pData, dataSize);
-                    }
-                    pCaptureClient->ReleaseBuffer(numFramesAvailable);
-                } else {
-                    break;
-                }
+            if (deviceInvalidated && g_isServerMicRunning) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] MicCaptureThread: Microphone device lost. Re-acquiring in 500ms...");
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
         }
 
-        pAudioClient->Stop();
-        pCaptureClient->Release();
-        pAudioClient->Release();
-        delete pTargetWaveFormat;
         if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
-
         if (State::globalDebugMode) UI::LogDebug("[Audio] Server Microphone broadcast stopped.");
     }
 
@@ -878,7 +1101,9 @@ namespace Audio {
             if (State::globalDebugMode) UI::LogDebug("[Audio] Cannot start mic broadcast: Could not get target format.");
             return;
         }
-        
+        if (g_serverMicThread.joinable()) {
+            g_serverMicThread.join();
+        }
         g_isServerMicRunning = true;
         g_serverMicThread = std::thread(ServerMicCaptureThreadLoop, format);
     }
@@ -946,166 +1171,205 @@ namespace Audio {
 
     /**
      * @brief Plays the incoming microphone stream into the target device.
+     * Incorporates a self-healing device recovery loop to survive system sleep/standby
+     * or Virtual Audio Cable driver restarts.
+     * @param sourceFormat The format of the incoming microphone stream.
+     * @return void
      */
     void ClientMicRenderThreadLoop(AudioFormat sourceFormat) {
         CoInitRAII coInit;
         // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
         HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "ClientMicRender");
 
-        IMMDevice* pDevice = nullptr;
-        HRESULT hr = GetAudioDevice(&pDevice);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: Failed to find target audio device.");
-            return;
-        }
+        while (g_isClientMicRunning) {
+            IMMDevice* pDevice = nullptr;
+            HRESULT hr = GetAudioDevice(&pDevice);
+            if (FAILED(hr) || !pDevice) {
+                if (State::globalDebugMode) {
+                    static uint64_t lastCableLog = 0;
+                    uint64_t now = GetTickCount64();
+                    if (now - lastCableLog > 3000) {
+                        UI::LogDebug("[Audio] ClientMicRender: Waiting for target virtual cable device...");
+                        lastCableLog = now;
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        IAudioClient* pAudioClient = nullptr;
-        hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);
-        pDevice->Release();
-        if (FAILED(hr)) return;
+            IAudioClient* pAudioClient = nullptr;
+            hr = pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&pAudioClient);
+            pDevice->Release();
+            pDevice = nullptr;
+            if (FAILED(hr) || !pAudioClient) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        WAVEFORMATEX* pSourceFormat = new WAVEFORMATEX();
-        pSourceFormat->wFormatTag = (sourceFormat.bitDepth == 32) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
-        pSourceFormat->nChannels = sourceFormat.channels;
-        pSourceFormat->nSamplesPerSec = sourceFormat.sampleRate;
-        pSourceFormat->wBitsPerSample = sourceFormat.bitDepth;
-        pSourceFormat->nBlockAlign = (sourceFormat.channels * sourceFormat.bitDepth) / 8;
-        pSourceFormat->nAvgBytesPerSec = pSourceFormat->nSamplesPerSec * pSourceFormat->nBlockAlign;
-        pSourceFormat->cbSize = 0;
+            WAVEFORMATEX* pSourceFormat = new WAVEFORMATEX();
+            pSourceFormat->wFormatTag = (sourceFormat.bitDepth == 32) ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM;
+            pSourceFormat->nChannels = sourceFormat.channels;
+            pSourceFormat->nSamplesPerSec = sourceFormat.sampleRate;
+            pSourceFormat->wBitsPerSample = sourceFormat.bitDepth;
+            pSourceFormat->nBlockAlign = (sourceFormat.channels * sourceFormat.bitDepth) / 8;
+            pSourceFormat->nAvgBytesPerSec = pSourceFormat->nSamplesPerSec * pSourceFormat->nBlockAlign;
+            pSourceFormat->cbSize = 0;
 
-        REFERENCE_TIME hnsRequestedDuration = 1000000; // 100ms buffer
-        hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, hnsRequestedDuration, 0, pSourceFormat, nullptr);
-        if (FAILED(hr)) {
-            if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: Initialize failed. AUTOCONVERTPCM unsupported?");
-            pAudioClient->Release();
-            delete pSourceFormat;
-            return;
-        }
+            REFERENCE_TIME hnsRequestedDuration = 1000000; // 100ms buffer
+            hr = pAudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, hnsRequestedDuration, 0, pSourceFormat, nullptr);
+            if (FAILED(hr)) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: Initialize failed (0x%08X). Retrying...", hr);
+                pAudioClient->Release();
+                delete pSourceFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        UINT32 bufferFrameCount;
-        pAudioClient->GetBufferSize(&bufferFrameCount);
+            UINT32 bufferFrameCount = 0;
+            pAudioClient->GetBufferSize(&bufferFrameCount);
 
-        IAudioRenderClient* pRenderClient = nullptr;
-        hr = pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&pRenderClient);
-        if (FAILED(hr)) {
-            pAudioClient->Release();
-            delete pSourceFormat;
-            return;
-        }
+            IAudioRenderClient* pRenderClient = nullptr;
+            hr = pAudioClient->GetService(__uuidof(IAudioRenderClient), (void**)&pRenderClient);
+            if (FAILED(hr) || !pRenderClient) {
+                pAudioClient->Release();
+                delete pSourceFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
 
-        hr = pAudioClient->Start();
-        if (FAILED(hr)) {
+            hr = pAudioClient->Start();
+            if (FAILED(hr)) {
+                pRenderClient->Release();
+                pAudioClient->Release();
+                delete pSourceFormat;
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+
+            DWORD sleepTimeMs = 10;
+            if (State::globalDebugMode) UI::LogDebug("[Audio] Client Microphone Receiver started (100ms buffer, 10ms poll).");
+
+            bool deviceInvalidated = false;
+            while (g_isClientMicRunning && !deviceInvalidated) {
+                UINT32 numPaddingFrames = 0;
+                HRESULT hrPad = pAudioClient->GetCurrentPadding(&numPaddingFrames);
+                if (FAILED(hrPad)) {
+                    // Device invalidated (sleep/wake, driver update, device unplugged).
+                    if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: Device invalidated (0x%08X). Recovering...", hrPad);
+                    deviceInvalidated = true;
+                    break;
+                }
+                UINT32 numFramesAvailable = bufferFrameCount - numPaddingFrames;
+
+                if (numFramesAvailable > 0) {
+                    BYTE* pData = nullptr;
+                    hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
+                    if (FAILED(hr)) {
+                        if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: GetBuffer failed (0x%08X). Recovering...", hr);
+                        deviceInvalidated = true;
+                        break;
+                    }
+                    {
+                        size_t bytesToProcess = numFramesAvailable * pSourceFormat->nBlockAlign;
+                        bool writeSilence = false;
+                        bool justStartedBuffering = false;
+
+                        {
+                            std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
+                            size_t availableBytes = g_clientMicQueue.buffer.Size();
+                            
+                            if (g_clientMicQueue.isBuffering) {
+                                writeSilence = true;
+                            } else if (availableBytes == 0) {
+                                g_clientMicQueue.starvationCount++;
+                                // 50 consecutive empty polls (~500ms) before re-buffering (same as server render)
+                                if (g_clientMicQueue.starvationCount > 50) {
+                                    g_clientMicQueue.isBuffering = true;
+                                    g_clientMicQueue.starvationCount = 0;
+                                    writeSilence = true;
+                                    justStartedBuffering = true;
+                                } else {
+                                    writeSilence = true; // Pad with silence temporarily
+                                }
+                            } else {
+                                g_clientMicQueue.starvationCount = 0;
+                                // Partial fill logic to prevent catastrophic 50ms rebuffering pauses
+                                size_t bytesRead = (std::min)(availableBytes, bytesToProcess);
+                                // Align to frame boundaries
+                                size_t frameSize = pSourceFormat->nBlockAlign;
+                                bytesRead = bytesRead - (bytesRead % frameSize);
+                                
+                                if (bytesRead > 0) {
+                                    g_clientMicQueue.buffer.Pop(pData, bytesRead);
+                                    if (bytesRead < bytesToProcess) {
+                                        // Zero out the remaining buffer
+                                        std::memset(pData + bytesRead, 0, bytesToProcess - bytesRead);
+                                    }
+                                } else {
+                                    writeSilence = true;
+                                }
+                            }
+                        }
+
+                        if (justStartedBuffering && State::globalDebugMode) {
+                            static uint64_t lastMicStarvationLog = 0;
+                            uint64_t now = GetTickCount64();
+                            if (now - lastMicStarvationLog > 5000) {
+                                UI::LogDebug("[Audio] Mic starvation! (50 consecutive drops). Re-buffering.");
+                                lastMicStarvationLog = now;
+                            }
+                        }
+
+                        // Apply fade-in ramp when exiting buffering mode to eliminate clicks
+                        if (g_clientMicQueue.wasBuffering && !writeSilence) {
+                            size_t frameSize = pSourceFormat->nBlockAlign;
+                            size_t totalSamples = bytesToProcess / (pSourceFormat->wBitsPerSample / 8);
+                            size_t rampSamples = (std::min)((size_t)64, totalSamples);
+                            if (pSourceFormat->wBitsPerSample == 32) {
+                                float* p = reinterpret_cast<float*>(pData);
+                                for (size_t s = 0; s < rampSamples; ++s) {
+                                    p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
+                                }
+                            } else if (pSourceFormat->wBitsPerSample == 16) {
+                                int16_t* p = reinterpret_cast<int16_t*>(pData);
+                                for (size_t s = 0; s < rampSamples; ++s) {
+                                    p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
+                                }
+                            }
+                            g_clientMicQueue.wasBuffering = false;
+                        }
+
+                        if (writeSilence) {
+                            memset(pData, 0, bytesToProcess);
+                        }
+
+                        hr = pRenderClient->ReleaseBuffer(numFramesAvailable, writeSilence ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+                        if (FAILED(hr)) {
+                            deviceInvalidated = true;
+                            break;
+                        }
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
+            }
+
+            pAudioClient->Stop();
             pRenderClient->Release();
             pAudioClient->Release();
             delete pSourceFormat;
-            return;
-        }
 
-        DWORD sleepTimeMs = 10;
-
-        if (State::globalDebugMode) UI::LogDebug("[Audio] Client Microphone Receiver started (100ms buffer, 10ms poll).");
-
-        while (g_isClientMicRunning) {
-            UINT32 numPaddingFrames;
-            HRESULT hrPad = pAudioClient->GetCurrentPadding(&numPaddingFrames);
-            if (FAILED(hrPad)) {
-                // Device invalidated (sleep/wake, driver update, device unplugged).
-                if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: Device invalidated (0x%08X). Exiting.", hrPad);
-                break;
-            }
-            UINT32 numFramesAvailable = bufferFrameCount - numPaddingFrames;
-
-            if (numFramesAvailable > 0) {
-                BYTE* pData;
-                hr = pRenderClient->GetBuffer(numFramesAvailable, &pData);
-                if (FAILED(hr)) {
-                    if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: GetBuffer failed (0x%08X). Exiting.", hr);
-                    break;
-                }
+            if (deviceInvalidated && g_isClientMicRunning) {
+                if (State::globalDebugMode) UI::LogDebug("[Audio] ClientMicRender: Target device lost. Re-acquiring in 500ms...");
                 {
-                    size_t bytesToProcess = numFramesAvailable * pSourceFormat->nBlockAlign;
-                    bool writeSilence = false;
-                    bool justStartedBuffering = false;
-
-                    {
-                        std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
-                        size_t availableBytes = g_clientMicQueue.buffer.Size();
-                        
-                        if (g_clientMicQueue.isBuffering) {
-                            writeSilence = true;
-                        } else if (availableBytes == 0) {
-                            g_clientMicQueue.starvationCount++;
-                            // 50 consecutive empty polls (~500ms) before re-buffering (same as server render)
-                            if (g_clientMicQueue.starvationCount > 50) {
-                                g_clientMicQueue.isBuffering = true;
-                                g_clientMicQueue.starvationCount = 0;
-                                writeSilence = true;
-                                justStartedBuffering = true;
-                            } else {
-                                writeSilence = true; // Pad with silence temporarily
-                            }
-                        } else {
-                            g_clientMicQueue.starvationCount = 0;
-                            // Partial fill logic to prevent catastrophic 50ms rebuffering pauses
-                            size_t bytesRead = (std::min)(availableBytes, bytesToProcess);
-                            // Align to frame boundaries
-                            size_t frameSize = pSourceFormat->nBlockAlign;
-                            bytesRead = bytesRead - (bytesRead % frameSize);
-                            
-                            if (bytesRead > 0) {
-                                g_clientMicQueue.buffer.Pop(pData, bytesRead);
-                                if (bytesRead < bytesToProcess) {
-                                    // Zero out the remaining buffer
-                                    std::memset(pData + bytesRead, 0, bytesToProcess - bytesRead);
-                                }
-                            } else {
-                                writeSilence = true;
-                            }
-                        }
-                    }
-
-                    if (justStartedBuffering && State::globalDebugMode) {
-                        static uint64_t lastMicStarvationLog = 0;
-                        uint64_t now = GetTickCount64();
-                        if (now - lastMicStarvationLog > 5000) {
-                            UI::LogDebug("[Audio] Mic starvation! (50 consecutive drops). Re-buffering.");
-                            lastMicStarvationLog = now;
-                        }
-                    }
-
-                    // Apply fade-in ramp when exiting buffering mode to eliminate clicks
-                    if (g_clientMicQueue.wasBuffering && !writeSilence) {
-                        size_t frameSize = pSourceFormat->nBlockAlign;
-                        size_t totalSamples = bytesToProcess / (pSourceFormat->wBitsPerSample / 8);
-                        size_t rampSamples = (std::min)((size_t)64, totalSamples);
-                        if (pSourceFormat->wBitsPerSample == 32) {
-                            float* p = reinterpret_cast<float*>(pData);
-                            for (size_t s = 0; s < rampSamples; ++s) {
-                                p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
-                            }
-                        } else if (pSourceFormat->wBitsPerSample == 16) {
-                            int16_t* p = reinterpret_cast<int16_t*>(pData);
-                            for (size_t s = 0; s < rampSamples; ++s) {
-                                p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
-                            }
-                        }
-                        g_clientMicQueue.wasBuffering = false;
-                    }
-
-                    if (writeSilence) {
-                        memset(pData, 0, bytesToProcess);
-                    }
-
-                    pRenderClient->ReleaseBuffer(numFramesAvailable, writeSilence ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+                    std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
+                    g_clientMicQueue.buffer.Clear();
+                    g_clientMicQueue.isBuffering = true;
+                    g_clientMicQueue.starvationCount = 0;
                 }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
         }
 
-        pAudioClient->Stop();
-        pRenderClient->Release();
-        pAudioClient->Release();
-        delete pSourceFormat;
         if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (State::globalDebugMode) UI::LogDebug("[Audio] Client Microphone Receiver stopped.");
     }
@@ -1120,6 +1384,9 @@ namespace Audio {
         if (!Network::GetServerAudioFormat(serverFormat)) {
             if (State::globalDebugMode) UI::LogDebug("[Audio] Cannot start mic receiver: Server audio format not yet received.");
             return;
+        }
+        if (g_clientMicThread.joinable()) {
+            g_clientMicThread.join();
         }
         g_isClientMicRunning = true;
         
@@ -1275,6 +1542,39 @@ namespace Audio {
         std::unique_lock<std::shared_mutex> mapLock(g_queuesMutex);
         if (g_clientAudioQueues.count(clientIdentifier)) {
             g_clientAudioQueues.erase(clientIdentifier);
+        }
+    }
+
+    /**
+     * @brief Notifies the audio subsystem that the system resumed from sleep or hibernate.
+     * Unblocks the server render loop, purges stale audio/mic buffers, and triggers device re-acquisition.
+     * @return void
+     */
+    void NotifySystemResumed() {
+        if (State::globalDebugMode) UI::LogDebug("[Audio] System resumed from sleep/standby: Signaling audio recovery.");
+
+        // Instantly unblock the server render loop so it does not wait on timeouts
+        if (g_hRenderEvent) {
+            SetEvent(g_hRenderEvent);
+        }
+
+        // Purge stale audio queues from before sleep to prevent a delayed audio burst on wake
+        {
+            std::shared_lock<std::shared_mutex> mapLock(g_queuesMutex);
+            for (auto& pair : g_clientAudioQueues) {
+                std::lock_guard<std::mutex> qLock(pair.second->mtx);
+                pair.second->buffer.Clear();
+                pair.second->isBuffering = true;
+                pair.second->starvationCount = 0;
+            }
+        }
+
+        // Purge client mic queue
+        {
+            std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
+            g_clientMicQueue.buffer.Clear();
+            g_clientMicQueue.isBuffering = true;
+            g_clientMicQueue.starvationCount = 0;
         }
     }
 }

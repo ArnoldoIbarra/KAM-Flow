@@ -466,6 +466,9 @@ namespace UI {
                         // penalized with escalating delays.
                         Network::NotifySystemResumed();
                     }
+
+                    // Recover audio subsystem from WASAPI device invalidation and purge pre-sleep buffers
+                    Audio::NotifySystemResumed();
                 }
                 return TRUE;
             case WM_DESTROY:

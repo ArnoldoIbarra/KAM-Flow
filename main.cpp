@@ -16,7 +16,10 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <iostream>
+
+#pragma comment(lib, "winmm.lib")
 #include <string>
 #include <thread>
 #include <atomic>
@@ -78,12 +81,29 @@ void KVMHookThreadLoop() {
 }
 
 /**
+ * @brief RAII guard to elevate the Windows system timer resolution to 1ms.
+ * Guarantees timeEndPeriod(1) is safely invoked on all exit paths.
+ */
+struct TimerResolutionGuard {
+    TimerResolutionGuard() {
+        timeBeginPeriod(1);
+    }
+    ~TimerResolutionGuard() {
+        timeEndPeriod(1);
+    }
+};
+
+/**
  * @brief Main entry point for the application.
  * @param argc The number of command-line arguments.
  * @param argv The array of command-line argument strings.
  * @return int Status code (0 for success).
  */
 int main(int argc, char* argv[]) {
+    // Elevate system timer resolution to 1ms (1000 Hz) to eliminate thread scheduling jitter
+    // and avoid coarse 15.6ms sleep quantization during high-frequency network/mouse streaming.
+    TimerResolutionGuard timerGuard;
+
     // Load persisted settings from kamflow.ini (This naturally manages initial console state)
     Config::LoadConfig();
 
@@ -96,6 +116,7 @@ int main(int argc, char* argv[]) {
     } else {
         if (State::globalDebugMode) UI::LogDebug("[System] Process elevated to HIGH_PRIORITY_CLASS.");
     }
+    if (State::globalDebugMode) UI::LogDebug("[System] System Timer Resolution elevated to 1ms (High Precision).");
 
     // === SINGLE INSTANCE ENFORCEMENT ===
     // Always check, regardless of debug mode. The previous code skipped this when

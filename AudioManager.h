@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Audio Manager Interface
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /// @file AudioManager.h
@@ -67,4 +67,7 @@ namespace Audio {
 
     /// Called by the network layer to purge a disconnected or disabled client's audio buffer.
     void ClearClientAudioQueue(uintptr_t clientIdentifier);
+
+    /// Notifies the audio subsystem that the system resumed from sleep or hibernate.
+    void NotifySystemResumed();
 }
