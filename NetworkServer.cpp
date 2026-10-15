@@ -627,8 +627,15 @@ void AcceptClientsLoop() {
         }
       } else if (header.magic != PACKET_MAGIC) {
         if (State::globalDebugMode) {
-          UI::LogDebug("[Network Server] Auth failed for %s:%d: bad magic 0x%08X (expected 0x%08X).",
-                       clientIpStr, clientPort, header.magic, PACKET_MAGIC);
+          // Detect common HTTP probes (e.g., 0x20544547 is "GET ", 0x54534F50 is "POST") on port 8080
+          // and log them cleanly without alarming "Auth failed" messages.
+          if (header.magic == 0x20544547 || header.magic == 0x54534F50) {
+            UI::LogDebug("[Network Server] HTTP probe ignored from %s:%d (received HTTP verb on port 8080).",
+                         clientIpStr, clientPort);
+          } else {
+            UI::LogDebug("[Network Server] Auth failed for %s:%d: bad magic 0x%08X (expected 0x%08X).",
+                         clientIpStr, clientPort, header.magic, PACKET_MAGIC);
+          }
         }
       } else if (header.type != MessageType::EVENT_AUTH) {
         if (State::globalDebugMode) {

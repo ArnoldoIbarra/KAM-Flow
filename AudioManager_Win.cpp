@@ -169,6 +169,7 @@ namespace Audio {
         std::mutex mtx;
         bool isBuffering = true;
         bool wasBuffering = false;  // Tracks previous buffering state for silence→audio fade-in
+        bool needsFadeIn = false;   // Signals fade-in ramp after partial fills, silence, or underflows
         int starvationCount = 0;
     };
     std::map<uintptr_t, std::shared_ptr<ClientAudioQueue>> g_clientAudioQueues;
@@ -412,11 +413,11 @@ namespace Audio {
                 continue;
             }
 
-            // With a 100ms WASAPI buffer, polling every 10ms is completely immune 
-            // to Windows' 15.6ms timer resolution worst-case limits.
-            DWORD sleepTimeMs = 10;
+            // Fast loopback polling period: Polling every 3ms with our enforced 1ms Windows timer resolution
+            // prevents beating against WASAPI's 10ms audio engine periods and eliminates bursty packet delivery.
+            DWORD sleepTimeMs = 3;
 
-            if (State::globalDebugMode) UI::LogDebug("[Audio] Loopback capture started. Jitter-immune 10ms Polling active.");
+            if (State::globalDebugMode) UI::LogDebug("[Audio] Loopback capture started. Low-jitter 3ms Polling active.");
 
             // 7. Main capture streaming loop for this device
             bool deviceInvalidated = false;
@@ -434,19 +435,16 @@ namespace Audio {
                 }
                 
                 if (packetLength == 0) {
-                    // When no application is rendering audio on the client, WASAPI Loopback returns packetLength == 0.
-                    // To prevent fake silence from injecting into active video/media streams during transient
-                    // 10ms-20ms audio engine buffer gaps (which previously caused server-side jitter buffer overruns
-                    // and audio artifacts), we dynamically compute the idle threshold based on the user's Jitter Buffer setting.
-                    int idleThresholdMs = (std::clamp)(State::audioJitterBufferMs.load() / 2, 25, 60);
-
+                    // When no application is rendering audio on the client, or during natural pauses
+                    // in media/dialogue, WASAPI Loopback returns packetLength == 0.
+                    // An active audio engine produces buffers every 10ms. If no packet is received for
+                    // 12ms (just over 1 buffer period), the stream is idle. To maintain clock sync with
+                    // the server and prevent draining the server's jitter buffer reservoir during video speech
+                    // pauses, we pace 10ms of silence every 10ms.
                     auto now = std::chrono::steady_clock::now();
                     auto idleDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRealPacketTime).count();
 
-                    if (idleDurationMs >= idleThresholdMs) {
-                        // True system silence: transmit a 10ms silent buffer of the target format paced every 10ms.
-                        // This maintains clock synchronization with the server's audio renderer (preventing starvation/re-buffering)
-                        // and keeps modern Wi-Fi 6/7 adapters in high-throughput active mode to prevent mouse stuttering.
+                    if (idleDurationMs >= 12) {
                         auto silenceElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastSilenceSendTime).count();
                         if (silenceElapsedMs >= 10) {
                             static thread_local std::vector<BYTE> idleSilenceBuffer;
@@ -781,21 +779,21 @@ namespace Audio {
                                 // Still in initial buffering mode - play silence until jitter buffer fills
                                 isBuffering = true;
                             } else if (availableBytes == 0) {
-                                // Instead of instantly pausing for 50ms due to microsecond clock drift,
-                                // we pad with 5ms of silence. We only rebuild the jitter buffer if it's a true network drop.
                                 queue->starvationCount++;
-                                // 50 consecutive empty polls (~500ms at 10ms/callback) before triggering re-buffer.
-                                if (queue->starvationCount > 50) {
+                                queue->needsFadeIn = true; // Signal smooth fade-in ramp when audio resumes
+
+                                // Fast-recovery threshold: 3 consecutive empty polls (30ms) triggers clean
+                                // re-buffering. This prevents running permanently on an exhausted (0ms) buffer
+                                // where every packet arrival jitter causes clicks.
+                                if (queue->starvationCount >= 3) {
                                     queue->isBuffering = true;
                                     queue->starvationCount = 0;
                                     isBuffering = true;
                                     if (State::globalDebugMode) {
-                                        // Rate-limit to once per 5 seconds to prevent flooding
-                                        // the debug log during sustained network issues.
                                         static uint64_t lastStarvationLog = 0;
                                         uint64_t now = GetTickCount64();
                                         if (now - lastStarvationLog > 5000) {
-                                            UI::LogDebug("[Audio] Starvation! (Requested %zu, Have 0). Re-buffering.", bytesToProcess);
+                                            UI::LogDebug("[Audio] Buffer depleted: Re-buffering to %dms target.", State::audioJitterBufferMs.load());
                                             lastStarvationLog = now;
                                         }
                                     }
@@ -812,9 +810,37 @@ namespace Audio {
                                     if (linearBuffer.size() < bytesToProcess) {
                                         linearBuffer.resize(bytesToProcess);
                                     }
-                                    // Zero the entire extraction buffer first so the unfilled tail is silence
+                                    // Zero the entire extraction buffer first so any unfilled tail is silence
                                     memset(linearBuffer.data(), 0, bytesToProcess);
                                     queue->buffer.Pop(linearBuffer.data(), bytesRead);
+
+                                    // If this was a partial fill, apply a linear fade-out ramp to the end
+                                    // of the extracted audio to prevent an instantaneous step discontinuity (click)
+                                    if (bytesRead < bytesToProcess) {
+                                        size_t framesRead = bytesRead / bytesPerFrame;
+                                        size_t fadeOutFrames = (std::min)((size_t)64, framesRead);
+                                        if (fadeOutFrames > 0) {
+                                            size_t startFrame = framesRead - fadeOutFrames;
+                                            if (format.bitDepth == 32) {
+                                                float* p = reinterpret_cast<float*>(linearBuffer.data());
+                                                for (size_t f = 0; f < fadeOutFrames; ++f) {
+                                                    float factor = static_cast<float>(fadeOutFrames - f) / static_cast<float>(fadeOutFrames);
+                                                    for (size_t c = 0; c < format.channels; ++c) {
+                                                        p[(startFrame + f) * format.channels + c] *= factor;
+                                                    }
+                                                }
+                                            } else if (format.bitDepth == 16) {
+                                                int16_t* p = reinterpret_cast<int16_t*>(linearBuffer.data());
+                                                for (size_t f = 0; f < fadeOutFrames; ++f) {
+                                                    float factor = static_cast<float>(fadeOutFrames - f) / static_cast<float>(fadeOutFrames);
+                                                    for (size_t c = 0; c < format.channels; ++c) {
+                                                        p[(startFrame + f) * format.channels + c] = static_cast<int16_t>(p[(startFrame + f) * format.channels + c] * factor);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        queue->needsFadeIn = true; // Signal fade-in for the next callback
+                                    }
                                 }
                             }
                         } // Mutex instantly released! Network thread is free to push new data.
@@ -825,22 +851,32 @@ namespace Audio {
 
                         if (bytesRead == 0) continue;
 
-                        // Apply a 64-sample linear fade-in ramp to eliminate the silence→audio click.
-                        // This smooths the transition when the buffer resumes after starvation.
-                        if (queue->wasBuffering && bytesRead > 0) {
-                            size_t rampSamples = (std::min)((size_t)64, bytesRead / (format.bitDepth / 8));
-                            if (format.bitDepth == 32) {
-                                float* p = reinterpret_cast<float*>(linearBuffer.data());
-                                for (size_t s = 0; s < rampSamples; ++s) {
-                                    p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
-                                }
-                            } else if (format.bitDepth == 16) {
-                                int16_t* p = reinterpret_cast<int16_t*>(linearBuffer.data());
-                                for (size_t s = 0; s < rampSamples; ++s) {
-                                    p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
+                        // Apply a 64-frame linear fade-in ramp across all channels to eliminate silence→audio clicks.
+                        // Smooths the waveform when resuming after starvation, re-buffering, or partial fills.
+                        if ((queue->wasBuffering || queue->needsFadeIn) && bytesRead > 0) {
+                            size_t framesRead = bytesRead / bytesPerFrame;
+                            size_t fadeInFrames = (std::min)((size_t)64, framesRead);
+                            if (fadeInFrames > 0) {
+                                if (format.bitDepth == 32) {
+                                    float* p = reinterpret_cast<float*>(linearBuffer.data());
+                                    for (size_t f = 0; f < fadeInFrames; ++f) {
+                                        float factor = static_cast<float>(f) / static_cast<float>(fadeInFrames);
+                                        for (size_t c = 0; c < format.channels; ++c) {
+                                            p[f * format.channels + c] *= factor;
+                                        }
+                                    }
+                                } else if (format.bitDepth == 16) {
+                                    int16_t* p = reinterpret_cast<int16_t*>(linearBuffer.data());
+                                    for (size_t f = 0; f < fadeInFrames; ++f) {
+                                        float factor = static_cast<float>(f) / static_cast<float>(fadeInFrames);
+                                        for (size_t c = 0; c < format.channels; ++c) {
+                                            p[f * format.channels + c] = static_cast<int16_t>(p[f * format.channels + c] * factor);
+                                        }
+                                    }
                                 }
                             }
                             queue->wasBuffering = false;
+                            queue->needsFadeIn = false;
                         }
 
                         // Log partial fills (only when significant data is missing, rate-limited)
@@ -1282,28 +1318,50 @@ namespace Audio {
                                 writeSilence = true;
                             } else if (availableBytes == 0) {
                                 g_clientMicQueue.starvationCount++;
-                                // 50 consecutive empty polls (~500ms) before re-buffering (same as server render)
-                                if (g_clientMicQueue.starvationCount > 50) {
+                                g_clientMicQueue.needsFadeIn = true;
+                                // Fast recovery: 3 consecutive empty polls (~30ms) triggers re-buffering
+                                if (g_clientMicQueue.starvationCount >= 3) {
                                     g_clientMicQueue.isBuffering = true;
                                     g_clientMicQueue.starvationCount = 0;
                                     writeSilence = true;
                                     justStartedBuffering = true;
                                 } else {
-                                    writeSilence = true; // Pad with silence temporarily
+                                    writeSilence = true;
                                 }
                             } else {
                                 g_clientMicQueue.starvationCount = 0;
-                                // Partial fill logic to prevent catastrophic 50ms rebuffering pauses
                                 size_t bytesRead = (std::min)(availableBytes, bytesToProcess);
-                                // Align to frame boundaries
                                 size_t frameSize = pSourceFormat->nBlockAlign;
                                 bytesRead = bytesRead - (bytesRead % frameSize);
                                 
                                 if (bytesRead > 0) {
                                     g_clientMicQueue.buffer.Pop(pData, bytesRead);
                                     if (bytesRead < bytesToProcess) {
-                                        // Zero out the remaining buffer
+                                        // Zero out the remaining buffer and apply fade-out ramp to avoid clicks
                                         std::memset(pData + bytesRead, 0, bytesToProcess - bytesRead);
+                                        size_t framesRead = bytesRead / frameSize;
+                                        size_t fadeOutFrames = (std::min)((size_t)64, framesRead);
+                                        if (fadeOutFrames > 0) {
+                                            size_t startFrame = framesRead - fadeOutFrames;
+                                            if (pSourceFormat->wBitsPerSample == 32) {
+                                                float* p = reinterpret_cast<float*>(pData);
+                                                for (size_t f = 0; f < fadeOutFrames; ++f) {
+                                                    float factor = static_cast<float>(fadeOutFrames - f) / static_cast<float>(fadeOutFrames);
+                                                    for (size_t c = 0; c < pSourceFormat->nChannels; ++c) {
+                                                        p[(startFrame + f) * pSourceFormat->nChannels + c] *= factor;
+                                                    }
+                                                }
+                                            } else if (pSourceFormat->wBitsPerSample == 16) {
+                                                int16_t* p = reinterpret_cast<int16_t*>(pData);
+                                                for (size_t f = 0; f < fadeOutFrames; ++f) {
+                                                    float factor = static_cast<float>(fadeOutFrames - f) / static_cast<float>(fadeOutFrames);
+                                                    for (size_t c = 0; c < pSourceFormat->nChannels; ++c) {
+                                                        p[(startFrame + f) * pSourceFormat->nChannels + c] = static_cast<int16_t>(p[(startFrame + f) * pSourceFormat->nChannels + c] * factor);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        g_clientMicQueue.needsFadeIn = true;
                                     }
                                 } else {
                                     writeSilence = true;
@@ -1315,28 +1373,37 @@ namespace Audio {
                             static uint64_t lastMicStarvationLog = 0;
                             uint64_t now = GetTickCount64();
                             if (now - lastMicStarvationLog > 5000) {
-                                UI::LogDebug("[Audio] Mic starvation! (50 consecutive drops). Re-buffering.");
+                                UI::LogDebug("[Audio] Mic starvation recovery: Re-buffering stream.");
                                 lastMicStarvationLog = now;
                             }
                         }
 
-                        // Apply fade-in ramp when exiting buffering mode to eliminate clicks
-                        if (g_clientMicQueue.wasBuffering && !writeSilence) {
+                        // Apply fade-in ramp when exiting buffering mode or after dropout to eliminate clicks
+                        if ((g_clientMicQueue.wasBuffering || g_clientMicQueue.needsFadeIn) && !writeSilence) {
                             size_t frameSize = pSourceFormat->nBlockAlign;
-                            size_t totalSamples = bytesToProcess / (pSourceFormat->wBitsPerSample / 8);
-                            size_t rampSamples = (std::min)((size_t)64, totalSamples);
-                            if (pSourceFormat->wBitsPerSample == 32) {
-                                float* p = reinterpret_cast<float*>(pData);
-                                for (size_t s = 0; s < rampSamples; ++s) {
-                                    p[s] *= static_cast<float>(s) / static_cast<float>(rampSamples);
-                                }
-                            } else if (pSourceFormat->wBitsPerSample == 16) {
-                                int16_t* p = reinterpret_cast<int16_t*>(pData);
-                                for (size_t s = 0; s < rampSamples; ++s) {
-                                    p[s] = static_cast<int16_t>(p[s] * (static_cast<float>(s) / static_cast<float>(rampSamples)));
+                            size_t framesRead = bytesToProcess / frameSize;
+                            size_t fadeInFrames = (std::min)((size_t)64, framesRead);
+                            if (fadeInFrames > 0) {
+                                if (pSourceFormat->wBitsPerSample == 32) {
+                                    float* p = reinterpret_cast<float*>(pData);
+                                    for (size_t f = 0; f < fadeInFrames; ++f) {
+                                        float factor = static_cast<float>(f) / static_cast<float>(fadeInFrames);
+                                        for (size_t c = 0; c < pSourceFormat->nChannels; ++c) {
+                                            p[f * pSourceFormat->nChannels + c] *= factor;
+                                        }
+                                    }
+                                } else if (pSourceFormat->wBitsPerSample == 16) {
+                                    int16_t* p = reinterpret_cast<int16_t*>(pData);
+                                    for (size_t f = 0; f < fadeInFrames; ++f) {
+                                        float factor = static_cast<float>(f) / static_cast<float>(fadeInFrames);
+                                        for (size_t c = 0; c < pSourceFormat->nChannels; ++c) {
+                                            p[f * pSourceFormat->nChannels + c] = static_cast<int16_t>(p[f * pSourceFormat->nChannels + c] * factor);
+                                        }
+                                    }
                                 }
                             }
                             g_clientMicQueue.wasBuffering = false;
+                            g_clientMicQueue.needsFadeIn = false;
                         }
 
                         if (writeSilence) {
@@ -1565,6 +1632,7 @@ namespace Audio {
                 std::lock_guard<std::mutex> qLock(pair.second->mtx);
                 pair.second->buffer.Clear();
                 pair.second->isBuffering = true;
+                pair.second->needsFadeIn = false;
                 pair.second->starvationCount = 0;
             }
         }
@@ -1574,6 +1642,7 @@ namespace Audio {
             std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
             g_clientMicQueue.buffer.Clear();
             g_clientMicQueue.isBuffering = true;
+            g_clientMicQueue.needsFadeIn = false;
             g_clientMicQueue.starvationCount = 0;
         }
     }
