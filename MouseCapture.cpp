@@ -61,11 +61,18 @@ namespace Input {
 
     /// Coordinates where the mouse entered the boundary.
     POINT entryPoint = { 0, 0 };
-    /// Coordinates where the mouse is locked during Remote Mode.
+    /// Desired monitor-center re-anchoring target during Remote mode (never overwritten by GetCursorPos).
+    POINT anchorTarget = { 0, 0 };
+    /// Fallback OS cursor coordinates used only if GetCursorPos fails.
     POINT lockedPoint = { 0, 0 };
     
-    /// Flags indicating which edge was breached.
+    /// Flags indicating whether control has transitioned to a remote node.
     std::atomic<bool> isTransitionedOut{false};
+    /// Locks WH_MOUSE_LL into swallow-only mode while MouseNetworkThreadLoop executes RouteCursorTransition.
+    std::atomic<bool> g_transitionPending{false};
+    static_assert(std::atomic<bool>::is_always_lock_free);
+    /// Timestamp (GetTickCount64) of the last drift-triggered re-anchor (accessed exclusively on hook thread).
+    uint64_t g_lastDriftReanchorMs = 0;
 
     /// Sub-pixel mouse sensitivity fractional accumulators shared across remote move frames.
     std::atomic<float> fracX{0.0f};
@@ -77,11 +84,11 @@ namespace Input {
     const ULONG_PTR KAMFLOW_REANCHOR = 0x4B414D46; // "KAMF" in hex
 
     /**
-     * @brief Re-centers the OS cursor to lockedPoint using SendInput.
+     * @brief Re-centers the OS cursor to anchorTarget using SendInput.
      * Uses MOUSEEVENTF_ABSOLUTE with MOUSEEVENTF_VIRTUALDESKTOP for
-     * correct multi-monitor positioning. The LLMHF_INJECTED flag set by
-     * SendInput plus our dwExtraInfo signature allow the hook to filter
-     * the resulting phantom WM_MOUSEMOVE event.
+     * correct multi-monitor positioning. The dwExtraInfo signature (checked
+     * before LLMHF_INJECTED) allows the hook to track the actual re-anchored
+     * position cleanly without overwriting anchorTarget.
      * @return void
      */
     void ReanchorCursor() {
@@ -93,18 +100,13 @@ namespace Input {
 
         INPUT input = {};
         input.type = INPUT_MOUSE;
-        input.mi.dx = ((lockedPoint.x - vLeft) * 65536) / vWidth;
-        input.mi.dy = ((lockedPoint.y - vTop) * 65536) / vHeight;
+        input.mi.dx = ComputeAbsoluteVirtualCoord(anchorTarget.x, vLeft, vWidth);
+        input.mi.dy = ComputeAbsoluteVirtualCoord(anchorTarget.y, vTop, vHeight);
         input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESKTOP;
         input.mi.dwExtraInfo = KAMFLOW_REANCHOR;
         SendInput(1, &input, sizeof(INPUT));
 
-        // Sync lockedPoint to the actual pixel the cursor landed on. The
-        // ABSOLUTE coordinate mapping uses integer division (65536/screenSize)
-        // which can round the cursor to 1-2px off from lockedPoint. Since
-        // every frame computes delta as (ms->pt - lockedPoint), this small
-        // offset becomes a constant per-frame bias — causing the client
-        // cursor to drift upward/diagonally on every movement.
+        // Update fallback position without touching anchorTarget so target center never drifts.
         POINT actual;
         if (GetCursorPos(&actual)) {
             lockedPoint = actual;
@@ -119,8 +121,7 @@ namespace Input {
      * @return void
      */
     void HandleReturnControl(uint8_t entryEdge, float normalizedX, float normalizedY) {
-        if (isTransitionedOut) {
-            isTransitionedOut = false; 
+        if (isTransitionedOut.exchange(false, std::memory_order_acq_rel)) {
 
             HMONITOR hMon = MonitorFromPoint(entryPoint, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi = { sizeof(mi) };
@@ -185,12 +186,15 @@ namespace Input {
 
             if (pendingTr.active) {
                 if (!Network::RouteCursorTransition(0, 0, pendingTr.exitEdge, pendingTr.normX, pendingTr.normY)) {
-                    isTransitionedOut.store(false, std::memory_order_relaxed);
+                    isTransitionedOut.store(false, std::memory_order_release);
                     if (State::globalDebugMode) {
                         UI::LogDebug("[KVM] WARNING: RouteCursorTransition failed for exitEdge=%u; staying LOCAL.",
                                      pendingTr.exitEdge);
                     }
                 }
+                // Release after RouteCursorTransition publishes State::IsRemote() (or failure)
+                // so MouseHookCallback never sees transitionPending=false while IsRemote() is stale.
+                g_transitionPending.store(false, std::memory_order_release);
             }
 
             if (!localQueue.empty()) {
@@ -275,27 +279,24 @@ namespace Input {
         int dx = 0, dy = 0;
 
         if (wParam == WM_MOUSEMOVE) {
-            // Delta from lockedPoint is correct because return 1 from the LL hook
-            // DOES prevent the OS from updating the cursor position. The cursor
-            // stays at lockedPoint, and ms->pt reports where it WOULD have moved.
-            // Each frame's delta = ms->pt - lockedPoint = the actual physical
-            // movement for that event.
-            int rawDx = ms->pt.x - lockedPoint.x;
-            int rawDy = ms->pt.y - lockedPoint.y;
+            // Compute delta from the live OS cursor position rather than an assumed static
+            // center so any external cursor shift cannot inject a persistent directional bias.
+            POINT curPos = lockedPoint;
+            if (GetCursorPos(&curPos)) {
+                lockedPoint = curPos;
+            }
+            const RemoteDeltaResult eval = EvaluateRemoteMouseDelta(
+                ms->pt.x, ms->pt.y, curPos.x, curPos.y, anchorTarget.x, anchorTarget.y);
 
-            // Failsafe: Only discard movement if delta exceeds 1500px in a single tick
-            // (true external teleport). Fast 1000Hz / high-DPI mouse flicks can exceed 200px
-            // during brief DWM stalls and must be preserved, re-anchoring immediately after.
-            if (abs(rawDx) > 1500 || abs(rawDy) > 1500) {
+            if (eval.discardTeleport) {
                 g_mouseTeleportDiscards.fetch_add(1, std::memory_order_relaxed);
                 ReanchorCursor();
                 return;
             }
-            bool needsReanchor = (abs(rawDx) > 150 || abs(rawDy) > 150);
 
-            if (rawDx != 0 || rawDy != 0) {
-                float sx = rawDx * State::mouseSensitivity + fracX.load(std::memory_order_relaxed);
-                float sy = rawDy * State::mouseSensitivity + fracY.load(std::memory_order_relaxed);
+            if (eval.dx != 0 || eval.dy != 0) {
+                float sx = eval.dx * State::mouseSensitivity + fracX.load(std::memory_order_relaxed);
+                float sy = eval.dy * State::mouseSensitivity + fracY.load(std::memory_order_relaxed);
                 dx = static_cast<int>(sx);
                 dy = static_cast<int>(sy);
                 fracX.store(sx - dx, std::memory_order_relaxed);
@@ -334,8 +335,16 @@ namespace Input {
                     g_mouseQueueCv.notify_one();
                 }
             }
-            if (needsReanchor) {
-                ReanchorCursor();
+            if (eval.needsReanchor) {
+                if (!eval.fromDrift) {
+                    ReanchorCursor();
+                } else {
+                    const uint64_t nowMs = GetTickCount64();
+                    if (g_lastDriftReanchorMs == 0 || (nowMs - g_lastDriftReanchorMs) >= 100) {
+                        g_lastDriftReanchorMs = nowMs;
+                        ReanchorCursor();
+                    }
+                }
             }
             return; 
         } else {
@@ -388,18 +397,31 @@ namespace Input {
             if (!Network::g_hasClients.load(std::memory_order_relaxed)) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
 
             MSLLHOOKSTRUCT* ms = (MSLLHOOKSTRUCT*)lParam;
+            // Check our re-anchor signature BEFORE LLMHF_INJECTED because SendInput sets
+            // LLMHF_INJECTED automatically; this keeps fallback lockedPoint synced on delivery.
+            if (ms->dwExtraInfo == KAMFLOW_REANCHOR) {
+                lockedPoint = ms->pt;
+                return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
+            }
             if (ms->flags & LLMHF_INJECTED) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
-            // Secondary filter: skip our own cursor re-centering events by dwExtraInfo
-            // signature. Belt-and-suspenders with the LLMHF_INJECTED check above.
-            if (ms->dwExtraInfo == KAMFLOW_REANCHOR) return CallNextHookEx(globalMouseHook, nCode, wParam, lParam);
 
-            if (!State::IsRemote() && isTransitionedOut) {
-                isTransitionedOut = false;
+            // Load g_transitionPending (acquire) BEFORE State::IsRemote() to pair with
+            // MouseNetworkThreadLoop's release after RouteCursorTransition updates State::currentMode.
+            const bool transitionPending = g_transitionPending.load(std::memory_order_acquire);
+            const bool isRemote = State::IsRemote();
+
+            if (ShouldClearTransitionedOut(isRemote, transitionPending,
+                                           isTransitionedOut.load(std::memory_order_relaxed))) {
+                isTransitionedOut.store(false, std::memory_order_relaxed);
             }
 
-            if (State::IsRemote()) {
+            const MouseHookAction action = ResolveMouseHookAction(isRemote, transitionPending);
+            if (action == MouseHookAction::SwallowOnly) {
+                return 1;
+            }
+            if (action == MouseHookAction::ForwardRemote) {
                 HandleRemoteMouseInput(wParam, ms);
-                return 1; 
+                return 1;
             }
 
             if (wParam == WM_MOUSEMOVE) {
@@ -457,11 +479,14 @@ namespace Input {
                                 // Check non-blockingly if a target node exists, then offload TCP RouteCursorTransition
                                 // to MouseNetworkThreadLoop so WH_MOUSE_LL never blocks on socket I/O.
                                 if (Network::HasTargetInDirection(0, 0, exitEdge)) {
-                                    isTransitionedOut.store(true, std::memory_order_relaxed);
+                                    isTransitionedOut.store(true, std::memory_order_release);
                                     entryPoint = ms->pt;
-                                    lockedPoint = { (cachedMi.rcMonitor.left + cachedMi.rcMonitor.right) / 2, (cachedMi.rcMonitor.top + cachedMi.rcMonitor.bottom) / 2 };
+                                    anchorTarget = { (cachedMi.rcMonitor.left + cachedMi.rcMonitor.right) / 2, (cachedMi.rcMonitor.top + cachedMi.rcMonitor.bottom) / 2 };
+                                    lockedPoint = anchorTarget;
                                     ReanchorCursor();
+                                    g_lastDriftReanchorMs = 0;
                                     consecutiveEdgeHits = 0;
+                                    g_transitionPending.store(true, std::memory_order_release);
                                     {
                                         std::lock_guard<std::mutex> lock(g_mouseQueueMutex);
                                         g_pendingEdgeTransition = { true, exitEdge, normX, normY };
@@ -489,6 +514,9 @@ namespace Input {
             return true; // Prevent handle leaking from double-hooks
         }
         
+        g_transitionPending.store(false, std::memory_order_release);
+        isTransitionedOut.store(false, std::memory_order_release);
+        g_lastDriftReanchorMs = 0;
         g_isMouseNetworkThreadRunning = true;
         g_mouseNetworkThread = std::thread(MouseNetworkThreadLoop);
         
@@ -511,14 +539,14 @@ namespace Input {
         if (g_mouseNetworkThread.joinable()) {
             g_mouseNetworkThread.join();
         }
+        g_transitionPending.store(false, std::memory_order_release);
+        isTransitionedOut.store(false, std::memory_order_release);
     }
 
     /**
-     * @brief Discards all pending mouse events in the queue.
-     * Called on sleep/wake resume to prevent stale burst playback that
-     * would teleport the cursor to wherever thousands of accumulated
-     * deltas point. Also resets the fractional accumulator to prevent
-     * sub-pixel drift from carrying over across sleep cycles.
+     * @brief Discards all pending mouse events and cancels any in-flight edge transition.
+     * Called on sleep/wake resume and forced LOCAL reverts to prevent stale burst
+     * playback or pending transitions from corrupting local cursor state.
      * @return void
      */
     void DrainMouseQueue() {
@@ -528,5 +556,7 @@ namespace Input {
         g_pendingEdgeTransition.active = false;
         fracX.store(0.0f, std::memory_order_relaxed);
         fracY.store(0.0f, std::memory_order_relaxed);
+        isTransitionedOut.store(false, std::memory_order_release);
+        g_transitionPending.store(false, std::memory_order_release);
     }
 }

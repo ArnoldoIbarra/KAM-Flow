@@ -11,6 +11,7 @@
 
 #include "AudioManager.h"
 #include "DebugLog.h"
+#include "MouseCapture.h"
 #include "NetworkMessages.h"
 #include <atomic>
 #include <cmath>
@@ -561,6 +562,92 @@ namespace {
         EXPECT_TRUE(Network::CanSendReturnControl(t0 + 200, t0));
         // Resetting lastSentMs on EVENT_SYNC_CURSOR immediately re-arms edge return.
         EXPECT_TRUE(Network::CanSendReturnControl(t0 + 10, 0));
+        return true;
+    }
+
+    // --- MOUSE TRANSITION & ANCHOR STABILITY TESTS ---
+
+    KAM_TEST(MouseHook_PendingTransitionSwallowsAndPreservesFlag) {
+        using Action = Input::MouseHookAction;
+
+        // During async transition (isRemote=false, transitionPending=true),
+        // the hook must swallow events and MUST NOT clear isTransitionedOut.
+        EXPECT_EQ(Input::ResolveMouseHookAction(false, true), Action::SwallowOnly);
+        EXPECT_EQ(Input::ResolveMouseHookAction(true, true), Action::SwallowOnly);
+        EXPECT_EQ(Input::ResolveMouseHookAction(true, false), Action::ForwardRemote);
+        EXPECT_EQ(Input::ResolveMouseHookAction(false, false), Action::PassThrough);
+
+        EXPECT_TRUE(!Input::ShouldClearTransitionedOut(false, true, true));
+        EXPECT_TRUE(!Input::ShouldClearTransitionedOut(true, true, true));
+        EXPECT_TRUE(!Input::ShouldClearTransitionedOut(true, false, true));
+        EXPECT_TRUE(!Input::ShouldClearTransitionedOut(false, false, false));
+        EXPECT_TRUE(Input::ShouldClearTransitionedOut(false, false, true));
+        return true;
+    }
+
+    KAM_TEST(MouseDelta_DriftedCursorHasZeroBiasAndTriggersReanchor) {
+        // Exact reproduction: monitor center (960, 540), OS cursor drifted to (870, 532).
+        const auto verticalMove = Input::EvaluateRemoteMouseDelta(870, 537, 870, 532, 960, 540);
+        EXPECT_EQ(verticalMove.dx, 0);
+        EXPECT_EQ(verticalMove.dy, 5);
+        EXPECT_TRUE(!verticalMove.discardTeleport);
+        EXPECT_TRUE(verticalMove.fromDrift);
+        EXPECT_TRUE(verticalMove.needsReanchor);
+
+        const auto rightMove = Input::EvaluateRemoteMouseDelta(880, 532, 870, 532, 960, 540);
+        EXPECT_EQ(rightMove.dx, 10);
+        EXPECT_EQ(rightMove.dy, 0);
+        EXPECT_TRUE(!rightMove.discardTeleport);
+        EXPECT_TRUE(rightMove.fromDrift);
+        EXPECT_TRUE(rightMove.needsReanchor);
+
+        // Normal centered movement stays within drift and flick thresholds.
+        const auto normalMove = Input::EvaluateRemoteMouseDelta(975, 520, 960, 540, 960, 540);
+        EXPECT_EQ(normalMove.dx, 15);
+        EXPECT_EQ(normalMove.dy, -20);
+        EXPECT_TRUE(!normalMove.discardTeleport);
+        EXPECT_TRUE(!normalMove.fromDrift);
+        EXPECT_TRUE(!normalMove.needsReanchor);
+
+        // Fast flick (>150px, <=1500px) preserves delta and triggers re-anchor.
+        const auto fastFlick = Input::EvaluateRemoteMouseDelta(1160, 540, 960, 540, 960, 540);
+        EXPECT_EQ(fastFlick.dx, 200);
+        EXPECT_EQ(fastFlick.dy, 0);
+        EXPECT_TRUE(!fastFlick.discardTeleport);
+        EXPECT_TRUE(!fastFlick.fromDrift);
+        EXPECT_TRUE(fastFlick.needsReanchor);
+
+        // External teleport (>1500px) discards delta and re-anchors.
+        const auto teleport = Input::EvaluateRemoteMouseDelta(2500, 540, 960, 540, 960, 540);
+        EXPECT_TRUE(teleport.discardTeleport);
+        EXPECT_TRUE(!teleport.fromDrift);
+        EXPECT_TRUE(teleport.needsReanchor);
+
+        // Negative virtual-desktop monitor coordinates behave identically.
+        const auto negMon = Input::EvaluateRemoteMouseDelta(-1038, -544, -1050, -540, -960, -540);
+        EXPECT_EQ(negMon.dx, 12);
+        EXPECT_EQ(negMon.dy, -4);
+        EXPECT_TRUE(!negMon.discardTeleport);
+        EXPECT_TRUE(negMon.fromDrift);
+        EXPECT_TRUE(negMon.needsReanchor);
+        return true;
+    }
+
+    KAM_TEST(MouseReanchor_VirtualDesktopCoordRoundingAndClamping) {
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(0, 0, 1920), 0);
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(960, 0, 1920), 32785);
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(1919, 0, 1920), 65535);
+
+        // Secondary monitor to the left of primary (-1920..1919, width 3840).
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(-1920, -1920, 3840), 0);
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(-960, -1920, 3840), 16388);
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(1919, -1920, 3840), 65535);
+
+        // Out-of-bounds clamping and degenerate sizes.
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(-500, 0, 1920), 0);
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(5000, 0, 1920), 65535);
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(100, 0, 1), 0);
+        EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(100, 0, 0), 0);
         return true;
     }
 

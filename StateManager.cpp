@@ -16,6 +16,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include "StateManager.h"
+#include "MouseCapture.h"
 #include "NetworkServer.h"   
 #include "NetworkMessages.h" 
 #include "UIManager.h"
@@ -56,12 +57,27 @@ namespace State {
      */
     void SetMode(ControlMode newMode) {
         ControlMode oldMode = currentMode.exchange(newMode);
-        if (oldMode == newMode) return;
-        
+
+        if (newMode == ControlMode::LOCAL) {
+            // Cancel any in-flight mouse edge transition and discard stale remote deltas
+            // even if currentMode was still LOCAL (e.g., Ctrl+Alt+M during pending transition).
+            Input::DrainMouseQueue();
+        }
+
+        if (oldMode == newMode) {
+            if (newMode == ControlMode::LOCAL) {
+                Network::g_controllingClientSocket.store(INVALID_SOCKET, std::memory_order_release);
+            }
+            return;
+        }
+
         Network::StatePayload payload = { static_cast<uint8_t>(newMode == ControlMode::REMOTE ? 1 : 0) };
-        
-        // Notify the controlling client of the mode change instead of broadcasting to all clients.
-        SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
+
+        // Clear g_controllingClientSocket atomically when returning to LOCAL so forced reverts
+        // (Ctrl+Alt+M, Game Mode, Sleep) never leave a stale controlling socket behind.
+        SOCKET ctrl = (newMode == ControlMode::LOCAL)
+                          ? Network::g_controllingClientSocket.exchange(INVALID_SOCKET, std::memory_order_acq_rel)
+                          : Network::g_controllingClientSocket.load(std::memory_order_acquire);
         if (ctrl != INVALID_SOCKET) {
             Network::SendToClient(ctrl, Network::MessageType::EVENT_STATE, &payload, sizeof(payload));
         }

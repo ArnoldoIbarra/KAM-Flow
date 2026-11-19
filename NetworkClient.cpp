@@ -99,6 +99,8 @@ std::atomic<bool> g_hasLoggedTcpFallback{false};
 std::atomic<uint64_t> g_udpHandshakeStartMs{0};
 /// Timestamp (GetTickCount64) of the last dispatched EVENT_RETURN_CONTROL for edge-burst debouncing.
 std::atomic<uint64_t> g_lastReturnControlTickMs{0};
+/// Signals EvaluateClientEdgeReturn (including ClientUDPListenerLoop) to reset its edge pull-back accumulator.
+std::atomic<bool> g_resetPullBackAccumulator{false};
 /// Synchronizes interruptible waits on the client heartbeat / UDP retry loop.
 std::mutex g_heartbeatCvMutex;
 std::condition_variable g_heartbeatCv;
@@ -563,6 +565,9 @@ void CheckForBlockedInput(const MousePayload &p, const POINT &currentPt) {
 static void EvaluateClientEdgeReturn(const MousePayload &p,
                                      int &pullBackAccumulator,
                                      int pullBackThreshold) {
+  if (g_resetPullBackAccumulator.exchange(false, std::memory_order_acq_rel)) {
+    pullBackAccumulator = 0;
+  }
   POINT pt;
   if (!GetCursorPos(&pt))
     return;
@@ -1180,6 +1185,7 @@ void ClientLoop() {
           SetCursorPos(tx, ty);
         }
         pullBackAccumulator = 0;
+        g_resetPullBackAccumulator.store(true, std::memory_order_release);
         g_lastReturnControlTickMs.store(0, std::memory_order_relaxed);
       }
     } else if (h.type == MessageType::EVENT_STATE) {
@@ -1453,6 +1459,7 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
   g_hasLoggedTcpFallback.store(false, std::memory_order_relaxed);
   g_udpHandshakeStartMs.store(GetTickCount64(), std::memory_order_relaxed);
   g_lastReturnControlTickMs.store(0, std::memory_order_relaxed);
+  g_resetPullBackAccumulator.store(true, std::memory_order_release);
 
   if (clientThread.joinable()) {
     if (State::globalDebugMode)

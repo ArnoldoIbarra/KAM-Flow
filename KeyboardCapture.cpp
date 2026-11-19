@@ -46,6 +46,8 @@ namespace Input {
     std::mutex g_keyboardQueueMutex;
     std::condition_variable g_keyboardQueueCv;
     std::atomic<bool> g_isKeyboardNetworkThreadRunning{false};
+    std::atomic<bool> g_pendingEmergencyRevert{false};
+    static_assert(std::atomic<bool>::is_always_lock_free);
     std::thread g_keyboardNetworkThread;
 
     /**
@@ -59,23 +61,36 @@ namespace Input {
         while (g_isKeyboardNetworkThreadRunning) {
             Network::KeyboardPayload p;
             bool hasPayload = false;
+            bool doEmergencyRevert = false;
             size_t depth = 0;
             {
                 std::unique_lock<std::mutex> lock(g_keyboardQueueMutex);
                 g_keyboardQueueCv.wait(lock, [] {
-                    return !g_keyboardQueue.empty() || !g_isKeyboardNetworkThreadRunning;
+                    return !g_keyboardQueue.empty() ||
+                           g_pendingEmergencyRevert.load(std::memory_order_acquire) ||
+                           !g_isKeyboardNetworkThreadRunning;
                 });
 
-                if (!g_isKeyboardNetworkThreadRunning && g_keyboardQueue.empty()) {
+                if (!g_isKeyboardNetworkThreadRunning && g_keyboardQueue.empty() &&
+                    !g_pendingEmergencyRevert.load(std::memory_order_acquire)) {
                     break;
                 }
 
-                if (!g_keyboardQueue.empty()) {
+                if (g_pendingEmergencyRevert.exchange(false, std::memory_order_acq_rel)) {
+                    doEmergencyRevert = true;
+                } else if (!g_keyboardQueue.empty()) {
                     depth = g_keyboardQueue.size();
                     p = g_keyboardQueue.front();
                     g_keyboardQueue.pop();
                     hasPayload = true;
                 }
+            }
+
+            // Execute blocking State::SetMode(LOCAL) off WH_KEYBOARD_LL so OS hook never stalls.
+            if (doEmergencyRevert) {
+                if (State::globalDebugMode) UI::LogDebug("[KAM-Flow] Emergency Override Triggered. Returning control to Server.");
+                State::SetMode(State::ControlMode::LOCAL);
+                continue;
             }
 
             // Perform the blocking network call outside of the OS hook chain.
@@ -138,10 +153,15 @@ namespace Input {
             }
 
             if (isKeyDown && kbd->vkCode == State::emergencyHotkey && isCtrlDown && isAltDown) {
-                if (State::globalDebugMode) UI::LogDebug("[KAM-Flow] Emergency Override Triggered. Returning control to Server.");
                 isCtrlDown = false;
                 isAltDown = false;
-                State::SetMode(State::ControlMode::LOCAL);
+                {
+                    std::lock_guard<std::mutex> lock(g_keyboardQueueMutex);
+                    std::queue<Network::KeyboardPayload> empty;
+                    std::swap(g_keyboardQueue, empty);
+                    g_pendingEmergencyRevert.store(true, std::memory_order_release);
+                }
+                g_keyboardQueueCv.notify_one();
                 return 1;
             }
 
@@ -189,6 +209,7 @@ namespace Input {
             return true; // Prevent handle leaking from double-hooks
         }
         
+        g_pendingEmergencyRevert.store(false, std::memory_order_relaxed);
         g_isKeyboardNetworkThreadRunning = true;
         g_keyboardNetworkThread = std::thread(KeyboardNetworkThreadLoop);
         
@@ -207,6 +228,7 @@ namespace Input {
         }
 
         g_isKeyboardNetworkThreadRunning = false;
+        g_pendingEmergencyRevert.store(false, std::memory_order_relaxed);
         g_keyboardQueueCv.notify_all();
         if (g_keyboardNetworkThread.joinable()) {
             g_keyboardNetworkThread.join();
