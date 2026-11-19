@@ -1057,8 +1057,13 @@ void AcceptClientsLoop() {
               {
                 Audio::AudioFormat serverFormat;
                 if (Audio::GetDefaultDeviceFormat(serverFormat)) {
+                  AudioFormatPayload wireFmt = {};
+                  wireFmt.sampleRate = serverFormat.sampleRate;
+                  wireFmt.bitDepth = serverFormat.bitDepth;
+                  wireFmt.channels = serverFormat.channels;
+                  wireFmt.codec = serverFormat.codec;
                   if (!SendToClient(clientSocket, MessageType::EVENT_AUDIO_FORMAT,
-                                    &serverFormat, sizeof(serverFormat)) &&
+                                    &wireFmt, sizeof(wireFmt)) &&
                       State::globalDebugMode) {
                     UI::LogDebug("[Network Server] WARNING: Failed to send audio format handshake to '%s' (WSA Error: %d).",
                                  safeName, WSAGetLastError());

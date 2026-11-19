@@ -93,6 +93,15 @@ namespace Network {
                type == MessageType::EVENT_HEARTBEAT;
     }
 
+    /// Audio wire encoding format negotiated via EVENT_AUDIO_FORMAT.
+    enum class AudioCodecType : uint8_t {
+        PCM  = 0, ///< Uncompressed PCM frames after AudioPacketHeader.
+        OPUS = 1  ///< Opus compressed frame (with In-Band FEC) after AudioPacketHeader.
+    };
+
+    /// AudioPacketHeader flag indicating digital silence (no compressed payload required).
+    constexpr uint8_t AUDIO_FLAG_SILENCE = 0x01;
+
 #pragma pack(push, 1)
 
     /**
@@ -190,15 +199,33 @@ namespace Network {
     };
 
     /**
-     * @brief Payload dictating the WASAPI stream format for automatic PCM conversion.
+     * @brief Payload dictating the WASAPI stream format and active wire codec.
      */
     struct AudioFormatPayload {
         /// e.g., 44100, 48000
-        uint32_t sampleRate; 
+        uint32_t sampleRate;
         /// e.g., 16, 24, 32
-        uint16_t bitDepth;   
+        uint16_t bitDepth;
         /// e.g., 1 (Mono), 2 (Stereo)
-        uint16_t channels;   
+        uint16_t channels;
+        /// Active wire codec dictated by the Server (AudioCodecType: 0 = PCM, 1 = Opus).
+        uint8_t codec;
+        /// Reserved padding bytes (must be zero).
+        uint8_t reserved[3];
+    };
+
+    /**
+     * @brief Packed wire header prepended to every EVENT_AUDIO_DATA and EVENT_MIC_DATA payload.
+     */
+    struct AudioPacketHeader {
+        /// Wire encoding for the payload bytes following this header (0 = PCM, 1 = Opus).
+        uint8_t codec;
+        /// Bitmask flags (e.g., AUDIO_FLAG_SILENCE).
+        uint8_t flags;
+        /// Number of PCM frames carried or represented by this packet.
+        uint16_t frameCount;
+        /// Monotonic per-stream audio sequence number for FEC/PLC loss recovery.
+        uint32_t audioSeq;
     };
 
     /**
@@ -242,6 +269,9 @@ namespace Network {
     };
 
 #pragma pack(pop)
+
+    static_assert(sizeof(AudioFormatPayload) == 12, "AudioFormatPayload must stay packed at 12 bytes");
+    static_assert(sizeof(AudioPacketHeader) == 8, "AudioPacketHeader must stay packed at 8 bytes");
 
     /// Counters tracking UDP delivery, out-of-order arrivals, sequence gaps, stale drops, and duplicates.
     struct UdpReplayStats {

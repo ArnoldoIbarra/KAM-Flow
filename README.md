@@ -121,7 +121,9 @@ This tab shows a grid with your **Server** box (green) in the center and connect
   * **Enable File Transfers:** Allow sending and receiving files via drag-and-drop.
   * **Mouse Sensitivity:** Adjust how fast the cursor moves on Client screens (`0.10` to `3.00`, default `1.00`) without changing your Server's own mouse speed.
 * **Audio Subsystem**
-  * **Network Jitter Buffer:** Controls audio buffering (`20 ms` to `200 ms`, default `80 ms`). Changes adjust buffering smoothly live without reconnecting — raise it (for example, `120–160 ms`) if Wi-Fi causes audio pops or skips; lower it for faster response on Ethernet.
+  * **Compress Audio with Opus (Wi-Fi Resilient):** *(Default: On)* Encodes network audio using low-latency 10 ms Opus with In-Band FEC (~24x smaller packets than raw PCM) to eliminate Wi-Fi IP fragmentation and recover single-packet drops cleanly. Connected Clients automatically synchronize their codec from the Server; when turned off (or on unsupported hardware rates), KAM-Flow uses MTU-safe chunked PCM (`<= 1280 B` per packet).
+  * **Adaptive Jitter Buffer (Auto):** *(Default: On)* Automatically steps the active Server jitter target up (`+20 ms`, ceiling `200 ms`) during Wi-Fi bursts or underruns, then gently relaxes back down (`-10 ms` after 60 s of clean playback) to your **Min Jitter Buffer** floor without audible glitches. Turn off for a fixed manual buffer target.
+  * **Min / Network Jitter Buffer:** Sets the buffer floor (or fixed target when Auto is off, `20 ms` to `200 ms`, default `80 ms`) with a live `(Active: XX ms)` readout when Adaptive mode is enabled. Changes apply smoothly live without reconnecting.
   * **Enable Master Audio Mix (Listen to Clients):** Plays audio received from your connected Clients through the Server's speakers or headset.
   * **Broadcast Server Microphone to Clients:** Sends your Server's default microphone to connected Clients (displays the active microphone name below the checkbox).
   * **Client Sync Toggles** *(visible when Master Audio Mix is enabled)*: Mute or unmute **Audio**, adjust each Client's individual **Vol** slider (`0.00` to `1.00`), or toggle **Clipboard** sync per Client.
@@ -157,6 +159,7 @@ Run **Client** mode on each secondary PC or laptop you want to control from your
 * **Startup Configuration:** Set **Default Start Mode**, **Minimize to System Tray**, and **Auto-Reconnect to Last Server** (automatically reconnects after brief drops or waking from sleep).
 * **Input Synchronization:** Toggle **Enable Keyboard Control**, **Enable Clipboard Sync**, and **Enable File Transfers**.
 * **Audio Subsystem:**
+  * Audio compression (**Opus** vs **PCM**) is controlled automatically by the Server — no separate codec setting is needed on the Client.
   * **Network Jitter Buffer:** Adjust buffering (`20 ms` to `200 ms`, default `80 ms`) for incoming Server microphone audio.
   * **Send Client Audio to Server:** Streams this Client's system audio to your Server's headset.
   * **Receive Server Microphone:** Routes the Server's microphone into VB-CABLE on this Client.
@@ -220,7 +223,7 @@ Windows does not allow regular apps to create virtual microphones by themselves.
 | **Client says "Authentication Failed" or wrong PIN** | The Server's Master PIN may have been regenerated or mistyped. On the Server's **Connections** tab, click **Reveal** to check the current 8-digit PIN. On the Client, click **Forget**, then click **Pair** and enter the new PIN. |
 | **Cursor will not cross to the Client (or goes the wrong direction)** | 1. Confirm **Enable Game Mode** is **unchecked** on the Server.<br>2. Open the Server's **Spatial Layout** tab and check that the Client box sits on the side you are moving toward.<br>3. Move near the middle of the screen edge — corners are protected by the **Corner Deadzone** slider. |
 | **Cursor feels too fast, too slow, or slightly laggy on the Client** | Adjust **Mouse Sensitivity** under Server **Preferences**. For the lowest possible latency (especially while gaming or transferring large files), connect your PCs via Ethernet or strong 5 GHz / 6 GHz Wi-Fi. |
-| **Audio pops, clicks, or cuts out** | Open **Preferences** and increase the **Network Jitter Buffer** slider from `80 ms` toward `120–160 ms` (adjustments take effect smoothly live without reconnecting). Also verify **Enable Master Audio Mix** is checked on the Server and **Send Client Audio to Server** is checked on the Client. |
+| **Audio pops, clicks, or cuts out** | Ensure **Compress Audio with Opus (Wi-Fi Resilient)** and **Adaptive Jitter Buffer (Auto)** are checked in Server **Preferences → Audio Subsystem** (recommended on Wi-Fi), or raise the **Min / Network Jitter Buffer** slider toward `120–160 ms` (adjustments take effect smoothly live without reconnecting). Also verify **Enable Master Audio Mix** is checked on the Server and **Send Client Audio to Server** is checked on the Client. |
 | **No sound from Client on Server (or Client audio is muted)** | Check **Preferences → Client Sync Toggles** on the Server to confirm that Client's **Audio** box is checked and its **Vol** slider is above `0.00`. |
 | **Client apps do not hear the Server's microphone** | Verify **VB-CABLE** is installed on the Client, **Broadcast Server Microphone to Clients** is checked on the Server, **Receive Server Microphone** is checked on the Client, and your app's microphone is set to **CABLE Output (VB-Audio Virtual Cable)**. |
 | **Mouse returns to Server unexpectedly when clicking a Client tray menu or admin popup** | This is intentional Windows security behavior. When a UAC prompt, Lock Screen, or protected system menu (such as the NVIDIA tray menu) opens on a Client, Windows blocks remote input to it, so KAM-Flow returns control to your Server to avoid locking you out. Use the Client's physical trackpad/keyboard to finish interacting with that prompt. |
@@ -255,7 +258,7 @@ If an issue keeps happening and you want to see what KAM-Flow is doing:
 <details>
 <summary><strong>Building from Source (for developers)</strong></summary>
 
-**Requirements:** Windows 10/11, CMake 3.15+, Visual Studio 2022+ (or Visual Studio Build Tools) with the **Desktop development with C++** workload (C++20 and Windows SDK). Dear ImGui is fetched automatically by CMake during configure.
+**Requirements:** Windows 10/11, CMake 3.15+, Visual Studio 2022+ (or Visual Studio Build Tools) with the **Desktop development with C++** workload (C++20 and Windows SDK). Dear ImGui and static libopus (BSD-3-Clause) are fetched automatically by CMake during configure.
 
 Open a Visual Studio Developer Command Prompt in the repository root and run:
 

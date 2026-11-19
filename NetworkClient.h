@@ -37,6 +37,9 @@ namespace Network {
     /// Retrieves the audio format sent by the server upon connection.
     bool GetServerAudioFormat(Audio::AudioFormat& outFormat);
 
+    /// Returns the lock-free active audio wire codec ID requested by the server.
+    uint8_t GetServerAudioCodec();
+
     /// Checks if the active TCP Client is currently connected and processing data.
     bool IsClientConnected();
 

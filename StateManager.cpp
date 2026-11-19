@@ -40,6 +40,9 @@ namespace State {
     std::atomic<bool> enableClientAudioStream{true};
     std::atomic<bool> enableClientMicReceive{false};
     std::atomic<int> audioJitterBufferMs{80};
+    std::atomic<bool> enableAudioOpus{true};
+    std::atomic<bool> enableAdaptiveJitterBuffer{true};
+    std::atomic<int> activeJitterBufferMs{80};
     std::atomic<int> edgeDeadzonePercent{5};
     std::atomic<float> mouseSensitivity{1.0f};
     std::atomic<char> emergencyHotkey{'M'};

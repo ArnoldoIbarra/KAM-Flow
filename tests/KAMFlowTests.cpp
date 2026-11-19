@@ -9,6 +9,7 @@
  * @brief Lightweight deterministic CTest unit test suite for KAM-Flow core utilities.
  */
 
+#include "AudioCodec.h"
 #include "AudioManager.h"
 #include "DebugLog.h"
 #include "MouseCapture.h"
@@ -771,6 +772,285 @@ namespace {
         EXPECT_EQ(DebugLog::ClassifyMessage(
                       "[Audio Perf] 30s Buf: min=10 avg=82 max=94ms (target=80ms) | Conceal=1 Starv=0 Overrun=0 | Hermite=-1/+0 | Jitter>25ms=0 Clip=0"),
                   Cat::Perf);
+        return true;
+    }
+
+    KAM_TEST(Audio_CaptureTimingStatsThresholdsAndReset) {
+        Audio::CaptureTimingStats stats;
+        EXPECT_TRUE(!stats.HasAnomaly());
+
+        // Normal 10-12ms sends and normal 34ms active->silence transition stay quiet
+        EXPECT_TRUE(!stats.RecordSend(0, false, 0, 3840, false));
+        EXPECT_TRUE(!stats.RecordSend(10, true, 0, 3840, false));
+        EXPECT_TRUE(!stats.RecordSend(12, true, 0, 3840, false));
+        EXPECT_TRUE(!stats.RecordSend(34, true, 0, 3840, true));
+        EXPECT_TRUE(!stats.HasAnomaly());
+        EXPECT_EQ(stats.realPackets, 3u);
+        EXPECT_EQ(stats.silencePackets, 1u);
+        EXPECT_EQ(stats.maxSendGapMs, 34u);
+        EXPECT_EQ(stats.maxPacketBytes, 3840u);
+
+        // 45ms gap (>40ms spike threshold, <=50ms warn threshold) flags 30s anomaly without immediate warn
+        EXPECT_TRUE(!stats.RecordSend(45, true, 0, 3840, false));
+        EXPECT_EQ(stats.sendGapSpikes, 1u);
+        EXPECT_TRUE(stats.HasAnomaly());
+
+        // 120ms gap (>50ms warn threshold) triggers warning and updates maxima
+        EXPECT_TRUE(stats.RecordSend(120, true, 1, 7680, false));
+        EXPECT_EQ(stats.sendGapSpikes, 2u);
+        EXPECT_EQ(stats.maxSendGapMs, 120u);
+        EXPECT_EQ(stats.maxPacketBytes, 7680u);
+
+        // Slow send() (>10ms) warns even on first send (hasPrevSend=false)
+        Audio::CaptureTimingStats slowStats;
+        EXPECT_TRUE(slowStats.RecordSend(999, false, 15, 3840, false));
+        EXPECT_EQ(slowStats.slowSendCalls, 1u);
+        EXPECT_EQ(slowStats.maxSendCallMs, 15u);
+        EXPECT_EQ(slowStats.maxSendGapMs, 0u);
+        EXPECT_TRUE(slowStats.HasAnomaly());
+
+        // Reset zeroes every field
+        stats.Reset();
+        EXPECT_TRUE(!stats.HasAnomaly());
+        EXPECT_EQ(stats.realPackets, 0u);
+        EXPECT_EQ(stats.silencePackets, 0u);
+        EXPECT_EQ(stats.sendGapSpikes, 0u);
+        EXPECT_EQ(stats.slowSendCalls, 0u);
+        EXPECT_EQ(stats.maxSendGapMs, 0u);
+        EXPECT_EQ(stats.maxSendCallMs, 0u);
+        EXPECT_EQ(stats.maxPacketBytes, 0u);
+        EXPECT_EQ(stats.discontinuities, 0u);
+        EXPECT_EQ(stats.silenceClockSlips, 0u);
+
+        // Diagnostic message color-category invariants
+        EXPECT_EQ(DebugLog::ClassifyMessage(
+                      "[Audio] WARNING: CaptureThread send gap 120ms (sendCall=0ms, pkt=3840B, src=WASAPI)."),
+                  DebugLog::Category::Error);
+        EXPECT_EQ(DebugLog::ClassifyMessage(
+                      "[Audio Perf] CaptureThread 30s: tx=100 (real=90 sil=10) | maxGap=120ms (>40ms=1) | maxSend=1ms | maxPkt=3840B | disc=0 slips=0"),
+                  DebugLog::Category::Perf);
+        return true;
+    }
+
+    /**
+     * @brief Verifies Opus format support checks, fallback behavior, wire header sizes, and MTU PCM chunk alignment.
+     * @return True when all assertions succeed.
+     */
+    KAM_TEST(AudioCodec_SupportedFormatAndMtuChunking) {
+        EXPECT_EQ(sizeof(Network::AudioFormatPayload), static_cast<size_t>(12));
+        EXPECT_EQ(sizeof(Network::AudioPacketHeader), static_cast<size_t>(8));
+
+        EXPECT_TRUE(AudioCodec::IsOpusFormatSupported(48000, 2, 32));
+        EXPECT_TRUE(AudioCodec::IsOpusFormatSupported(48000, 1, 16));
+        EXPECT_TRUE(AudioCodec::IsOpusFormatSupported(16000, 2, 16));
+        EXPECT_TRUE(!AudioCodec::IsOpusFormatSupported(44100, 2, 32));
+        EXPECT_TRUE(!AudioCodec::IsOpusFormatSupported(96000, 2, 32));
+        EXPECT_TRUE(!AudioCodec::IsOpusFormatSupported(48000, 6, 32));
+        EXPECT_TRUE(!AudioCodec::IsOpusFormatSupported(48000, 2, 24));
+
+        EXPECT_EQ(AudioCodec::ResolveEffectiveAudioCodec(true, 48000, 2, 32), AudioCodec::kAudioCodecOpus);
+        EXPECT_EQ(AudioCodec::ResolveEffectiveAudioCodec(false, 48000, 2, 32), AudioCodec::kAudioCodecPcm);
+        EXPECT_EQ(AudioCodec::ResolveEffectiveAudioCodec(true, 44100, 2, 32), AudioCodec::kAudioCodecPcm);
+
+        const size_t chunk8 = AudioCodec::ComputeMtuSafePcmChunkBytes(8);
+        EXPECT_EQ(chunk8, static_cast<size_t>(1280));
+        EXPECT_EQ(chunk8 % 8, static_cast<size_t>(0));
+
+        const size_t chunk12 = AudioCodec::ComputeMtuSafePcmChunkBytes(12);
+        EXPECT_TRUE(chunk12 <= AudioCodec::kMaxSafePcmPayloadBytes);
+        EXPECT_EQ(chunk12 % 12, static_cast<size_t>(0));
+        EXPECT_EQ(chunk12, static_cast<size_t>(1272));
+
+        const size_t chunkOversize = AudioCodec::ComputeMtuSafePcmChunkBytes(2000, 1280);
+        EXPECT_EQ(chunkOversize, static_cast<size_t>(2000));
+        return true;
+    }
+
+    /**
+     * @brief Verifies 10ms Opus encoding/decoding round-trip across arbitrary WASAPI chunk boundaries and bit depths.
+     * @return True when encoded packet counts, sizes, decoded frame counts, and silence handling match.
+     */
+    KAM_TEST(AudioCodec_OpusRoundTripAndArbitraryFrameAccumulation) {
+        AudioCodec::OpusStreamEncoder encFloat;
+        AudioCodec::OpusStreamDecoder decFloat;
+        EXPECT_TRUE(encFloat.Initialize(48000, 32, 2, false));
+        EXPECT_TRUE(decFloat.Initialize(48000, 32, 2));
+        EXPECT_EQ(encFloat.GetFrameSizeSamples(), static_cast<uint16_t>(480));
+
+        // Build 1440 frames (30ms) of 440Hz stereo float audio.
+        std::vector<float> sineFloat(1440 * 2, 0.0f);
+        for (size_t i = 0; i < 1440; ++i) {
+            const float sample = 0.25f * std::sinf(2.0f * 3.14159265f * 440.0f * static_cast<float>(i) / 48000.0f);
+            sineFloat[i * 2] = sample;
+            sineFloat[i * 2 + 1] = sample;
+        }
+
+        // Push 144 frames (no complete 10ms frame yet -> 0 packets), then 336 frames (-> 1 packet), then 960 (-> 2 packets).
+        std::vector<AudioCodec::EncodedOpusPacket> packets;
+        EXPECT_TRUE(encFloat.PushPcmAndEncode(sineFloat.data(), 144 * 2 * sizeof(float), packets));
+        EXPECT_EQ(packets.size(), static_cast<size_t>(0));
+
+        EXPECT_TRUE(encFloat.PushPcmAndEncode(sineFloat.data() + 144 * 2, 336 * 2 * sizeof(float), packets));
+        EXPECT_EQ(packets.size(), static_cast<size_t>(1));
+
+        EXPECT_TRUE(encFloat.PushPcmAndEncode(sineFloat.data() + 480 * 2, 960 * 2 * sizeof(float), packets));
+        EXPECT_EQ(packets.size(), static_cast<size_t>(3));
+
+        AudioCodec::OpusDecodeStats dStats;
+        for (uint32_t i = 0; i < 3; ++i) {
+            EXPECT_EQ(packets[i].audioSeq, i);
+            EXPECT_EQ(packets[i].frameCount, static_cast<uint16_t>(480));
+            EXPECT_TRUE(!packets[i].opusBytes.empty() && packets[i].opusBytes.size() < 400);
+
+            std::vector<uint8_t> pcmOut;
+            EXPECT_TRUE(decFloat.DecodePacket(
+                packets[i].flags, packets[i].frameCount, packets[i].audioSeq,
+                packets[i].opusBytes.data(), packets[i].opusBytes.size(), pcmOut, dStats));
+            EXPECT_EQ(pcmOut.size(), static_cast<size_t>(480 * 2 * sizeof(float)));
+        }
+
+        // Verify 16-bit mono VOIP profile and digital silence zero-fill fast path.
+        AudioCodec::OpusStreamEncoder encMic;
+        AudioCodec::OpusStreamDecoder decMic;
+        EXPECT_TRUE(encMic.Initialize(48000, 16, 1, true));
+        EXPECT_TRUE(decMic.Initialize(48000, 16, 1));
+        std::vector<int16_t> sineMic(480, 0);
+        for (size_t i = 0; i < 480; ++i) {
+            sineMic[i] = static_cast<int16_t>(8000.0f * std::sinf(2.0f * 3.14159265f * 300.0f * static_cast<float>(i) / 48000.0f));
+        }
+        std::vector<AudioCodec::EncodedOpusPacket> micPkts;
+        EXPECT_TRUE(encMic.PushPcmAndEncode(sineMic.data(), sineMic.size() * sizeof(int16_t), micPkts));
+        EXPECT_EQ(micPkts.size(), static_cast<size_t>(1));
+
+        std::vector<uint8_t> micOut;
+        AudioCodec::OpusDecodeStats micStats;
+        EXPECT_TRUE(decMic.DecodePacket(
+            micPkts[0].flags, micPkts[0].frameCount, micPkts[0].audioSeq,
+            micPkts[0].opusBytes.data(), micPkts[0].opusBytes.size(), micOut, micStats));
+        EXPECT_EQ(micOut.size(), static_cast<size_t>(480 * sizeof(int16_t)));
+
+        std::vector<uint8_t> silOut;
+        EXPECT_TRUE(decMic.DecodePacket(
+            AudioCodec::kAudioFlagSilence, 480, micPkts[0].audioSeq + 1, nullptr, 0, silOut, micStats));
+        EXPECT_EQ(silOut.size(), static_cast<size_t>(480 * sizeof(int16_t)));
+        for (uint8_t b : silOut) {
+            EXPECT_EQ(b, static_cast<uint8_t>(0));
+        }
+        return true;
+    }
+
+    /**
+     * @brief Verifies Opus sequence-gap FEC/PLC concealment bounds, late packet drop, and restart resync.
+     * @return True when FEC, capped PLC, stale drop, and restart resync behave deterministically.
+     */
+    KAM_TEST(AudioCodec_OpusLossFecPlcAndStaleRejection) {
+        AudioCodec::OpusStreamEncoder enc;
+        AudioCodec::OpusStreamDecoder dec;
+        EXPECT_TRUE(enc.Initialize(48000, 32, 2, true));
+        EXPECT_TRUE(dec.Initialize(48000, 32, 2));
+
+        constexpr uint32_t kTotalFrames = 60;
+        std::vector<float> audio(kTotalFrames * 480 * 2, 0.0f);
+        for (size_t i = 0; i < kTotalFrames * 480; ++i) {
+            const float s = 0.2f * std::sinf(2.0f * 3.14159265f * 440.0f * static_cast<float>(i) / 48000.0f);
+            audio[i * 2] = s;
+            audio[i * 2 + 1] = s;
+        }
+        std::vector<AudioCodec::EncodedOpusPacket> pkts;
+        EXPECT_TRUE(enc.PushPcmAndEncode(audio.data(), audio.size() * sizeof(float), pkts));
+        EXPECT_EQ(pkts.size(), static_cast<size_t>(kTotalFrames));
+
+        AudioCodec::OpusDecodeStats stats;
+        std::vector<uint8_t> out;
+
+        // Decode seq 0 cleanly.
+        EXPECT_TRUE(dec.DecodePacket(0, 480, pkts[0].audioSeq, pkts[0].opusBytes.data(), pkts[0].opusBytes.size(), out, stats));
+        EXPECT_EQ(out.size(), static_cast<size_t>(480 * 8));
+
+        // Skip seq 1, arrive at seq 2 -> synthesizes 1 FEC frame + seq 2.
+        out.clear();
+        EXPECT_TRUE(dec.DecodePacket(0, 480, pkts[2].audioSeq, pkts[2].opusBytes.data(), pkts[2].opusBytes.size(), out, stats));
+        EXPECT_EQ(stats.fecFrames, 1u);
+        EXPECT_EQ(stats.plcFrames, 0u);
+        EXPECT_EQ(out.size(), static_cast<size_t>(2 * 480 * 8));
+
+        // Stale arrival of delayed seq 1 -> rejected without duplicating audio.
+        out.clear();
+        EXPECT_TRUE(!dec.DecodePacket(0, 480, pkts[1].audioSeq, pkts[1].opusBytes.data(), pkts[1].opusBytes.size(), out, stats));
+        EXPECT_EQ(stats.staleDropped, 1u);
+        EXPECT_EQ(out.size(), static_cast<size_t>(0));
+
+        // Multi-packet gap (skip seq 3..7, arrive at seq 8 -> gap=5) caps concealment at kMaxOpusPlcGapFrames (4): 3 PLC + 1 FEC + current.
+        out.clear();
+        EXPECT_TRUE(dec.DecodePacket(0, 480, pkts[8].audioSeq, pkts[8].opusBytes.data(), pkts[8].opusBytes.size(), out, stats));
+        EXPECT_EQ(stats.plcFrames, 3u);
+        EXPECT_EQ(stats.fecFrames, 2u);
+        EXPECT_EQ(out.size(), static_cast<size_t>(5 * 480 * 8));
+
+        // Advance to seq 59, then simulate capture restart back at seq 0 (diff=-60 < -50) -> resyncs cleanly.
+        out.clear();
+        EXPECT_TRUE(dec.DecodePacket(0, 480, pkts[59].audioSeq, pkts[59].opusBytes.data(), pkts[59].opusBytes.size(), out, stats));
+        out.clear();
+        EXPECT_TRUE(dec.DecodePacket(0, 480, pkts[0].audioSeq, pkts[0].opusBytes.data(), pkts[0].opusBytes.size(), out, stats));
+        EXPECT_EQ(stats.resyncCount, 1u);
+        EXPECT_EQ(out.size(), static_cast<size_t>(480 * 8));
+        return true;
+    }
+
+    /**
+     * @brief Verifies AdaptiveJitterController fast attack, cooldown gating, slow clean relaxation, and manual override.
+     * @return True when target expansion, relaxation, floor changes, and manual mode hold exactly.
+     */
+    KAM_TEST(Audio_AdaptiveJitterControllerExpandRelaxAndManualMode) {
+        Audio::AdaptiveJitterController ctrl;
+        ctrl.Reset(80);
+        EXPECT_EQ(ctrl.effectiveTargetMs, 80);
+        EXPECT_TRUE(!ctrl.IsExpanded());
+
+        // Manual mode ignores concealments/rx-gaps and follows the slider directly.
+        EXPECT_TRUE(!ctrl.Update(false, 80, 0.01, true, 180));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 80);
+        EXPECT_TRUE(ctrl.Update(false, 50, 0.01, true, 180));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 50);
+
+        // Adaptive mode starts at floor 80.
+        ctrl.Reset(80);
+        EXPECT_TRUE(!ctrl.Update(true, 80, 1.0, false, 15));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 80);
+
+        // Concealment triggers +20ms immediate expansion (80 -> 100).
+        EXPECT_TRUE(ctrl.Update(true, 80, 0.01, true, 10));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 100);
+        EXPECT_TRUE(ctrl.IsExpanded());
+
+        // Follow-up severe gap inside 4.0s cooldown must NOT double-expand.
+        EXPECT_TRUE(!ctrl.Update(true, 80, 2.0, false, 150));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 100);
+
+        // After >=4.0s cooldown expires, severe rxGap (>80% of 100ms = 85ms) expands 100 -> 120.
+        EXPECT_TRUE(ctrl.Update(true, 80, 2.5, false, 85));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 120);
+
+        // 59.5s clean keeps 120ms; crossing 60.0s relaxes -10ms to 110ms.
+        for (int i = 0; i < 595; ++i) {
+            EXPECT_TRUE(!ctrl.Update(true, 80, 0.1, false, 12));
+        }
+        EXPECT_EQ(ctrl.effectiveTargetMs, 120);
+        EXPECT_TRUE(ctrl.Update(true, 80, 0.6, false, 12));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 110);
+
+        // Step down cleanly over three more 60s clean intervals until hitting floor 80.
+        for (int step = 0; step < 3; ++step) {
+            for (int i = 0; i < 600; ++i) {
+                ctrl.Update(true, 80, 0.1, false, 10);
+            }
+        }
+        EXPECT_EQ(ctrl.effectiveTargetMs, 80);
+        EXPECT_TRUE(!ctrl.IsExpanded());
+
+        // When unexpanded, moving floor slider directly updates active target.
+        EXPECT_TRUE(ctrl.Update(true, 40, 0.01, false, 5));
+        EXPECT_EQ(ctrl.effectiveTargetMs, 40);
         return true;
     }
 

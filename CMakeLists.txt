@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 
-project(KAM-Flow VERSION 1.0 LANGUAGES CXX)
+project(KAM-Flow VERSION 1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
@@ -19,6 +19,21 @@ FetchContent_Declare(
     GIT_TAG v1.90.4
 )
 FetchContent_MakeAvailable(imgui)
+
+# --- LIBOPUS FETCH & STATIC INTEGRATION (BSD-3-Clause) ---
+set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+set(OPUS_STATIC_RUNTIME ON CACHE BOOL "" FORCE)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    opus
+    GIT_REPOSITORY https://github.com/xiph/opus.git
+    GIT_TAG v1.5.2
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(opus)
 
 set(IMGUI_DIR ${imgui_SOURCE_DIR})
 set(IMGUI_SOURCES
@@ -42,6 +57,7 @@ set(SOURCES
     DebugLog.cpp
     SecurityManager_Win.cpp
     CredentialManager_Win.cpp
+    AudioCodec.cpp
     AudioManager_Win.cpp
     NetworkMessages.h
     ClipboardManager_Win.cpp
@@ -60,14 +76,16 @@ set_target_properties(KAM-Flow PROPERTIES LINK_FLAGS "/ENTRY:mainCRTStartup /MAN
 # Include ImGui headers explicitly so the compiler and VS Code find them
 target_include_directories(KAM-Flow PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 
-# Link Windows subsystems, multimedia timers, and DirectX 11
-target_link_libraries(KAM-Flow PRIVATE user32 ws2_32 d3d11 d3dcompiler comdlg32 bcrypt advapi32 ole32 shell32 winmm)
+# Link Windows subsystems, multimedia timers, DirectX 11, and static libopus
+target_link_libraries(KAM-Flow PRIVATE user32 ws2_32 d3d11 d3dcompiler comdlg32 bcrypt advapi32 ole32 shell32 winmm opus)
 
 # Non-elevated console unit test executable for CTest
 enable_testing()
 add_executable(KAMFlowTests
     tests/KAMFlowTests.cpp
+    AudioCodec.cpp
     DebugLog.cpp
 )
 target_include_directories(KAMFlowTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(KAMFlowTests PRIVATE opus)
 add_test(NAME KAMFlowTests COMMAND KAMFlowTests)

@@ -77,8 +77,14 @@ namespace State {
     /// Client: Toggle to receive server microphone data into the Virtual Audio Cable.
     extern std::atomic<bool> enableClientMicReceive;
 
-    /// Target jitter buffer latency in milliseconds for incoming audio.
+    /// Target jitter buffer floor latency in milliseconds for incoming audio.
     extern std::atomic<int> audioJitterBufferMs;
+    /// Server: Enable Opus audio compression with In-Band FEC and PLC.
+    extern std::atomic<bool> enableAudioOpus;
+    /// Server: Enable adaptive auto-scaling jitter buffer above the floor slider.
+    extern std::atomic<bool> enableAdaptiveJitterBuffer;
+    /// Read-only live effective jitter buffer target in milliseconds (updated by renderer).
+    extern std::atomic<int> activeJitterBufferMs;
 
     /// Percentage of the screen corners (0-10) to ignore for edge detection transitions.
     extern std::atomic<int> edgeDeadzonePercent;

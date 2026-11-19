@@ -14,11 +14,12 @@
 
 namespace Audio {
 
-    /// Structure to hold the standard PCM audio format for network transmission.
+    /// Structure to hold the audio stream format and active wire codec.
     struct AudioFormat {
-        uint32_t sampleRate;
-        uint16_t bitDepth;
-        uint16_t channels;
+        uint32_t sampleRate = 0;
+        uint16_t bitDepth = 0;
+        uint16_t channels = 0;
+        uint8_t codec = 0; ///< Active wire codec (0 = PCM, 1 = Opus).
     };
 
     /// Jitter-buffer deadband, hysteresis release threshold, and burst trim ceiling in milliseconds.
@@ -82,6 +83,162 @@ namespace Audio {
         return (std::max)(static_cast<int64_t>(30), safeDuration + 15);
     }
 
+    /// Outgoing capture send-gap threshold (ms) counted as a spike in 30s summaries (above normal 30-38ms silence transitions).
+    constexpr uint32_t kCaptureSendGapSpikeMs = 40;
+    /// Outgoing capture send-gap threshold (ms) triggering an immediate rate-limited warning.
+    constexpr uint32_t kCaptureSendGapWarnMs = 50;
+    /// Outgoing network send() duration threshold (ms) flagging blocking audio transmits.
+    constexpr uint32_t kCaptureSlowSendCallMs = 10;
+    /// Server incoming audio inter-arrival gap threshold (ms) counted as a receive spike.
+    constexpr uint32_t kAudioRxGapSpikeMs = 45;
+
+    /// Accumulates per-30-second capture send timing, packet size, and WASAPI discontinuity telemetry.
+    struct CaptureTimingStats {
+        uint32_t realPackets = 0;
+        uint32_t silencePackets = 0;
+        uint32_t sendGapSpikes = 0;
+        uint32_t slowSendCalls = 0;
+        uint32_t maxSendGapMs = 0;
+        uint32_t maxSendCallMs = 0;
+        uint32_t maxPacketBytes = 0;
+        uint32_t discontinuities = 0;
+        uint32_t silenceClockSlips = 0;
+
+        /// Records an outgoing audio packet send and returns true if an immediate warning should be logged.
+        inline bool RecordSend(uint32_t sendGapMs, bool hasPrevSend, uint32_t sendCallMs,
+                               uint32_t packetBytes, bool isSyntheticSilence) {
+            if (isSyntheticSilence) {
+                ++silencePackets;
+            } else {
+                ++realPackets;
+            }
+            maxPacketBytes = (std::max)(maxPacketBytes, packetBytes);
+            maxSendCallMs = (std::max)(maxSendCallMs, sendCallMs);
+            if (sendCallMs > kCaptureSlowSendCallMs) {
+                ++slowSendCalls;
+            }
+            if (hasPrevSend) {
+                maxSendGapMs = (std::max)(maxSendGapMs, sendGapMs);
+                if (sendGapMs > kCaptureSendGapSpikeMs) {
+                    ++sendGapSpikes;
+                }
+            }
+            return (hasPrevSend && sendGapMs > kCaptureSendGapWarnMs) || (sendCallMs > kCaptureSlowSendCallMs);
+        }
+
+        /// Returns true if any timing anomaly, discontinuity, or blocking send occurred in this window.
+        inline bool HasAnomaly() const {
+            return discontinuities > 0 || silenceClockSlips > 0 || sendGapSpikes > 0 || slowSendCalls > 0;
+        }
+
+        /// Resets all counters and maxima for the next 30-second reporting interval.
+        inline void Reset() {
+            realPackets = 0;
+            silencePackets = 0;
+            sendGapSpikes = 0;
+            slowSendCalls = 0;
+            maxSendGapMs = 0;
+            maxSendCallMs = 0;
+            maxPacketBytes = 0;
+            discontinuities = 0;
+            silenceClockSlips = 0;
+        }
+    };
+
+    /// Minimum allowed jitter buffer target in milliseconds.
+    constexpr int kMinJitterBufferMs = 20;
+    /// Maximum allowed jitter buffer target in milliseconds.
+    constexpr int kMaxJitterBufferMs = 200;
+    /// Step size (ms) when adaptive jitter expands on concealment/starvation/severe network gaps.
+    constexpr int kAdaptiveJitterStepUpMs = 20;
+    /// Step size (ms) when adaptive jitter relaxes after sustained clean playback.
+    constexpr int kAdaptiveJitterStepDownMs = 10;
+    /// Cooldown (seconds) between consecutive upward adaptive jitter expansions.
+    constexpr double kAdaptiveExpandCooldownSec = 4.0;
+    /// Clean playback duration (seconds) required before adaptive jitter steps down.
+    constexpr double kAdaptiveRelaxCleanSec = 60.0;
+    /// Minimum cooldown (seconds) between consecutive downward relaxation steps.
+    constexpr double kAdaptiveRelaxCooldownSec = 30.0;
+
+    /// Pure-logic controller for fast-attack, slow-decay adaptive jitter buffer sizing.
+    struct AdaptiveJitterController {
+        int floorMs = 80;
+        int effectiveTargetMs = 80;
+        double cleanSeconds = 0.0;
+        double secondsSinceLastExpand = kAdaptiveExpandCooldownSec;
+        double secondsSinceLastRelax = kAdaptiveRelaxCooldownSec;
+
+        /// Resets controller state to the given floor target in milliseconds.
+        inline void Reset(int floor) {
+            const int clamped = (std::max)(kMinJitterBufferMs, (std::min)(kMaxJitterBufferMs, floor));
+            floorMs = clamped;
+            effectiveTargetMs = clamped;
+            cleanSeconds = 0.0;
+            secondsSinceLastExpand = kAdaptiveExpandCooldownSec;
+            secondsSinceLastRelax = kAdaptiveRelaxCooldownSec;
+        }
+
+        /// Returns true if adaptive logic has raised the active target above the configured floor.
+        inline bool IsExpanded() const {
+            return effectiveTargetMs > floorMs;
+        }
+
+        /// Advances timers and updates effectiveTargetMs; returns true if effectiveTargetMs changed.
+        inline bool Update(bool adaptiveEnabled,
+                           int requestedFloorMs,
+                           double dtSec,
+                           bool hadConcealOrStarve,
+                           uint32_t maxRxGapMs) {
+            const int clampedFloor = (std::max)(kMinJitterBufferMs, (std::min)(kMaxJitterBufferMs, requestedFloorMs));
+            const int prevTarget = effectiveTargetMs;
+
+            if (!adaptiveEnabled) {
+                floorMs = clampedFloor;
+                effectiveTargetMs = clampedFloor;
+                cleanSeconds = 0.0;
+                secondsSinceLastExpand = kAdaptiveExpandCooldownSec;
+                secondsSinceLastRelax = kAdaptiveRelaxCooldownSec;
+                return effectiveTargetMs != prevTarget;
+            }
+
+            if (clampedFloor != floorMs) {
+                const int oldFloor = floorMs;
+                floorMs = clampedFloor;
+                if (effectiveTargetMs < floorMs || effectiveTargetMs <= oldFloor) {
+                    effectiveTargetMs = floorMs;
+                }
+            }
+
+            if (dtSec > 0.0) {
+                secondsSinceLastExpand += dtSec;
+                secondsSinceLastRelax += dtSec;
+            }
+
+            const double severeRxThresholdMs = static_cast<double>(effectiveTargetMs) * 0.80;
+            const bool severeRxGap = static_cast<double>(maxRxGapMs) > severeRxThresholdMs;
+            if (hadConcealOrStarve || severeRxGap) {
+                cleanSeconds = 0.0;
+                if (secondsSinceLastExpand >= kAdaptiveExpandCooldownSec &&
+                    effectiveTargetMs < kMaxJitterBufferMs) {
+                    effectiveTargetMs = (std::min)(kMaxJitterBufferMs, effectiveTargetMs + kAdaptiveJitterStepUpMs);
+                    secondsSinceLastExpand = 0.0;
+                }
+                return effectiveTargetMs != prevTarget;
+            }
+
+            if (dtSec > 0.0 && effectiveTargetMs > floorMs) {
+                cleanSeconds += dtSec;
+                if (cleanSeconds >= kAdaptiveRelaxCleanSec &&
+                    secondsSinceLastRelax >= kAdaptiveRelaxCooldownSec) {
+                    effectiveTargetMs = (std::max)(floorMs, effectiveTargetMs - kAdaptiveJitterStepDownMs);
+                    cleanSeconds = 0.0;
+                    secondsSinceLastRelax = 0.0;
+                }
+            }
+            return effectiveTargetMs != prevTarget;
+        }
+    };
+
     /// Initializes the Audio Manager and COM for WASAPI.
     bool Initialize();
 
@@ -138,4 +295,7 @@ namespace Audio {
 
     /// Notifies the audio subsystem that the system resumed from sleep or hibernate.
     void NotifySystemResumed();
+
+    /// Broadcasts updated audio codec configuration from Server to all connected clients.
+    void NotifyCodecSettingChanged();
 }

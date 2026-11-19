@@ -114,7 +114,9 @@ std::mutex discoveryMutex;
 
 // Audio state variables.
 Audio::AudioFormat g_serverAudioFormat;
+std::mutex g_serverAudioFormatMutex;
 std::atomic<bool> g_hasServerAudioFormat(false);
+std::atomic<uint8_t> g_serverAudioCodec{0};
 
 // Auto-Reconnect state variables.
 std::string lastConnectedIp = "";
@@ -666,10 +668,19 @@ std::vector<DiscoveredServer> GetDiscoveredServers() {
  * @return true if the format has been received and is valid.
  */
 bool GetServerAudioFormat(Audio::AudioFormat &outFormat) {
+  std::lock_guard<std::mutex> lock(g_serverAudioFormatMutex);
   if (!g_hasServerAudioFormat)
     return false;
   outFormat = g_serverAudioFormat;
   return true;
+}
+
+/**
+ * @brief Retrieves the lock-free active audio wire codec ID dictated by the Server.
+ * @return Wire codec ID (0 = PCM, 1 = Opus).
+ */
+uint8_t GetServerAudioCodec() {
+  return g_serverAudioCodec.load(std::memory_order_relaxed);
 }
 
 /**
@@ -1198,22 +1209,38 @@ void ClientLoop() {
       }
     } else if (h.type == MessageType::EVENT_AUDIO_FORMAT) {
       if (finalSize == sizeof(AudioFormatPayload)) {
+        AudioFormatPayload wireFmt;
+        memcpy(&wireFmt, finalPayload, sizeof(wireFmt));
+
         Audio::AudioFormat newFormat;
-        memcpy(&newFormat, finalPayload, sizeof(newFormat));
+        newFormat.sampleRate = wireFmt.sampleRate;
+        newFormat.bitDepth = wireFmt.bitDepth;
+        newFormat.channels = wireFmt.channels;
+        newFormat.codec = wireFmt.codec;
 
-        bool formatChanged = g_hasServerAudioFormat &&
-                             ((g_serverAudioFormat.sampleRate != newFormat.sampleRate) ||
-                              (g_serverAudioFormat.bitDepth != newFormat.bitDepth) ||
-                              (g_serverAudioFormat.channels != newFormat.channels));
+        bool formatChanged = false;
+        bool codecChanged = false;
+        {
+          std::lock_guard<std::mutex> lock(g_serverAudioFormatMutex);
+          const bool hadFmt = g_hasServerAudioFormat.load(std::memory_order_relaxed);
+          formatChanged = hadFmt &&
+                          ((g_serverAudioFormat.sampleRate != newFormat.sampleRate) ||
+                           (g_serverAudioFormat.bitDepth != newFormat.bitDepth) ||
+                           (g_serverAudioFormat.channels != newFormat.channels));
+          codecChanged = hadFmt && (g_serverAudioFormat.codec != newFormat.codec);
+          g_serverAudioFormat = newFormat;
+          g_serverAudioCodec.store(newFormat.codec, std::memory_order_relaxed);
+          g_hasServerAudioFormat = true;
+        }
 
-        g_serverAudioFormat = newFormat;
-        g_hasServerAudioFormat = true;
-        if (State::globalDebugMode)
+        if (State::globalDebugMode) {
+          const char* suffix = formatChanged ? " (Format Changed)"
+                             : (codecChanged ? " (Codec Changed)" : "");
           UI::LogDebug(
-              "[Audio] Received Server Audio Format: %uHz, %u-bit, %uch%s",
-              g_serverAudioFormat.sampleRate, g_serverAudioFormat.bitDepth,
-              g_serverAudioFormat.channels,
-              formatChanged ? " (Format Changed)" : "");
+              "[Audio] Received Server Audio Format: %uHz, %u-bit, %uch, Codec=%s%s",
+              newFormat.sampleRate, newFormat.bitDepth,
+              newFormat.channels, newFormat.codec == 1 ? "Opus" : "PCM", suffix);
+        }
 
         if (formatChanged) {
           // If capture or mic receiver was already running, stop first so StartLoopbackCapture
@@ -1227,7 +1254,7 @@ void ClientLoop() {
             Audio::StartMicReceiver();
           }
         } else {
-          // Format has not changed; start streams if enabled and not already running
+          // Format dimensions unchanged (or codec toggled in-place); start streams if needed.
           if (State::enableClientAudioStream) {
             Audio::StartLoopbackCapture();
           }

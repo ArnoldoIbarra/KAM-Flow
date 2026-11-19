@@ -1684,18 +1684,55 @@ namespace UI {
                 ImGui::Text("Audio Subsystem");
                 ImGui::Separator();
 
+                if (State::currentRole == State::AppRole::SERVER) {
+                    if (AtomicCheckbox("Compress Audio with Opus (Wi-Fi Resilient)", State::enableAudioOpus)) {
+                        Audio::NotifyCodecSettingChanged();
+                    }
+                    DrawWrappedTooltip("Encodes network audio with low-latency 10ms Opus and In-Band FEC (~24x smaller packets than raw PCM) to prevent Wi-Fi fragmentation and drops. Clients sync automatically from the Server.");
+
+                    if (AtomicCheckbox("Adaptive Jitter Buffer (Auto)", State::enableAdaptiveJitterBuffer)) {
+                        if (!State::enableAdaptiveJitterBuffer.load(std::memory_order_relaxed)) {
+                            State::activeJitterBufferMs.store(
+                                State::audioJitterBufferMs.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+                        }
+                    }
+                    DrawWrappedTooltip("Automatically raises the active jitter buffer (+20 ms steps up to 200 ms) during Wi-Fi bursts or underruns, then gently relaxes back down to your Min Jitter Buffer floor after 60 seconds of clean playback.");
+                }
+
                 ImGui::SetNextItemWidth(150.0f);
-                AtomicSliderInt("##JitterBuffer", State::audioJitterBufferMs, 20, 200, "%d ms");
+                if (AtomicSliderInt("##JitterBuffer", State::audioJitterBufferMs, 20, 200, "%d ms")) {
+                    if (State::currentRole == State::AppRole::SERVER &&
+                        (!State::enableAdaptiveJitterBuffer.load(std::memory_order_relaxed) ||
+                         !State::enableServerAudioMix.load(std::memory_order_relaxed))) {
+                        State::activeJitterBufferMs.store(
+                            State::audioJitterBufferMs.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+                    }
+                }
                 ImGui::SameLine();
                 if (ImGui::SmallButton("Reset##JitterBuffer")) {
                     State::audioJitterBufferMs.store(80, std::memory_order_relaxed);
+                    if (State::currentRole == State::AppRole::SERVER &&
+                        (!State::enableAdaptiveJitterBuffer.load(std::memory_order_relaxed) ||
+                         !State::enableServerAudioMix.load(std::memory_order_relaxed))) {
+                        State::activeJitterBufferMs.store(80, std::memory_order_relaxed);
+                    }
                 }
                 DrawWrappedTooltip("Reset network jitter buffer to default (80 ms).");
                 ImGui::SameLine();
-                ImGui::Text("Network Jitter Buffer");
                 if (State::currentRole == State::AppRole::SERVER) {
-                    DrawWrappedTooltip("Increase to stop audio skipping on unstable networks (adds latency). Decrease for instant audio response when listening to Clients.");
+                    const bool isAdaptive = State::enableAdaptiveJitterBuffer.load(std::memory_order_relaxed);
+                    ImGui::Text("%s", isAdaptive ? "Min Jitter Buffer" : "Network Jitter Buffer");
+                    DrawWrappedTooltip(isAdaptive
+                        ? "Floor target for adaptive buffering (20-200 ms). The Server raises Active latency automatically if Wi-Fi stalls and returns to this floor once clean."
+                        : "Fixed target jitter buffer (20-200 ms). Increase to stop audio skipping on unstable networks; decrease for lower latency.");
+                    if (isAdaptive) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(Active: %d ms)", State::activeJitterBufferMs.load(std::memory_order_relaxed));
+                    }
                 } else {
+                    ImGui::Text("Network Jitter Buffer");
                     DrawWrappedTooltip("Increase to stop audio skipping when receiving the Server's Microphone. Decrease for instant audio response.");
                 }
                 ImGui::Spacing();

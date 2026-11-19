@@ -110,16 +110,22 @@ namespace Config {
         State::enableServerMicBroadcast = GetPrivateProfileIntA("Audio", "EnableServerMicBroadcast", 0, fullPath.c_str()) != 0;
         State::enableClientAudioStream = GetPrivateProfileIntA("Audio", "EnableClientAudioStream", 1, fullPath.c_str()) != 0;
         State::enableClientMicReceive = GetPrivateProfileIntA("Audio", "EnableClientMicReceive", 0, fullPath.c_str()) != 0;
+        State::enableAudioOpus = GetPrivateProfileIntA("Audio", "EnableAudioOpus", 1, fullPath.c_str()) != 0;
+        State::enableAdaptiveJitterBuffer = GetPrivateProfileIntA("Audio", "EnableAdaptiveJitterBuffer", 1, fullPath.c_str()) != 0;
 
         int jitterMs = GetPrivateProfileIntA("Audio", "JitterBufferMs", 80, fullPath.c_str());
         if (jitterMs < 20) { jitterMs = 20; hadClamp = true; }
         if (jitterMs > 200) { jitterMs = 200; hadClamp = true; }
         State::audioJitterBufferMs = jitterMs;
+        State::activeJitterBufferMs = jitterMs;
 
         if (State::globalDebugMode) {
-            UI::LogDebug("[Config] Loaded %s (DefaultRole=%d, Jitter=%dms, Deadzone=%d%%, Sens=%.2f, GameMode=%d)",
+            UI::LogDebug("[Config] Loaded %s (DefaultRole=%d, Jitter=%dms, AutoJitter=%d, Opus=%d, Deadzone=%d%%, Sens=%.2f, GameMode=%d)",
                          fullPath.c_str(), static_cast<int>(State::defaultRole),
-                         State::audioJitterBufferMs.load(), State::edgeDeadzonePercent.load(),
+                         State::audioJitterBufferMs.load(),
+                         State::enableAdaptiveJitterBuffer.load() ? 1 : 0,
+                         State::enableAudioOpus.load() ? 1 : 0,
+                         State::edgeDeadzonePercent.load(),
                          State::mouseSensitivity.load(), State::enableGameMode.load() ? 1 : 0);
             if (sensParseFailed || hadClamp) {
                 UI::LogDebug("[Config] WARNING: Some settings in '%s' were malformed or out of range and were clamped to safe bounds.",
@@ -166,6 +172,8 @@ namespace Config {
         writeIni("Audio", "EnableServerMicBroadcast", State::enableServerMicBroadcast.load() ? "1" : "0");
         writeIni("Audio", "EnableClientAudioStream", State::enableClientAudioStream.load() ? "1" : "0");
         writeIni("Audio", "EnableClientMicReceive", State::enableClientMicReceive.load() ? "1" : "0");
+        writeIni("Audio", "EnableAudioOpus", State::enableAudioOpus.load() ? "1" : "0");
+        writeIni("Audio", "EnableAdaptiveJitterBuffer", State::enableAdaptiveJitterBuffer.load() ? "1" : "0");
         writeIni("Audio", "JitterBufferMs", std::to_string(State::audioJitterBufferMs.load()).c_str());
 
         if (firstWriteErr != 0 && State::globalDebugMode) {

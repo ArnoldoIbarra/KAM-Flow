@@ -11,8 +11,10 @@
  */
 
 #include "AudioManager.h"
+#include "AudioCodec.h"
 #include "DebugLog.h"
 #include "StateManager.h"
+#include "NetworkMessages.h"
 #include "NetworkClient.h"
 #include "NetworkServer.h"
 #include "UIManager.h"
@@ -95,29 +97,39 @@ namespace Audio {
     }
 
     /**
-     * @brief Emits a 30-second WASAPI capture anomaly summary only when discontinuities or clock slips occurred.
+     * @brief Atomically updates target to the maximum of its current value and value.
+     * @param target Atomic maximum accumulator.
+     * @param value Candidate value to incorporate.
+     * @return void
+     */
+    static inline void AtomicUpdateMax(std::atomic<uint32_t>& target, uint32_t value) {
+        uint32_t cur = target.load(std::memory_order_relaxed);
+        while (value > cur && !target.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {
+        }
+    }
+
+    /**
+     * @brief Emits a 30-second WASAPI capture anomaly summary when discontinuities, slips, or send stalls occurred.
      * @param label Thread label for diagnostic output.
      * @param intervalStart Start timestamp of the current 30-second window (reset when elapsed).
-     * @param discontinuityCount Accumulated AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY count (reset when elapsed).
-     * @param silenceClockSlips Accumulated silence-pacer deadline slip count (reset when elapsed).
+     * @param stats Accumulated capture timing, packet-size, and discontinuity telemetry (reset when elapsed).
      * @return void
      */
     static void MaybeLogCapturePerf30s(const char* label,
                                       std::chrono::steady_clock::time_point& intervalStart,
-                                      uint32_t& discontinuityCount,
-                                      uint32_t& silenceClockSlips) {
+                                      CaptureTimingStats& stats) {
         auto now = std::chrono::steady_clock::now();
         if ((now - intervalStart) < std::chrono::seconds(30)) {
             return;
         }
-        if (State::globalDebugMode &&
-            Network::ShouldEmitPerfSummary(static_cast<uint64_t>(discontinuityCount) + silenceClockSlips)) {
-            UI::LogDebug("[Audio Perf] %s 30s: WASAPI discontinuities=%u, silence-clock slips=%u",
-                         label, discontinuityCount, silenceClockSlips);
+        if (State::globalDebugMode && stats.HasAnomaly()) {
+            UI::LogDebug("[Audio Perf] %s 30s: tx=%u (real=%u sil=%u) | maxGap=%ums (>%ums=%u) | maxSend=%ums | maxPkt=%uB | disc=%u slips=%u",
+                         label, stats.realPackets + stats.silencePackets, stats.realPackets, stats.silencePackets,
+                         stats.maxSendGapMs, kCaptureSendGapSpikeMs, stats.sendGapSpikes,
+                         stats.maxSendCallMs, stats.maxPacketBytes, stats.discontinuities, stats.silenceClockSlips);
         }
         intervalStart = now;
-        discontinuityCount = 0;
-        silenceClockSlips = 0;
+        stats.Reset();
     }
 
     // --- CLIENT CAPTURE THREAD ---
@@ -141,6 +153,24 @@ namespace Audio {
     // --- SERVER RENDER STATE ---
     AudioFormat g_serverRenderFormat;
     std::atomic<bool> g_hasRenderFormat(false);
+    std::atomic<uint32_t> g_serverRenderRate{0};
+    std::atomic<uint16_t> g_serverRenderBits{0};
+    std::atomic<uint16_t> g_serverRenderChannels{0};
+    std::mutex g_formatBroadcastMutex;
+
+    /**
+     * @brief Serializes an internal AudioFormat struct into the packed 12-byte wire AudioFormatPayload.
+     * @param fmt Source audio format and negotiated codec.
+     * @return Packed AudioFormatPayload ready for EVENT_AUDIO_FORMAT transmission.
+     */
+    static Network::AudioFormatPayload MakeAudioFormatPayload(const AudioFormat& fmt) {
+        Network::AudioFormatPayload payload = {};
+        payload.sampleRate = fmt.sampleRate;
+        payload.bitDepth = fmt.bitDepth;
+        payload.channels = fmt.channels;
+        payload.codec = fmt.codec;
+        return payload;
+    }
 
     /**
      * @brief A low-overhead circular buffer for audio PCM data.
@@ -219,6 +249,14 @@ namespace Audio {
         std::atomic<bool> isEnabled{true};
         std::atomic<float> volume{1.0f};
         std::atomic<uint32_t> overrunCount{0};
+        std::atomic<uint32_t> rxMaxGapMs{0};
+        std::atomic<uint32_t> pendingAdaptRxGapMs{0};
+        std::atomic<uint32_t> rxGapSpikes{0};
+        std::atomic<uint32_t> rxMaxPktBytes{0};
+        std::atomic<uint32_t> rxPackets{0};
+        std::atomic<uint32_t> opusFecCount{0};
+        std::atomic<uint32_t> opusPlcCount{0};
+        std::atomic<uint32_t> opusStaleCount{0};
         bool isBuffering = true;
         bool wasBuffering = false;  // Tracks previous buffering state for silence->audio fade-in
         bool needsFadeIn = false;   // Signals smooth crossfade ramp after partial fills, silence, or underflows
@@ -230,6 +268,11 @@ namespace Audio {
         bool hasHermiteHistory = false;
         float appliedTargetMs = -1.0f;          // Last observed jitter target (detects live slider adjustments)
         bool seekingTarget = false;             // True while converging smoothly onto an updated slider target
+        std::chrono::steady_clock::time_point lastRxTime{};
+        bool hasRxTime = false;
+        uint8_t lastRxCodec = 255;
+        AudioCodec::OpusStreamDecoder opusDecoder;
+        std::vector<uint8_t> decodePcmScratch;
 
         void ResetStreamState() {
             buffer.Clear();
@@ -241,6 +284,10 @@ namespace Audio {
             hasHermiteHistory = false;
             appliedTargetMs = -1.0f;
             seekingTarget = false;
+            hasRxTime = false;
+            pendingAdaptRxGapMs.store(0, std::memory_order_relaxed);
+            lastRxCodec = 255;
+            opusDecoder.Reset(true);
             std::fill(std::begin(lastFrameFloat), std::end(lastFrameFloat), 0.0f);
             std::fill(std::begin(lastFrameInt16), std::end(lastFrameInt16), static_cast<int16_t>(0));
             for (int i = 0; i < 3; ++i) {
@@ -250,6 +297,275 @@ namespace Audio {
     };
     std::map<uintptr_t, std::shared_ptr<ClientAudioQueue>> g_clientAudioQueues;
     std::shared_mutex g_queuesMutex; // Protects the map itself during additions/removals.
+
+    /**
+     * @brief Encodes active audio into 10ms Opus frames or splits raw PCM into MTU-safe packets.
+     * Both capture paths (client loopback and server mic) share this wire packet emitter.
+     * @param format Active WASAPI capture stream format.
+     * @param useOpus True when Opus encoding should be used (if format-supported).
+     * @param isVoice True for VOIP microphone tuning, false for desktop audio music/multimedia tuning.
+     * @param isSilence True when transmitting pure digital silence (header-only 8-byte fast path).
+     * @param numFrames Number of PCM frames represented or contained in pcmData.
+     * @param pcmData Interleaved PCM buffer (optional when isSilence is true).
+     * @param encoder Per-thread Opus encoder and monotonic sequence generator.
+     * @param activeOpusState Tracks whether the previous packet used Opus so live toggling resets FIFO cleanly.
+     * @param encodedScratch Reusable vector holding newly produced Opus packets.
+     * @param txScratch Reusable packet assembly buffer holding AudioPacketHeader + payload.
+     * @param sendPacketFn Callable receiving (const void* packetBytes, UINT32 packetSize).
+     * @return void
+     */
+    template <typename SendPacketFn>
+    static void EmitAudioStreamFrames(const AudioFormat& format,
+                                      bool useOpus,
+                                      bool isVoice,
+                                      bool isSilence,
+                                      uint16_t numFrames,
+                                      const uint8_t* pcmData,
+                                      AudioCodec::OpusStreamEncoder& encoder,
+                                      bool& activeOpusState,
+                                      std::vector<AudioCodec::EncodedOpusPacket>& encodedScratch,
+                                      std::vector<uint8_t>& txScratch,
+                                      SendPacketFn&& sendPacketFn) {
+        if (numFrames == 0) {
+            return;
+        }
+
+        const bool wantOpus = AudioCodec::ResolveEffectiveAudioCodec(
+            useOpus, format.sampleRate, format.channels, format.bitDepth) == AudioCodec::kAudioCodecOpus;
+        if (wantOpus) {
+            if (!encoder.IsInitialized() ||
+                encoder.GetSampleRate() != format.sampleRate ||
+                encoder.GetChannels() != format.channels ||
+                encoder.GetBitDepth() != format.bitDepth) {
+                encoder.Initialize(format.sampleRate, format.bitDepth, format.channels, isVoice);
+            }
+            activeOpusState = encoder.IsInitialized();
+        } else {
+            if (activeOpusState) {
+                encoder.Reset(false);
+                activeOpusState = false;
+            }
+        }
+
+        if (activeOpusState) {
+            if (isSilence) {
+                encoder.NotifySilenceSkipped();
+                Network::AudioPacketHeader hdr = {};
+                hdr.codec = AudioCodec::kAudioCodecOpus;
+                hdr.flags = Network::AUDIO_FLAG_SILENCE;
+                hdr.frameCount = numFrames;
+                hdr.audioSeq = encoder.NextSequence();
+                sendPacketFn(&hdr, static_cast<UINT32>(sizeof(hdr)));
+                return;
+            }
+
+            if (pcmData) {
+                const size_t blockAlign = static_cast<size_t>(format.channels) * (format.bitDepth / 8);
+                encodedScratch.clear();
+                if (encoder.PushPcmAndEncode(pcmData, static_cast<size_t>(numFrames) * blockAlign, encodedScratch)) {
+                    for (const auto& pkt : encodedScratch) {
+                        Network::AudioPacketHeader hdr = {};
+                        hdr.codec = AudioCodec::kAudioCodecOpus;
+                        hdr.flags = pkt.flags;
+                        hdr.frameCount = pkt.frameCount;
+                        hdr.audioSeq = pkt.audioSeq;
+                        txScratch.resize(sizeof(hdr) + pkt.opusBytes.size());
+                        std::memcpy(txScratch.data(), &hdr, sizeof(hdr));
+                        if (!pkt.opusBytes.empty()) {
+                            std::memcpy(txScratch.data() + sizeof(hdr), pkt.opusBytes.data(), pkt.opusBytes.size());
+                        }
+                        sendPacketFn(txScratch.data(), static_cast<UINT32>(txScratch.size()));
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Uncompressed PCM path: keep silence compact (8B header) and chunk active audio <= 1280B to eliminate IP fragmentation.
+        if (isSilence) {
+            Network::AudioPacketHeader hdr = {};
+            hdr.codec = AudioCodec::kAudioCodecPcm;
+            hdr.flags = Network::AUDIO_FLAG_SILENCE;
+            hdr.frameCount = numFrames;
+            hdr.audioSeq = encoder.NextSequence();
+            sendPacketFn(&hdr, static_cast<UINT32>(sizeof(hdr)));
+            return;
+        }
+
+        if (!pcmData) {
+            return;
+        }
+        const uint32_t blockAlign = static_cast<uint32_t>(format.channels) * (format.bitDepth / 8);
+        if (blockAlign == 0) {
+            return;
+        }
+        const size_t totalBytes = static_cast<size_t>(numFrames) * blockAlign;
+        const size_t chunkBytes = AudioCodec::ComputeMtuSafePcmChunkBytes(blockAlign);
+        size_t offset = 0;
+        while (offset < totalBytes) {
+            const size_t sliceBytes = (std::min)(chunkBytes, totalBytes - offset);
+            const uint16_t sliceFrames = static_cast<uint16_t>(sliceBytes / blockAlign);
+            Network::AudioPacketHeader hdr = {};
+            hdr.codec = AudioCodec::kAudioCodecPcm;
+            hdr.flags = 0;
+            hdr.frameCount = sliceFrames;
+            hdr.audioSeq = encoder.NextSequence();
+            txScratch.resize(sizeof(hdr) + sliceBytes);
+            std::memcpy(txScratch.data(), &hdr, sizeof(hdr));
+            std::memcpy(txScratch.data() + sizeof(hdr), pcmData + offset, sliceBytes);
+            sendPacketFn(txScratch.data(), static_cast<UINT32>(txScratch.size()));
+            offset += sliceBytes;
+        }
+    }
+
+    /**
+     * @brief Decodes one incoming AudioPacketHeader-prefixed network packet into a queue and enforces jitter bounds.
+     * Shared by HandleAudioData (Server) and HandleMicData (Client) to keep buffering/FEC/PLC logic unified.
+     * @param queue Destination ClientAudioQueue.
+     * @param streamFmt Active PCM output format of the target WASAPI renderer.
+     * @param packetData Decrypted wire payload starting with Network::AudioPacketHeader.
+     * @param packetSize Byte size of packetData.
+     * @param targetJitterMs Current target jitter buffer depth in milliseconds.
+     * @param recordRxStats True on Server mix queues to update 30s receive-gap telemetry and adaptive gap inputs.
+     * @param outSwitchedCodec Receives the new codec ID if the incoming codec changed, or 255 if unchanged.
+     * @param outDroppedOverrun Set true if buffer exceeded maxBufferMs and oldest samples were trimmed.
+     * @param outLoggedTargetMs Receives the overrun ceiling in milliseconds when outDroppedOverrun is true.
+     * @return True if decoded audio was queued cleanly; false if invalid/stale/ignored.
+     */
+    static bool PushDecodedAudioPacket(ClientAudioQueue& queue,
+                                       const AudioFormat& streamFmt,
+                                       const void* packetData,
+                                       size_t packetSize,
+                                       float targetJitterMs,
+                                       bool recordRxStats,
+                                       uint8_t& outSwitchedCodec,
+                                       bool& outDroppedOverrun,
+                                       float& outLoggedTargetMs) {
+        outSwitchedCodec = 255;
+        outDroppedOverrun = false;
+        outLoggedTargetMs = 0.0f;
+
+        if (!packetData || packetSize < sizeof(Network::AudioPacketHeader)) {
+            return false;
+        }
+        const size_t frameSize = static_cast<size_t>(streamFmt.channels) * (streamFmt.bitDepth / 8);
+        if (streamFmt.sampleRate == 0 || frameSize == 0) {
+            return false;
+        }
+
+        Network::AudioPacketHeader hdr = {};
+        std::memcpy(&hdr, packetData, sizeof(hdr));
+        const uint8_t* payload = static_cast<const uint8_t*>(packetData) + sizeof(hdr);
+        const size_t payloadBytes = packetSize - sizeof(hdr);
+
+        std::lock_guard<std::mutex> queueLock(queue.mtx);
+
+        if (recordRxStats) {
+            const auto rxNow = std::chrono::steady_clock::now();
+            if (queue.hasRxTime) {
+                const int64_t gapMs = std::chrono::duration_cast<std::chrono::milliseconds>(rxNow - queue.lastRxTime).count();
+                if (gapMs > 0) {
+                    const uint32_t gapU32 = static_cast<uint32_t>((std::min)(gapMs, static_cast<int64_t>(UINT32_MAX)));
+                    AtomicUpdateMax(queue.rxMaxGapMs, gapU32);
+                    AtomicUpdateMax(queue.pendingAdaptRxGapMs, gapU32);
+                    if (gapU32 > kAudioRxGapSpikeMs) {
+                        queue.rxGapSpikes.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+            queue.lastRxTime = rxNow;
+            queue.hasRxTime = true;
+            queue.rxPackets.fetch_add(1, std::memory_order_relaxed);
+            AtomicUpdateMax(queue.rxMaxPktBytes,
+                            static_cast<uint32_t>((std::min)(packetSize, static_cast<size_t>(UINT32_MAX))));
+        }
+
+        const uint8_t* decodedPtr = nullptr;
+        size_t decodedBytes = 0;
+
+        if (hdr.codec == AudioCodec::kAudioCodecOpus) {
+            if (queue.lastRxCodec != AudioCodec::kAudioCodecOpus) {
+                // Reset expected sequence state when switching into Opus from PCM or initial startup
+                // so prior PCM audioSeq counts never trigger bogus PLC/FEC synthesis.
+                queue.opusDecoder.Reset(true);
+            }
+            if (!queue.opusDecoder.MatchesFormat(streamFmt.sampleRate, streamFmt.bitDepth, streamFmt.channels)) {
+                if (!queue.opusDecoder.Initialize(streamFmt.sampleRate, streamFmt.bitDepth, streamFmt.channels)) {
+                    return false;
+                }
+            }
+            queue.decodePcmScratch.clear();
+            AudioCodec::OpusDecodeStats dStats = {};
+            const bool ok = queue.opusDecoder.DecodePacket(
+                hdr.flags, hdr.frameCount, hdr.audioSeq, payload, payloadBytes, queue.decodePcmScratch, dStats);
+            queue.opusFecCount.fetch_add(dStats.fecFrames, std::memory_order_relaxed);
+            queue.opusPlcCount.fetch_add(dStats.plcFrames, std::memory_order_relaxed);
+            queue.opusStaleCount.fetch_add(dStats.staleDropped, std::memory_order_relaxed);
+            if (!ok || queue.decodePcmScratch.empty()) {
+                return false;
+            }
+            decodedPtr = queue.decodePcmScratch.data();
+            decodedBytes = queue.decodePcmScratch.size();
+        } else if (hdr.codec == AudioCodec::kAudioCodecPcm) {
+            if ((hdr.flags & Network::AUDIO_FLAG_SILENCE) != 0 && payloadBytes == 0) {
+                const size_t silenceFrames = (hdr.frameCount > 0) ? hdr.frameCount : (streamFmt.sampleRate / 100);
+                decodedBytes = silenceFrames * frameSize;
+                queue.decodePcmScratch.assign(decodedBytes, 0);
+                decodedPtr = queue.decodePcmScratch.data();
+            } else {
+                if (payloadBytes == 0 || (payloadBytes % frameSize) != 0) {
+                    return false;
+                }
+                decodedPtr = payload;
+                decodedBytes = payloadBytes;
+            }
+        } else {
+            return false;
+        }
+
+        if (queue.lastRxCodec != hdr.codec) {
+            queue.lastRxCodec = hdr.codec;
+            outSwitchedCodec = hdr.codec;
+        }
+
+        queue.buffer.Push(decodedPtr, decodedBytes);
+
+        const size_t bytesPerSec = static_cast<size_t>(streamFmt.sampleRate) * frameSize;
+        const BufferBounds bounds = ComputeBufferBounds(targetJitterMs);
+
+        size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (bounds.releaseMs / 1000.0f));
+        minBufferThreshold -= (minBufferThreshold % frameSize);
+        if (queue.isBuffering && queue.buffer.Size() >= minBufferThreshold) {
+            queue.isBuffering = false;
+            queue.wasBuffering = true;
+        }
+
+        const size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (bounds.maxBufferMs / 1000.0f));
+        if (queue.wasBuffering && queue.buffer.Size() > minBufferThreshold) {
+            size_t staleExcess = queue.buffer.Size() - minBufferThreshold;
+            staleExcess -= (staleExcess % frameSize);
+            if (staleExcess > 0) {
+                queue.buffer.Drop(staleExcess);
+            }
+        } else if (queue.buffer.Size() > maxBufferSize) {
+            const size_t trimTargetBytes = static_cast<size_t>(bytesPerSec * (bounds.highDeadbandMs / 1000.0f));
+            size_t excess = (queue.buffer.Size() > trimTargetBytes)
+                ? (queue.buffer.Size() - trimTargetBytes)
+                : 0;
+            excess -= (excess % frameSize);
+
+            if (excess > 0) {
+                outDroppedOverrun = true;
+                outLoggedTargetMs = bounds.maxBufferMs;
+                queue.overrunCount.fetch_add(1, std::memory_order_relaxed);
+                queue.buffer.Drop(excess);
+                queue.needsFadeIn = true;
+                queue.hasHermiteHistory = false;
+                queue.resamplePhase = 0.0;
+            }
+        }
+        return true;
+    }
 
     /**
      * @brief Evaluates a C1-continuous 4-point Hermite cubic interpolator.
@@ -459,6 +775,9 @@ namespace Audio {
         } else {
             outFormat.bitDepth = pWaveFormat->wBitsPerSample;
         }
+        outFormat.codec = AudioCodec::ResolveEffectiveAudioCodec(
+            State::enableAudioOpus.load(std::memory_order_relaxed),
+            outFormat.sampleRate, outFormat.channels, outFormat.bitDepth);
 
         CoTaskMemFree(pWaveFormat);
         return true;
@@ -504,6 +823,11 @@ namespace Audio {
         CoInitRAII coInit;
         // Register with MMCSS to guarantee CPU scheduling even when a game is consuming 100% CPU
         HANDLE hMmcss = RegisterMMCSS(L"Pro Audio", "CaptureThread");
+
+        AudioCodec::OpusStreamEncoder capEncoder;
+        std::vector<AudioCodec::EncodedOpusPacket> capEncodedScratch;
+        std::vector<uint8_t> capTxScratch;
+        bool capUsingOpus = false;
 
         while (g_isCaptureRunning) {
             if (!pEnumerator) {
@@ -617,9 +941,23 @@ namespace Audio {
             // prevents beating against WASAPI's 10ms audio engine periods and eliminates bursty packet delivery.
             DWORD sleepTimeMs = 3;
 
+            UINT32 capBufferFrames = 0;
+            pAudioClient->GetBufferSize(&capBufferFrames);
+            REFERENCE_TIME defaultPeriod = 0;
+            REFERENCE_TIME minPeriod = 0;
+            pAudioClient->GetDevicePeriod(&defaultPeriod, &minPeriod);
+
             if (State::globalDebugMode) {
-                UI::LogDebug("[Audio] Loopback capture started (%uHz %uch %u-bit, 3ms low-jitter polling).",
-                             targetFormat.sampleRate, targetFormat.channels, targetFormat.bitDepth);
+                const double sr = (targetFormat.sampleRate > 0) ? static_cast<double>(targetFormat.sampleRate) : 48000.0;
+                const double enginePeriodMs = static_cast<double>(defaultPeriod) / 10000.0;
+                const double capBufMs = 1000.0 * static_cast<double>(capBufferFrames) / sr;
+                const bool initialOpus = AudioCodec::ResolveEffectiveAudioCodec(
+                    Network::GetServerAudioCodec() == AudioCodec::kAudioCodecOpus,
+                    targetFormat.sampleRate, targetFormat.channels, targetFormat.bitDepth) == AudioCodec::kAudioCodecOpus;
+                UI::LogDebug("[Audio] Loopback capture started (%uHz %uch %u-bit, Codec=%s, enginePeriod=%.1fms, capBuf=%uf/%.1fms, 3ms polling).",
+                             targetFormat.sampleRate, targetFormat.channels, targetFormat.bitDepth,
+                             initialOpus ? "Opus" : "PCM",
+                             enginePeriodMs, capBufferFrames, capBufMs);
             }
 
             // 7. Main capture streaming loop for this device
@@ -629,10 +967,53 @@ namespace Audio {
             int64_t lastPacketDurationMs = 10;
             bool silenceActive = false;
             auto capPerfStart = std::chrono::steady_clock::now();
-            uint32_t discontinuityCount = 0;
-            uint32_t silenceClockSlips = 0;
+            CaptureTimingStats capStats;
+            std::chrono::steady_clock::time_point lastAudioSendTime{};
+            bool hasLastAudioSend = false;
+            static DebugLog::RateLimitState capSendGapWarnRate;
+            bool lastWantOpus = (Network::GetServerAudioCodec() == AudioCodec::kAudioCodecOpus);
+
+            auto sendTrackedAudio = [&](const void* data, UINT32 dataSize, bool isSyntheticSilence, const char* srcLabel) {
+                const auto sendStart = std::chrono::steady_clock::now();
+                const uint32_t sendGapMs = hasLastAudioSend
+                    ? static_cast<uint32_t>((std::max)(static_cast<int64_t>(0),
+                          std::chrono::duration_cast<std::chrono::milliseconds>(sendStart - lastAudioSendTime).count()))
+                    : 0u;
+                Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, data, dataSize);
+                const auto sendEnd = std::chrono::steady_clock::now();
+                const uint32_t sendCallMs = static_cast<uint32_t>((std::max)(static_cast<int64_t>(0),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(sendEnd - sendStart).count()));
+
+                const bool hadPrevSend = hasLastAudioSend;
+                lastAudioSendTime = sendStart;
+                hasLastAudioSend = true;
+
+                if (capStats.RecordSend(sendGapMs, hadPrevSend, sendCallMs, dataSize, isSyntheticSilence) &&
+                    State::globalDebugMode) {
+                    uint32_t suppressed = 0;
+                    if (capSendGapWarnRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                        char supBuf[32] = "";
+                        if (suppressed > 0) {
+                            snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+                        }
+                        UI::LogDebug("[Audio] WARNING: CaptureThread send gap %ums (sendCall=%ums, pkt=%uB, src=%s%s).",
+                                     sendGapMs, sendCallMs, dataSize, srcLabel, supBuf);
+                    }
+                }
+            };
 
             while (g_isCaptureRunning && !deviceInvalidated) {
+                const bool wantOpus = (Network::GetServerAudioCodec() == AudioCodec::kAudioCodecOpus);
+                if (wantOpus != lastWantOpus) {
+                    lastWantOpus = wantOpus;
+                    if (State::globalDebugMode) {
+                        const uint8_t eff = AudioCodec::ResolveEffectiveAudioCodec(
+                            wantOpus, targetFormat.sampleRate, targetFormat.channels, targetFormat.bitDepth);
+                        UI::LogDebug("[Audio] CaptureThread: Live codec switched to %s.",
+                                     eff == AudioCodec::kAudioCodecOpus ? "Opus" : "PCM");
+                    }
+                }
+
                 UINT32 packetLength = 0;
                 hr = pCaptureClient->GetNextPacketSize(&packetLength);
                 if (FAILED(hr)) {
@@ -652,22 +1033,24 @@ namespace Audio {
                     if (idleDurationMs >= idleThresholdMs) {
                         if (!silenceActive) {
                             silenceActive = true;
-                            nextSilenceDeadline = now;
+                            // Backdate by 10ms so the initial transition sends two 10ms catch-up silence packets,
+                            // preventing the ~30ms idleThreshold wait from draining the Server's jitter buffer.
+                            nextSilenceDeadline = now - std::chrono::milliseconds(10);
                         }
-                        static thread_local std::vector<BYTE> idleSilenceBuffer;
-                        UINT32 framesPer10ms = targetWaveFormat.nSamplesPerSec / 100;
-                        UINT32 dataSize = framesPer10ms * targetWaveFormat.nBlockAlign;
-                        if (idleSilenceBuffer.size() != dataSize) {
-                            idleSilenceBuffer.assign(dataSize, 0);
-                        }
+                        const uint16_t framesPer10ms = static_cast<uint16_t>(targetWaveFormat.nSamplesPerSec / 100);
                         int sentCount = 0;
                         while (now >= nextSilenceDeadline && sentCount < 2) {
-                            Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, idleSilenceBuffer.data(), dataSize);
+                            EmitAudioStreamFrames(
+                                targetFormat, wantOpus, false, true, framesPer10ms, nullptr,
+                                capEncoder, capUsingOpus, capEncodedScratch, capTxScratch,
+                                [&](const void* pkt, UINT32 pktBytes) {
+                                    sendTrackedAudio(pkt, pktBytes, true, "IdleSilence");
+                                });
                             nextSilenceDeadline += std::chrono::milliseconds(10);
                             ++sentCount;
                         }
                         if (now >= nextSilenceDeadline) {
-                            ++silenceClockSlips;
+                            ++capStats.silenceClockSlips;
                             nextSilenceDeadline = now + std::chrono::milliseconds(10);
                         }
                     }
@@ -683,7 +1066,7 @@ namespace Audio {
                         hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr);
                         if (SUCCEEDED(hr)) {
                             if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
-                                ++discontinuityCount;
+                                ++capStats.discontinuities;
                             }
                             int64_t packetDurMs = (targetWaveFormat.nSamplesPerSec > 0)
                                 ? (static_cast<int64_t>(numFramesAvailable) * 1000LL / static_cast<int64_t>(targetWaveFormat.nSamplesPerSec))
@@ -692,18 +1075,14 @@ namespace Audio {
                             lastRealPacketTime = std::chrono::steady_clock::now();
                             silenceActive = false;
 
-                            UINT32 dataSize = numFramesAvailable * targetWaveFormat.nBlockAlign;
-                            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                                // CRITICAL: We MUST send silence to keep the server's playback clock perfectly synced.
-                                // Ignoring silent packets causes the server to consume audio faster than real-time, leading to starvation.
-                                static thread_local std::vector<BYTE> silenceBuffer;
-                                if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
-                                else std::memset(silenceBuffer.data(), 0, dataSize);
-                                
-                                Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, silenceBuffer.data(), dataSize);
-                            } else {
-                                Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, pData, dataSize);
-                            }
+                            const bool isSilentBuffer = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                            EmitAudioStreamFrames(
+                                targetFormat, wantOpus, false, isSilentBuffer,
+                                static_cast<uint16_t>(numFramesAvailable), isSilentBuffer ? nullptr : pData,
+                                capEncoder, capUsingOpus, capEncodedScratch, capTxScratch,
+                                [&](const void* pkt, UINT32 pktBytes) {
+                                    sendTrackedAudio(pkt, pktBytes, false, isSilentBuffer ? "WASAPI-Silent" : "WASAPI");
+                                });
                             pCaptureClient->ReleaseBuffer(numFramesAvailable);
                         } else {
                             if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_RESOURCES_INVALIDATED) {
@@ -724,7 +1103,7 @@ namespace Audio {
                         }
                     }
                 }
-                MaybeLogCapturePerf30s("CaptureThread", capPerfStart, discontinuityCount, silenceClockSlips);
+                MaybeLogCapturePerf30s("CaptureThread", capPerfStart, capStats);
                 std::this_thread::sleep_for(std::chrono::milliseconds(sleepTimeMs));
             }
 
@@ -843,21 +1222,38 @@ namespace Audio {
             format.sampleRate = pMixFormat->nSamplesPerSec;
             format.channels = pMixFormat->nChannels;
             format.bitDepth = 32;
+            const bool wantOpus = State::enableAudioOpus.load(std::memory_order_relaxed);
+            format.codec = AudioCodec::ResolveEffectiveAudioCodec(
+                wantOpus, format.sampleRate, format.channels, format.bitDepth);
+            if (wantOpus && format.codec != AudioCodec::kAudioCodecOpus && State::globalDebugMode) {
+                UI::LogDebug("[Audio] Opus unavailable for %uHz %uch %u-bit mix format; using MTU-safe PCM fallback.",
+                             format.sampleRate, format.channels, format.bitDepth);
+            }
 
-            bool hadRenderFormat = g_hasRenderFormat.load(std::memory_order_relaxed);
-            bool formatChanged = hadRenderFormat &&
-                                 ((g_serverRenderFormat.sampleRate != format.sampleRate) ||
-                                  (g_serverRenderFormat.bitDepth != format.bitDepth) ||
-                                  (g_serverRenderFormat.channels != format.channels));
+            bool hadRenderFormat = false;
+            bool formatChanged = false;
+            bool codecChanged = false;
+            {
+                std::lock_guard<std::mutex> fmtLock(g_formatBroadcastMutex);
+                hadRenderFormat = g_hasRenderFormat.load(std::memory_order_relaxed);
+                formatChanged = hadRenderFormat &&
+                                ((g_serverRenderFormat.sampleRate != format.sampleRate) ||
+                                 (g_serverRenderFormat.bitDepth != format.bitDepth) ||
+                                 (g_serverRenderFormat.channels != format.channels));
+                codecChanged = hadRenderFormat && (g_serverRenderFormat.codec != format.codec);
+                g_serverRenderFormat = format;
+                g_serverRenderRate.store(format.sampleRate, std::memory_order_relaxed);
+                g_serverRenderBits.store(format.bitDepth, std::memory_order_relaxed);
+                g_serverRenderChannels.store(format.channels, std::memory_order_relaxed);
+                g_hasRenderFormat.store(true, std::memory_order_release);
+            }
 
-            g_serverRenderFormat = format;
-            g_hasRenderFormat = true;
-
-            // Broadcast on initial render format acquisition or whenever the hardware mix format changes
+            // Broadcast on initial render format acquisition or whenever mix format/codec changes
             // so connected clients immediately synchronize capture and mic formats.
-            if ((!hadRenderFormat || formatChanged) && State::enableServerAudioMix) {
-                Network::BroadcastMessage(Network::MessageType::EVENT_AUDIO_FORMAT, &g_serverRenderFormat, sizeof(g_serverRenderFormat));
-                // Restart server microphone capture if active so it matches the new format
+            if ((!hadRenderFormat || formatChanged || codecChanged) && State::enableServerAudioMix) {
+                const Network::AudioFormatPayload wireFmt = MakeAudioFormatPayload(format);
+                Network::BroadcastMessage(Network::MessageType::EVENT_AUDIO_FORMAT, &wireFmt, sizeof(wireFmt));
+                // Restart server microphone capture if active so it matches the new hardware sample rate/channels
                 if (formatChanged && g_isServerMicRunning) {
                     StopMicBroadcast();
                     StartMicBroadcast();
@@ -948,8 +1344,9 @@ namespace Audio {
                 double hwMs = (format.sampleRate > 0)
                     ? (1000.0 * static_cast<double>(bufferFrameCount) / static_cast<double>(format.sampleRate))
                     : 0.0;
-                UI::LogDebug("[Audio] Render started: %uHz %uch %u-bit (HW buffer: %u frames / %.1fms)%s",
+                UI::LogDebug("[Audio] Render started: %uHz %uch %u-bit, Codec=%s (HW buffer: %u frames / %.1fms)%s",
                              format.sampleRate, format.channels, format.bitDepth,
+                             format.codec == AudioCodec::kAudioCodecOpus ? "Opus" : "PCM",
                              bufferFrameCount, hwMs,
                              formatChanged ? " [Format Changed]" : "");
             }
@@ -957,7 +1354,11 @@ namespace Audio {
             bool deviceInvalidated = false;
             auto perfIntervalStart = std::chrono::steady_clock::now();
             auto lastWakeTime = perfIntervalStart;
+            auto lastAdaptiveTime = perfIntervalStart;
             bool hasWakeTime = false;
+            AdaptiveJitterController adaptiveJitter;
+            adaptiveJitter.Reset(State::audioJitterBufferMs.load(std::memory_order_relaxed));
+            State::activeJitterBufferMs.store(adaptiveJitter.effectiveTargetMs, std::memory_order_relaxed);
             float bufMinMs = 1e9f;
             float bufMaxMs = 0.0f;
             double bufSumMs = 0.0;
@@ -974,6 +1375,7 @@ namespace Audio {
                 DWORD waitResult = WaitForSingleObject(g_hRenderEvent, 500);
                 if (waitResult != WAIT_OBJECT_0) {
                     hasWakeTime = false;
+                    lastAdaptiveTime = std::chrono::steady_clock::now();
                     if (!g_isRenderRunning) break;
                     // On timeout, probe device health using GetCurrentPadding.
                     // When Windows enters sleep or invalidates the endpoint, the event stops firing
@@ -1019,6 +1421,7 @@ namespace Audio {
                     break;
                 }
                 std::vector<std::shared_ptr<ClientAudioQueue>> activeQueues;
+                bool anyConcealOrStarve = false;
                 {
                     // Resize if needed, then initialize to silence (0.0f).
                     size_t mixBufferSize = numFramesAvailable * pMixFormat->nChannels;
@@ -1051,6 +1454,7 @@ namespace Audio {
                         bool logDepleted = false;
                         bool didConceal = false;
                         float sampledBufMs = -1.0f;
+                        int64_t silentRxMs = -1;
                         int hermiteDir = 0;
                         bool applyCrossfade = false;
                         float crossfadeFrom[8] = {0.0f};
@@ -1079,7 +1483,7 @@ namespace Audio {
                                 float currentBufferMs = (bytesPerSec > 0)
                                     ? (1000.0f * static_cast<float>(availableBytes) / static_cast<float>(bytesPerSec))
                                     : 0.0f;
-                                float targetMs = static_cast<float>(State::audioJitterBufferMs.load(std::memory_order_relaxed));
+                                float targetMs = static_cast<float>(State::activeJitterBufferMs.load(std::memory_order_relaxed));
                                 sampledBufMs = currentBufferMs;
 
                                 if (queue->appliedTargetMs < 0.0f) {
@@ -1186,6 +1590,10 @@ namespace Audio {
                                 } else {
                                     // Partial fill or transient empty poll due to Wi-Fi jitter:
                                     // Maintain waveform continuity via smooth exponential decay instead of 0.0 notches.
+                                    if (queue->hasRxTime) {
+                                        silentRxMs = (std::max)(static_cast<int64_t>(0),
+                                            std::chrono::duration_cast<std::chrono::milliseconds>(wakeNow - queue->lastRxTime).count());
+                                    }
                                     if (availableFrames > 0) {
                                         queue->starvationCount = 0;
                                         size_t validBytes = availableFrames * bytesPerFrame;
@@ -1236,6 +1644,7 @@ namespace Audio {
                         else if (hermiteDir > 0) ++hermiteHighCallbacks;
                         if (didConceal) ++concealCallbacks;
                         if (logDepleted) ++starvationResets;
+                        if (didConceal || logDepleted) anyConcealOrStarve = true;
 
                         if (logDepleted && State::globalDebugMode) {
                             static DebugLog::RateLimitState depletedRate;
@@ -1243,10 +1652,16 @@ namespace Audio {
                             if (depletedRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
                                 char supBuf[32] = "";
                                 if (suppressed > 0) {
-                                    snprintf(supBuf, sizeof(supBuf), " (+%u suppressed)", suppressed);
+                                    snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
                                 }
-                                UI::LogDebug("[Audio] Buffer depleted: Re-buffering to %dms target%s.",
-                                             State::audioJitterBufferMs.load(std::memory_order_relaxed), supBuf);
+                                if (silentRxMs >= 0) {
+                                    UI::LogDebug("[Audio] Buffer depleted: Re-buffering to %dms target (silentRx=%lldms%s).",
+                                                 State::activeJitterBufferMs.load(std::memory_order_relaxed),
+                                                 static_cast<long long>(silentRxMs), supBuf);
+                                } else {
+                                    UI::LogDebug("[Audio] Buffer depleted: Re-buffering to %dms target%s.",
+                                                 State::activeJitterBufferMs.load(std::memory_order_relaxed), supBuf);
+                                }
                             }
                         }
 
@@ -1258,9 +1673,10 @@ namespace Audio {
                                 if (suppressed > 0) {
                                     snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
                                 }
-                                UI::LogDebug("[Audio] WARNING: Transient jitter underrun concealed (buf=%.0fms, target=%dms%s) — raise Jitter Buffer if persistent.",
+                                UI::LogDebug("[Audio] WARNING: Transient jitter underrun concealed (buf=%.0fms, target=%dms, silentRx=%lldms%s) — raise Jitter Buffer if persistent.",
                                              sampledBufMs >= 0.0f ? sampledBufMs : 0.0f,
-                                             State::audioJitterBufferMs.load(std::memory_order_relaxed),
+                                             State::activeJitterBufferMs.load(std::memory_order_relaxed),
+                                             static_cast<long long>(silentRxMs),
                                              supBuf);
                             }
                         }
@@ -1324,22 +1740,73 @@ namespace Audio {
                     }
                 }
 
+                {
+                    uint32_t tickMaxRxGapMs = 0;
+                    for (const auto& q : activeQueues) {
+                        const uint32_t rxGap = q->pendingAdaptRxGapMs.exchange(0, std::memory_order_relaxed);
+                        tickMaxRxGapMs = (std::max)(tickMaxRxGapMs, rxGap);
+                    }
+                    double adaptDtSec = 0.0;
+                    if (!activeQueues.empty()) {
+                        adaptDtSec = (std::min)(0.25, (std::max)(0.0,
+                            std::chrono::duration<double>(wakeNow - lastAdaptiveTime).count()));
+                    }
+                    lastAdaptiveTime = wakeNow;
+
+                    const bool adaptiveEnabled = State::enableAdaptiveJitterBuffer.load(std::memory_order_relaxed);
+                    const int requestedFloorMs = State::audioJitterBufferMs.load(std::memory_order_relaxed);
+                    const int prevEffectiveMs = adaptiveJitter.effectiveTargetMs;
+                    const int prevFloorMs = adaptiveJitter.floorMs;
+                    if (adaptiveJitter.Update(adaptiveEnabled, requestedFloorMs, adaptDtSec, anyConcealOrStarve, tickMaxRxGapMs)) {
+                        const int newEffectiveMs = adaptiveJitter.effectiveTargetMs;
+                        State::activeJitterBufferMs.store(newEffectiveMs, std::memory_order_relaxed);
+                        const bool floorMoved = (requestedFloorMs != prevFloorMs);
+                        if (adaptiveEnabled && !floorMoved && State::globalDebugMode) {
+                            if (newEffectiveMs > prevEffectiveMs) {
+                                UI::LogDebug("[Audio] Adaptive Jitter Buffer expanded: %d -> %d ms (min=%dms, conceal=%d, rxGap=%ums).",
+                                             prevEffectiveMs, newEffectiveMs, adaptiveJitter.floorMs,
+                                             anyConcealOrStarve ? 1 : 0, tickMaxRxGapMs);
+                            } else if (newEffectiveMs < prevEffectiveMs) {
+                                UI::LogDebug("[Audio] Adaptive Jitter Buffer relaxed: %d -> %d ms (min=%dms).",
+                                             prevEffectiveMs, newEffectiveMs, adaptiveJitter.floorMs);
+                            }
+                        }
+                    }
+                }
+
                 if ((wakeNow - perfIntervalStart) >= std::chrono::seconds(30)) {
                     uint32_t totalOverruns = 0;
+                    uint32_t totalRxGapSpikes = 0;
+                    uint32_t maxRxGapMs = 0;
+                    uint32_t maxRxPktBytes = 0;
+                    uint32_t totalOpusFec = 0;
+                    uint32_t totalOpusPlc = 0;
                     for (auto& q : activeQueues) {
                         totalOverruns += q->overrunCount.exchange(0, std::memory_order_relaxed);
+                        totalRxGapSpikes += q->rxGapSpikes.exchange(0, std::memory_order_relaxed);
+                        maxRxGapMs = (std::max)(maxRxGapMs, q->rxMaxGapMs.exchange(0, std::memory_order_relaxed));
+                        maxRxPktBytes = (std::max)(maxRxPktBytes, q->rxMaxPktBytes.exchange(0, std::memory_order_relaxed));
+                        q->rxPackets.exchange(0, std::memory_order_relaxed);
+                        totalOpusFec += q->opusFecCount.exchange(0, std::memory_order_relaxed);
+                        totalOpusPlc += q->opusPlcCount.exchange(0, std::memory_order_relaxed);
+                        q->opusStaleCount.exchange(0, std::memory_order_relaxed);
                     }
                     const uint64_t anomalySum = static_cast<uint64_t>(concealCallbacks) + starvationResets +
                                                 totalOverruns + hermiteLowCallbacks + hermiteHighCallbacks +
-                                                wakeJitterSpikes + clipSamples;
+                                                wakeJitterSpikes + clipSamples + totalRxGapSpikes +
+                                                totalOpusFec + totalOpusPlc;
                     if (State::globalDebugMode && Network::ShouldEmitPerfSummary(anomalySum)) {
                         float minOut = (bufSamples > 0) ? bufMinMs : 0.0f;
                         double avgOut = (bufSamples > 0) ? (bufSumMs / static_cast<double>(bufSamples)) : 0.0;
-                        UI::LogDebug("[Audio Perf] 30s Buf: min=%.0f avg=%.0f max=%.0fms (target=%dms) | Conceal=%u Starv=%u Overrun=%u | Hermite=-%u/+%u | Jitter>25ms=%u Clip=%u",
+                        UI::LogDebug("[Audio Perf] 30s Buf: min=%.0f avg=%.0f max=%.0fms (target=%dms min=%dms auto=%d) | Conceal=%u Starv=%u Overrun=%u | Hermite=-%u/+%u | RxGapMax=%ums (>%ums=%u) MaxPkt=%uB | OpusFEC=%u PLC=%u | Jitter>25ms=%u Clip=%u",
                                      minOut, avgOut, bufMaxMs,
+                                     State::activeJitterBufferMs.load(std::memory_order_relaxed),
                                      State::audioJitterBufferMs.load(std::memory_order_relaxed),
+                                     State::enableAdaptiveJitterBuffer.load(std::memory_order_relaxed) ? 1 : 0,
                                      concealCallbacks, starvationResets, totalOverruns,
                                      hermiteLowCallbacks, hermiteHighCallbacks,
+                                     maxRxGapMs, kAudioRxGapSpikeMs, totalRxGapSpikes, maxRxPktBytes,
+                                     totalOpusFec, totalOpusPlc,
                                      wakeJitterSpikes, clipSamples);
                     }
                     perfIntervalStart = wakeNow;
@@ -1526,14 +1993,53 @@ namespace Audio {
 
             if (State::globalDebugMode) {
                 std::string micName = GetDefaultMicName();
-                UI::LogDebug("[Audio] Server Microphone broadcast started ('%s', %uHz %uch %u-bit, Event-Driven WASAPI).",
-                             micName.c_str(), targetFormat.sampleRate, targetFormat.channels, targetFormat.bitDepth);
+                const bool initialOpus = AudioCodec::ResolveEffectiveAudioCodec(
+                    State::enableAudioOpus.load(std::memory_order_relaxed),
+                    targetFormat.sampleRate, targetFormat.channels, targetFormat.bitDepth) == AudioCodec::kAudioCodecOpus;
+                UI::LogDebug("[Audio] Server Microphone broadcast started ('%s', %uHz %uch %u-bit, Codec=%s, Event-Driven WASAPI).",
+                             micName.c_str(), targetFormat.sampleRate, targetFormat.channels, targetFormat.bitDepth,
+                             initialOpus ? "Opus" : "PCM");
             }
 
             bool deviceInvalidated = false;
             auto micCapPerfStart = std::chrono::steady_clock::now();
-            uint32_t micDiscontinuityCount = 0;
-            uint32_t micUnusedSlips = 0;
+            CaptureTimingStats micStats;
+            std::chrono::steady_clock::time_point lastMicSendTime{};
+            bool hasLastMicSend = false;
+            static DebugLog::RateLimitState micSendGapWarnRate;
+            AudioCodec::OpusStreamEncoder micEncoder;
+            std::vector<AudioCodec::EncodedOpusPacket> micEncodedScratch;
+            std::vector<uint8_t> micTxScratch;
+            bool micUsingOpus = false;
+
+            auto sendTrackedMic = [&](const void* data, UINT32 dataSize, const char* srcLabel) {
+                const auto sendStart = std::chrono::steady_clock::now();
+                const uint32_t sendGapMs = hasLastMicSend
+                    ? static_cast<uint32_t>((std::max)(static_cast<int64_t>(0),
+                          std::chrono::duration_cast<std::chrono::milliseconds>(sendStart - lastMicSendTime).count()))
+                    : 0u;
+                Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, data, dataSize);
+                const auto sendEnd = std::chrono::steady_clock::now();
+                const uint32_t sendCallMs = static_cast<uint32_t>((std::max)(static_cast<int64_t>(0),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(sendEnd - sendStart).count()));
+
+                const bool hadPrevSend = hasLastMicSend;
+                lastMicSendTime = sendStart;
+                hasLastMicSend = true;
+
+                if (micStats.RecordSend(sendGapMs, hadPrevSend, sendCallMs, dataSize, false) &&
+                    State::globalDebugMode) {
+                    uint32_t suppressed = 0;
+                    if (micSendGapWarnRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                        char supBuf[32] = "";
+                        if (suppressed > 0) {
+                            snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+                        }
+                        UI::LogDebug("[Audio] WARNING: ServerMicCapture send gap %ums (sendCall=%ums, pkt=%uB, src=%s%s).",
+                                     sendGapMs, sendCallMs, dataSize, srcLabel, supBuf);
+                    }
+                }
+            };
 
             while (g_isServerMicRunning && !deviceInvalidated) {
                 DWORD waitResult = WaitForSingleObject(g_hServerMicEvent, 500);
@@ -1557,6 +2063,8 @@ namespace Audio {
                     break;
                 }
 
+                const bool wantMicOpus = State::enableAudioOpus.load(std::memory_order_relaxed);
+
                 // Drain the hardware capture buffer completely upon event notification
                 while (packetLength > 0) {
                     BYTE* pData = nullptr;
@@ -1566,18 +2074,16 @@ namespace Audio {
                     hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, nullptr, nullptr);
                     if (SUCCEEDED(hr)) {
                         if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
-                            ++micDiscontinuityCount;
+                            ++micStats.discontinuities;
                         }
-                        UINT32 dataSize = numFramesAvailable * targetWaveFormat.nBlockAlign;
-                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                            static thread_local std::vector<BYTE> silenceBuffer;
-                            if (silenceBuffer.size() < dataSize) silenceBuffer.resize(dataSize, 0);
-                            else std::memset(silenceBuffer.data(), 0, dataSize);
-                            
-                            Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, silenceBuffer.data(), dataSize);
-                        } else {
-                            Network::BroadcastMessage(Network::MessageType::EVENT_MIC_DATA, pData, dataSize);
-                        }
+                        const bool isSilentBuffer = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
+                        EmitAudioStreamFrames(
+                            targetFormat, wantMicOpus, true, isSilentBuffer,
+                            static_cast<uint16_t>(numFramesAvailable), isSilentBuffer ? nullptr : pData,
+                            micEncoder, micUsingOpus, micEncodedScratch, micTxScratch,
+                            [&](const void* pkt, UINT32 pktBytes) {
+                                sendTrackedMic(pkt, pktBytes, isSilentBuffer ? "WASAPI-Silent" : "WASAPI");
+                            });
                         pCaptureClient->ReleaseBuffer(numFramesAvailable);
                     } else {
                         if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_RESOURCES_INVALIDATED) {
@@ -1597,7 +2103,7 @@ namespace Audio {
                         break;
                     }
                 }
-                MaybeLogCapturePerf30s("ServerMicCapture", micCapPerfStart, micDiscontinuityCount, micUnusedSlips);
+                MaybeLogCapturePerf30s("ServerMicCapture", micCapPerfStart, micStats);
             }
 
             pAudioClient->Stop();
@@ -1987,11 +2493,15 @@ namespace Audio {
 
                 if ((cmWakeNow - cmPerfStart) >= std::chrono::seconds(30)) {
                     uint32_t micOverruns = g_clientMicQueue.overrunCount.exchange(0, std::memory_order_relaxed);
+                    uint32_t micOpusFec = g_clientMicQueue.opusFecCount.exchange(0, std::memory_order_relaxed);
+                    uint32_t micOpusPlc = g_clientMicQueue.opusPlcCount.exchange(0, std::memory_order_relaxed);
+                    g_clientMicQueue.opusStaleCount.exchange(0, std::memory_order_relaxed);
                     const uint64_t anomalySum = static_cast<uint64_t>(micConcealCallbacks) + micStarvationResets +
-                                                micOverruns + micWakeJitterSpikes;
+                                                micOverruns + micWakeJitterSpikes + micOpusFec + micOpusPlc;
                     if (State::globalDebugMode && Network::ShouldEmitPerfSummary(anomalySum)) {
-                        UI::LogDebug("[Audio Perf] ClientMic 30s: Conceal=%u Starv=%u Overrun=%u Jitter>25ms=%u",
-                                     micConcealCallbacks, micStarvationResets, micOverruns, micWakeJitterSpikes);
+                        UI::LogDebug("[Audio Perf] ClientMic 30s: Conceal=%u Starv=%u Overrun=%u OpusFEC=%u PLC=%u Jitter>25ms=%u",
+                                     micConcealCallbacks, micStarvationResets, micOverruns,
+                                     micOpusFec, micOpusPlc, micWakeJitterSpikes);
                     }
                     cmPerfStart = cmWakeNow;
                     micConcealCallbacks = 0;
@@ -2074,57 +2584,23 @@ namespace Audio {
      */
     void HandleMicData(const void* pcmData, size_t dataSize) {
         if (!g_isClientMicRunning) return;
-        
+
+        AudioFormat format;
+        if (!Network::GetServerAudioFormat(format)) return;
+
+        uint8_t switchedCodec = 255;
         bool droppedOverrun = false;
         float loggedTargetMs = 0.0f;
-        {
-            std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
-            const uint8_t* pBytes = static_cast<const uint8_t*>(pcmData);
-            g_clientMicQueue.buffer.Push(pBytes, dataSize);
+        const float jitterTargetMs = static_cast<float>(State::audioJitterBufferMs.load(std::memory_order_relaxed));
 
-            AudioFormat format;
-            if (Network::GetServerAudioFormat(format)) {
-                size_t bytesPerSec = format.sampleRate * format.channels * (format.bitDepth / 8);
-                size_t frameSize = format.channels * (format.bitDepth / 8);
-                float jitterTargetMs = static_cast<float>(State::audioJitterBufferMs);
-                const BufferBounds bounds = ComputeBufferBounds(jitterTargetMs);
+        PushDecodedAudioPacket(
+            g_clientMicQueue, format, pcmData, dataSize, jitterTargetMs,
+            false, switchedCodec, droppedOverrun, loggedTargetMs);
 
-                size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (bounds.releaseMs / 1000.0f));
-                if (frameSize > 0) {
-                    minBufferThreshold -= (minBufferThreshold % frameSize);
-                }
-                if (g_clientMicQueue.isBuffering && g_clientMicQueue.buffer.Size() >= minBufferThreshold) {
-                    g_clientMicQueue.isBuffering = false;
-                    g_clientMicQueue.wasBuffering = true;  // Signal fade-in ramp on the next render callback
-                }
-
-                // Cap post-starvation burst tail while still waiting for the first render callback,
-                // otherwise an accumulated Wi-Fi packet dump causes immediate overrun/latency spike.
-                size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (bounds.maxBufferMs / 1000.0f));
-                if (frameSize > 0 && g_clientMicQueue.wasBuffering && g_clientMicQueue.buffer.Size() > minBufferThreshold) {
-                    size_t staleExcess = g_clientMicQueue.buffer.Size() - minBufferThreshold;
-                    staleExcess -= (staleExcess % frameSize);
-                    if (staleExcess > 0) {
-                        g_clientMicQueue.buffer.Drop(staleExcess);
-                    }
-                } else if (frameSize > 0 && g_clientMicQueue.buffer.Size() > maxBufferSize) {
-                    size_t trimTargetBytes = static_cast<size_t>(bytesPerSec * (bounds.highDeadbandMs / 1000.0f));
-                    size_t excess = (g_clientMicQueue.buffer.Size() > trimTargetBytes)
-                        ? (g_clientMicQueue.buffer.Size() - trimTargetBytes)
-                        : 0;
-                    excess -= (excess % frameSize);
-
-                    if (excess > 0) {
-                        droppedOverrun = true;
-                        loggedTargetMs = bounds.maxBufferMs;
-                        g_clientMicQueue.overrunCount.fetch_add(1, std::memory_order_relaxed);
-                        g_clientMicQueue.buffer.Drop(excess);
-                        g_clientMicQueue.needsFadeIn = true;
-                        g_clientMicQueue.hasHermiteHistory = false;
-                        g_clientMicQueue.resamplePhase = 0.0;
-                    }
-                }
-            }
+        if (switchedCodec != 255 && State::globalDebugMode) {
+            UI::LogDebug("[Audio] ClientMic receiver switched to codec: %s (%uHz %uch %u-bit).",
+                         switchedCodec == AudioCodec::kAudioCodecOpus ? "Opus" : "PCM",
+                         format.sampleRate, format.channels, format.bitDepth);
         }
 
         if (droppedOverrun && State::globalDebugMode) {
@@ -2142,14 +2618,15 @@ namespace Audio {
     }
 
     /**
-     * @brief Pushes incoming client PCM data into their specific mix queue on the server.
+     * @brief Decodes and queues incoming client audio packets into that client's mix queue on the server.
      * @param clientIdentifier The socket handle representing the client.
-     * @param pcmData Pointer to the raw audio buffer.
-     * @param dataSize Size of the audio buffer in bytes.
+     * @param pcmData Pointer to wire audio packet starting with AudioPacketHeader.
+     * @param dataSize Size of the incoming packet in bytes.
      * @return void
      */
     void HandleAudioData(uintptr_t clientIdentifier, const void* pcmData, size_t dataSize) {
         if (!g_isRenderRunning) return;
+        if (!g_hasRenderFormat.load(std::memory_order_acquire)) return;
 
         // Find or create a queue for this client (avoids locking coarse clientsMutex on the UDP hot path).
         std::shared_ptr<ClientAudioQueue> pQueue;
@@ -2171,60 +2648,26 @@ namespace Audio {
         }
 
         if (!pQueue->isEnabled.load(std::memory_order_relaxed)) return;
-        
+
+        AudioFormat renderFmt;
+        renderFmt.sampleRate = g_serverRenderRate.load(std::memory_order_relaxed);
+        renderFmt.bitDepth = g_serverRenderBits.load(std::memory_order_relaxed);
+        renderFmt.channels = g_serverRenderChannels.load(std::memory_order_relaxed);
+        renderFmt.codec = 0;
+        uint8_t switchedCodec = 255;
         bool droppedOverrun = false;
         float loggedTargetMs = 0.0f;
+        const float jitterTargetMs = static_cast<float>(State::activeJitterBufferMs.load(std::memory_order_relaxed));
 
-        // Lock the individual queue and push the new data.
-        {
-            std::lock_guard<std::mutex> queueLock(pQueue->mtx);
-            const uint8_t* pBytes = static_cast<const uint8_t*>(pcmData);
-            pQueue->buffer.Push(pBytes, dataSize);
+        PushDecodedAudioPacket(
+            *pQueue, renderFmt, pcmData, dataSize, jitterTargetMs,
+            true, switchedCodec, droppedOverrun, loggedTargetMs);
 
-            // Bounded buffer logic.
-            if (g_hasRenderFormat) {
-                size_t bytesPerSec = g_serverRenderFormat.sampleRate * g_serverRenderFormat.channels * (g_serverRenderFormat.bitDepth / 8);
-                size_t frameSize = g_serverRenderFormat.channels * (g_serverRenderFormat.bitDepth / 8);
-                float jitterTargetMs = static_cast<float>(State::audioJitterBufferMs);
-                const BufferBounds bounds = ComputeBufferBounds(jitterTargetMs);
-
-                size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (bounds.releaseMs / 1000.0f));
-                if (frameSize > 0) {
-                    minBufferThreshold -= (minBufferThreshold % frameSize);
-                }
-                if (pQueue->isBuffering && pQueue->buffer.Size() >= minBufferThreshold) {
-                    pQueue->isBuffering = false;
-                    pQueue->wasBuffering = true;  // Signal fade-in ramp on the next render callback
-                }
-
-                // Fresh-tail cap while waiting for the first render callback after re-buffering:
-                // discards stalled burst backlog so playback resumes on fresh ~releaseMs audio instead of hitting maxBufferMs.
-                size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (bounds.maxBufferMs / 1000.0f));
-                if (frameSize > 0 && pQueue->wasBuffering && pQueue->buffer.Size() > minBufferThreshold) {
-                    size_t staleExcess = pQueue->buffer.Size() - minBufferThreshold;
-                    staleExcess -= (staleExcess % frameSize);
-                    if (staleExcess > 0) {
-                        pQueue->buffer.Drop(staleExcess);
-                    }
-                } else if (frameSize > 0 && pQueue->buffer.Size() > maxBufferSize) {
-                    // Single crossfaded trim back to highDeadbandMs instead of staying pinned at the overrun ceiling.
-                    size_t trimTargetBytes = static_cast<size_t>(bytesPerSec * (bounds.highDeadbandMs / 1000.0f));
-                    size_t excess = (pQueue->buffer.Size() > trimTargetBytes)
-                        ? (pQueue->buffer.Size() - trimTargetBytes)
-                        : 0;
-                    excess -= (excess % frameSize);
-
-                    if (excess > 0) {
-                        droppedOverrun = true;
-                        loggedTargetMs = bounds.maxBufferMs;
-                        pQueue->overrunCount.fetch_add(1, std::memory_order_relaxed);
-                        pQueue->buffer.Drop(excess);
-                        pQueue->needsFadeIn = true;
-                        pQueue->hasHermiteHistory = false;
-                        pQueue->resamplePhase = 0.0;
-                    }
-                }
-            }
+        if (switchedCodec != 255 && State::globalDebugMode) {
+            UI::LogDebug("[Audio] Mix stream (%llu) switched to codec: %s (%uHz %uch %u-bit).",
+                         static_cast<unsigned long long>(clientIdentifier),
+                         switchedCodec == AudioCodec::kAudioCodecOpus ? "Opus" : "PCM",
+                         renderFmt.sampleRate, renderFmt.channels, renderFmt.bitDepth);
         }
 
         if (droppedOverrun && State::globalDebugMode) {
@@ -2308,5 +2751,48 @@ namespace Audio {
             std::lock_guard<std::mutex> lock(g_clientMicQueue.mtx);
             g_clientMicQueue.ResetStreamState();
         }
+    }
+
+    /**
+     * @brief Broadcasts updated audio codec configuration from Server to all connected clients.
+     * Invoked when the Server user toggles Opus compression in real time.
+     * @return void
+     */
+    void NotifyCodecSettingChanged() {
+        if (State::currentRole != State::AppRole::SERVER) {
+            return;
+        }
+        AudioFormat fmt;
+        bool hasFmt = false;
+        {
+            std::lock_guard<std::mutex> fmtLock(g_formatBroadcastMutex);
+            if (g_hasRenderFormat.load(std::memory_order_relaxed)) {
+                fmt = g_serverRenderFormat;
+                hasFmt = true;
+            }
+        }
+        if (!hasFmt && !GetDefaultDeviceFormat(fmt)) {
+            return;
+        }
+        const bool wantOpus = State::enableAudioOpus.load(std::memory_order_relaxed);
+        fmt.codec = AudioCodec::ResolveEffectiveAudioCodec(wantOpus, fmt.sampleRate, fmt.channels, fmt.bitDepth);
+        {
+            std::lock_guard<std::mutex> fmtLock(g_formatBroadcastMutex);
+            if (g_hasRenderFormat.load(std::memory_order_relaxed)) {
+                g_serverRenderFormat.codec = fmt.codec;
+            }
+        }
+        if (State::globalDebugMode) {
+            if (wantOpus && fmt.codec != AudioCodec::kAudioCodecOpus) {
+                UI::LogDebug("[Audio] Opus unavailable for %uHz %uch %u-bit format; keeping PCM.",
+                             fmt.sampleRate, fmt.channels, fmt.bitDepth);
+            } else {
+                UI::LogDebug("[Audio] Server Codec toggled to %s (%uHz %uch %u-bit). Broadcasting to clients.",
+                             fmt.codec == AudioCodec::kAudioCodecOpus ? "Opus" : "PCM",
+                             fmt.sampleRate, fmt.channels, fmt.bitDepth);
+            }
+        }
+        const Network::AudioFormatPayload wireFmt = MakeAudioFormatPayload(fmt);
+        Network::BroadcastMessage(Network::MessageType::EVENT_AUDIO_FORMAT, &wireFmt, sizeof(wireFmt));
     }
 }
