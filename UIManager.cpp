@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// UI Manager Windows/DX11 Implementation
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -11,6 +11,7 @@
  */
 
 #include "UIManager.h"
+#include "DebugLog.h"
 #include "StateManager.h"
 #include "NetworkServer.h"
 #include "NetworkClient.h" 
@@ -35,6 +36,7 @@
 #include <commdlg.h>
 #include <cstdio>
 #include <cmath>
+#include <memory>
 #include "resource.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -55,8 +57,6 @@ namespace UI {
     ID3D11RenderTargetView* pMainRenderTargetView = nullptr;
     /// Flag tracking if the window remains open.
     bool isAppRunning = false;
-    char newServerIP[64] = "";
-    char newServerPIN[16] = "";
     bool showServerPin = false;
 
     // Pairing flow state for the client mode Connections tab
@@ -148,11 +148,24 @@ namespace UI {
     }
 
     // --- IN-ENGINE DEBUG CONSOLE ---
-    std::mutex g_logMutex;
-    std::vector<char> g_logBufferVec; // Starts entirely empty to save memory
-    std::string g_lineBuffer;
-    size_t g_logBufferLen = 0;
-    std::atomic<bool> g_logDirty(false); // Tracks if new data was written
+
+    /**
+     * @brief Maps a semantic log category to its Dear ImGui text color.
+     * @param category The pre-classified log entry category.
+     * @return ImVec4 RGBA color vector for rendering the log line.
+     */
+    static ImVec4 GetCategoryColor(DebugLog::Category category) {
+        switch (category) {
+            case DebugLog::Category::Security: return ImVec4(1.0f, 0.75f, 0.22f, 1.0f);  // Amber / Yellow
+            case DebugLog::Category::Error:    return ImVec4(1.0f, 0.35f, 0.35f, 1.0f);  // Coral Red
+            case DebugLog::Category::Perf:     return ImVec4(0.35f, 0.90f, 0.78f, 1.0f); // Teal-Mint
+            case DebugLog::Category::Network:  return ImVec4(0.28f, 0.80f, 1.0f, 1.0f);  // Bright Cyan
+            case DebugLog::Category::Audio:    return ImVec4(0.82f, 0.55f, 1.0f, 1.0f);  // Purple / Violet
+            case DebugLog::Category::UI:       return ImVec4(0.35f, 0.85f, 0.45f, 1.0f); // Mint Green
+            case DebugLog::Category::Info:
+            default:                           return ImVec4(0.82f, 0.82f, 0.82f, 1.0f); // Light Gray
+        }
+    }
 
     class ImGuiLogStreamBuf : public std::streambuf {
     public:
@@ -172,78 +185,62 @@ namespace UI {
         }
     protected:
         virtual std::streamsize xsputn(const char* s, std::streamsize count) override {
-            if (!State::globalDebugMode) return count; // Instant short-circuit! CPU cost is 0.
-            
-            g_lineBuffer.append(s, count);
+            if (!State::globalDebugMode.load(std::memory_order_relaxed)) return count; // Instant short-circuit! CPU cost is 0.
+            if (!s || count <= 0) return count;
+
+            std::lock_guard<std::mutex> lock(m_streamMutex);
+            m_lineBuffer.append(s, static_cast<size_t>(count));
+            if (m_lineBuffer.size() > 4096 && m_lineBuffer.find('\n') == std::string::npos) {
+                m_lineBuffer.push_back('\n');
+            }
             size_t newline_pos;
-            while ((newline_pos = g_lineBuffer.find('\n')) != std::string::npos) {
-                std::string line = g_lineBuffer.substr(0, newline_pos);
-                g_lineBuffer.erase(0, newline_pos + 1);
+            while ((newline_pos = m_lineBuffer.find('\n')) != std::string::npos) {
+                std::string line = m_lineBuffer.substr(0, newline_pos);
+                m_lineBuffer.erase(0, newline_pos + 1);
 
                 SYSTEMTIME st;
                 GetLocalTime(&st);
-                char time_buf[64];
+                char time_buf[32];
                 sprintf_s(time_buf, sizeof(time_buf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-                
-                std::string final_line = std::string(time_buf) + line + "\n";
 
-                std::lock_guard<std::mutex> lock(g_logMutex);
-                if (g_logBufferVec.empty()) g_logBufferVec.resize(1024 * 1024, 0); // Lazy allocation
-                
-                if (final_line.length() > g_logBufferVec.size() - 1) continue;
-
-                if (g_logBufferLen + final_line.length() > g_logBufferVec.size() - 1) {
-                    size_t shift = (g_logBufferLen + final_line.length()) - (g_logBufferVec.size() - 1);
-                    std::memmove(g_logBufferVec.data(), g_logBufferVec.data() + shift, g_logBufferLen - shift);
-                    g_logBufferLen -= shift;
-                }
-                std::memcpy(g_logBufferVec.data() + g_logBufferLen, final_line.c_str(), final_line.length());
-                g_logBufferLen += final_line.length();
-                g_logBufferVec[g_logBufferLen] = '\0';
-                g_logDirty = true;
+                DebugLog::GetGlobalLog().Push(time_buf, line);
             }
             return count;
         }
         virtual int_type overflow(int_type c) override {
-            if (!State::globalDebugMode) return c;
+            if (!State::globalDebugMode.load(std::memory_order_relaxed)) return c;
             if (c != EOF) { char ch = static_cast<char>(c); xsputn(&ch, 1); }
             return c;
         }
+    private:
+        std::mutex m_streamMutex;
+        std::string m_lineBuffer;
     };
 
-    ImGuiLogStreamBuf* g_logInterceptor = nullptr;
+    std::unique_ptr<ImGuiLogStreamBuf> g_logInterceptor;
 
     /**
      * @brief Blazing fast, thread-safe, atomic logger for time-critical threads.
-     * Bypasses std::ostream overhead and locks the mutex exactly once per line.
+     * Formats into a stack buffer and writes into the bounded O(1) DebugLog ring buffer.
+     * @param fmt Printf-style format string.
+     * @return void
      */
     void LogDebug(const char* fmt, ...) {
-        if (!State::globalDebugMode) return;
+        if (!State::globalDebugMode.load(std::memory_order_relaxed)) return;
         
-        char buf[1024];
+        char buf[DebugLog::kMaxLineLength + 16];
         va_list args;
         va_start(args, fmt);
-        vsnprintf(buf, sizeof(buf), fmt, args);
+        int written = vsnprintf(buf, sizeof(buf), fmt, args);
         va_end(args);
+        if (written < 0) return;
 
         SYSTEMTIME st;
         GetLocalTime(&st);
-        char time_buf[64];
-        int timeLen = sprintf_s(time_buf, sizeof(time_buf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+        char timeBuf[32];
+        sprintf_s(timeBuf, sizeof(timeBuf), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 
-        std::string finalLine = std::string(time_buf) + buf + "\n";
-
-        std::lock_guard<std::mutex> lock(g_logMutex);
-        if (g_logBufferVec.empty()) g_logBufferVec.resize(1024 * 1024, 0); // Lazy allocation
-        if (g_logBufferLen + finalLine.length() > g_logBufferVec.size() - 1) {
-            size_t shift = (g_logBufferLen + finalLine.length()) - (g_logBufferVec.size() - 1);
-            std::memmove(g_logBufferVec.data(), g_logBufferVec.data() + shift, g_logBufferLen - shift);
-            g_logBufferLen -= shift;
-        }
-        std::memcpy(g_logBufferVec.data() + g_logBufferLen, finalLine.c_str(), finalLine.length());
-        g_logBufferLen += finalLine.length();
-        g_logBufferVec[g_logBufferLen] = '\0';
-        g_logDirty = true;
+        DebugLog::GetGlobalLog().Push(timeBuf, buf);
     }
 
     // File transfer state variables.
@@ -297,14 +294,38 @@ namespace UI {
     }
 
     /**
+     * @brief Registers a global Ctrl+Alt hotkey and logs a warning if claimed by another application.
+     * @param targetHwnd Window handle receiving WM_HOTKEY.
+     * @param id Hotkey identifier (1=Emergency, 2=Game Mode).
+     * @param label Human-readable hotkey name for error logging.
+     * @param key Virtual key character ('A'-'Z').
+     * @return void
+     */
+    static void RegisterHotKeyChecked(HWND targetHwnd, int id, const char* label, char key) {
+        if (!::RegisterHotKey(targetHwnd, id, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, static_cast<UINT>(key))) {
+            if (State::globalDebugMode) {
+                UI::LogDebug("[UI] WARNING: Failed to register %s Hotkey Ctrl+Alt+%c (err=%lu — may be claimed by another app).",
+                             label, key, ::GetLastError());
+            }
+        }
+    }
+
+    /**
      * @brief Extracts the back buffer from the swap chain and creates a render target view.
      * @return void
      */
     void CreateRenderTarget() {
-        ID3D11Texture2D* pBackBuffer;
-        pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
-        pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &pMainRenderTargetView);
+        ID3D11Texture2D* pBackBuffer = nullptr;
+        HRESULT hr = pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+        if (FAILED(hr) || !pBackBuffer) {
+            if (State::globalDebugMode) UI::LogDebug("[UI] ERROR: SwapChain GetBuffer failed (0x%08X).", hr);
+            return;
+        }
+        hr = pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &pMainRenderTargetView);
         pBackBuffer->Release();
+        if (FAILED(hr) && State::globalDebugMode) {
+            UI::LogDebug("[UI] ERROR: CreateRenderTargetView failed (0x%08X).", hr);
+        }
     }
 
     /**
@@ -420,6 +441,11 @@ namespace UI {
         }
         break; // Let it fall through to DefWindowProc
             case 0x02E0: // WM_DPICHANGED
+                if (State::globalDebugMode) {
+                    UINT newDpi = HIWORD(wParam);
+                    UI::LogDebug("[UI] Monitor DPI changed to %u (%.0f%%).",
+                                 newDpi, (static_cast<float>(newDpi) / 96.0f) * 100.0f);
+                }
                 if (lParam) {
                     RECT* const prcNewWindow = (RECT*)lParam;
                     ::SetWindowPos(hWnd, nullptr,
@@ -440,7 +466,10 @@ namespace UI {
                 if (wParam == SIZE_MINIMIZED) return 0;
                 if (pd3dDevice != nullptr) {
                     CleanupRenderTarget();
-                    pSwapChain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+                    HRESULT hrResize = pSwapChain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
+                    if (FAILED(hrResize) && State::globalDebugMode) {
+                        UI::LogDebug("[UI] ERROR: SwapChain ResizeBuffers failed (0x%08X).", hrResize);
+                    }
                     CreateRenderTarget();
                 }
                 return 0;
@@ -570,7 +599,7 @@ namespace UI {
      * @return true if initialization succeeded, false if any subsystem failed.
      */
     bool Initialize() {
-        g_logInterceptor = new ImGuiLogStreamBuf();
+        g_logInterceptor = std::make_unique<ImGuiLogStreamBuf>();
 
         // Ensure KAM-Flow survives extreme system load by elevating the entire process priority.
         // This guarantees KVM inputs and audio streams don't stutter when minimized during heavy gaming/workloads.
@@ -582,7 +611,11 @@ namespace UI {
         PowerThrottling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
         PowerThrottling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
         PowerThrottling.StateMask = 0; // 0 explicitly disables throttling
-        ::SetProcessInformation(::GetCurrentProcess(), ProcessPowerThrottling, &PowerThrottling, sizeof(PowerThrottling));
+        if (!::SetProcessInformation(::GetCurrentProcess(), ProcessPowerThrottling, &PowerThrottling, sizeof(PowerThrottling))) {
+            if (State::globalDebugMode) {
+                UI::LogDebug("[UI] WARNING: Failed to disable Windows Power Throttling / EcoQoS (err=%lu).", ::GetLastError());
+            }
+        }
 
         WNDCLASSEX wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, "KAMFlowUIClass", nullptr };
         wc.hIcon = ::LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON));
@@ -605,11 +638,14 @@ namespace UI {
         if (g_windowW < 300) g_windowW = 450; if (g_windowH < 300) g_windowH = 480;
 
         hwnd = ::CreateWindow(wc.lpszClassName, "KAM-Flow", WS_OVERLAPPEDWINDOW, g_windowX, g_windowY, g_windowW, g_windowH, nullptr, nullptr, wc.hInstance, nullptr);
-        if (!hwnd) return false;
+        if (!hwnd) {
+            if (State::globalDebugMode) UI::LogDebug("[UI] ERROR: CreateWindow failed (err=%lu).", ::GetLastError());
+            return false;
+        }
 
-        // Register the Global Hotkey for Emergency Override
-        ::RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::emergencyHotkey.load(std::memory_order_relaxed));
-        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey.load(std::memory_order_relaxed));
+        // Register the Global Hotkeys for Emergency Override and Game Mode
+        RegisterHotKeyChecked(hwnd, 1, "Emergency", State::emergencyHotkey.load(std::memory_order_relaxed));
+        RegisterHotKeyChecked(hwnd, 2, "Game Mode", State::gameModeHotkey.load(std::memory_order_relaxed));
 
         InitTrayIcon(hwnd);
 
@@ -617,9 +653,14 @@ namespace UI {
         ::DragAcceptFiles(hwnd, TRUE);
         
         // Bypass UIPI (User Interface Privilege Isolation) to allow drops from non-elevated Windows Explorer
-        ::ChangeWindowMessageFilterEx(hwnd, WM_DROPFILES, MSGFLT_ALLOW, nullptr);
-        ::ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
-        ::ChangeWindowMessageFilterEx(hwnd, 0x0049, MSGFLT_ALLOW, nullptr); // WM_COPYGLOBALDATA
+        if (!::ChangeWindowMessageFilterEx(hwnd, WM_DROPFILES, MSGFLT_ALLOW, nullptr) ||
+            !::ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr) ||
+            !::ChangeWindowMessageFilterEx(hwnd, 0x0049, MSGFLT_ALLOW, nullptr)) {
+            if (State::globalDebugMode) {
+                UI::LogDebug("[UI] WARNING: ChangeWindowMessageFilterEx failed (err=%lu — drag-and-drop from non-elevated Explorer may be blocked).",
+                             ::GetLastError());
+            }
+        }
 
         DXGI_SWAP_CHAIN_DESC sd;
         ZeroMemory(&sd, sizeof(sd));
@@ -638,11 +679,19 @@ namespace UI {
         D3D_FEATURE_LEVEL featureLevel;
         const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
         
+        bool usedWarp = false;
         HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &pSwapChain, &pd3dDevice, &featureLevel, &pd3dDeviceContext);
         if (res == DXGI_ERROR_UNSUPPORTED || res == E_FAIL) {
+            if (State::globalDebugMode) {
+                UI::LogDebug("[UI] WARNING: DX11 Hardware init failed (0x%08X); falling back to WARP software renderer.", res);
+            }
+            usedWarp = true;
             res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &pSwapChain, &pd3dDevice, &featureLevel, &pd3dDeviceContext);
         }
-        if (res != S_OK) return false;
+        if (res != S_OK) {
+            if (State::globalDebugMode) UI::LogDebug("[UI] ERROR: DX11 initialization failed (0x%08X).", res);
+            return false;
+        }
 
         CreateRenderTarget();
         
@@ -678,6 +727,12 @@ namespace UI {
 
         ImGui_ImplWin32_Init(hwnd);
         ImGui_ImplDX11_Init(pd3dDevice, pd3dDeviceContext);
+
+        if (State::globalDebugMode) {
+            UI::LogDebug("[UI] Initialized (%s, DPI scale: %.0f%%).",
+                         usedWarp ? "WARP Software" : "DX11 Hardware",
+                         dpiScale * 100.0f);
+        }
 
         isAppRunning = true;
         return true;
@@ -876,7 +931,16 @@ namespace UI {
                     }
                 } else {
                     // === CLIENT MODE CONNECTIONS TAB ===
-                    auto targets = CredentialManager::GetSavedTargets("KAMFlow_Server_");
+                    static std::vector<std::string> s_cachedTargets;
+                    static uint64_t s_lastTargetsQueryTick = 0;
+                    static bool s_targetsDirty = true;
+                    uint64_t nowTick = GetTickCount64();
+                    if (s_targetsDirty || (nowTick - s_lastTargetsQueryTick > 2000)) {
+                        s_cachedTargets = CredentialManager::GetSavedTargets("KAMFlow_Server_");
+                        s_lastTargetsQueryTick = nowTick;
+                        s_targetsDirty = false;
+                    }
+                    const auto& targets = s_cachedTargets;
                     bool isPaired = !targets.empty();
 
                     std::string currentStatus = State::GetClientStatus();
@@ -975,6 +1039,7 @@ namespace UI {
                                         if (CredentialManager::LoadSecret("KAMFlow_Server_" + pairedIP, savedPin)) {
                                             CredentialManager::SaveSecret("KAMFlow_Server_" + newIP, savedPin);
                                             CredentialManager::DeleteSecret("KAMFlow_Server_" + pairedIP);
+                                            s_targetsDirty = true;
                                         }
                                     }
                                     g_editingPairedIP = false;
@@ -1013,6 +1078,7 @@ namespace UI {
                                         for (const auto& t : targets) {
                                             CredentialManager::DeleteSecret(t);
                                         }
+                                        s_targetsDirty = true;
                                         g_editingPairedIP = false;
                                     }
                                     DrawWrappedTooltip("Remove the saved pairing for this server.");
@@ -1096,6 +1162,7 @@ namespace UI {
                                 for (const auto& t : targets) {
                                     CredentialManager::DeleteSecret(t);
                                 }
+                                s_targetsDirty = true;
                                 g_editingPairedIP = false;
                                 ImGui::CloseCurrentPopup();
                                 g_showPinPopup = true; // Will trigger OpenPopup on next frame
@@ -1156,6 +1223,7 @@ namespace UI {
                                 CredentialManager::SaveSecret(
                                     "KAMFlow_Server_" + std::string(g_pairingTargetIP),
                                     std::string(g_pairingPinInput));
+                                s_targetsDirty = true;
                                 memset(g_pairingPinInput, 0, sizeof(g_pairingPinInput));
                                 ImGui::CloseCurrentPopup();
                             }
@@ -1516,7 +1584,14 @@ namespace UI {
                     DrawWrappedTooltip("If checked, audio from the Server's microphone will be received and injected into a local Virtual Audio Cable.");
                     
                     if (State::enableClientMicReceive) {
-                        if (!Audio::IsVirtualAudioCableInstalled()) {
+                        static bool s_isVbCableInstalled = false;
+                        static uint64_t s_lastVbCableCheckTick = 0;
+                        uint64_t nowTick = GetTickCount64();
+                        if (s_lastVbCableCheckTick == 0 || (nowTick - s_lastVbCableCheckTick > 2000)) {
+                            s_isVbCableInstalled = Audio::IsVirtualAudioCableInstalled();
+                            s_lastVbCableCheckTick = nowTick;
+                        }
+                        if (!s_isVbCableInstalled) {
                             ImGui::Spacing();
                             ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.15f, 1.0f));
                             ImGui::BeginChild("VBCableInfo", ImVec2(0, 200), true);
@@ -1554,7 +1629,7 @@ namespace UI {
                 if (ImGui::Combo("##EmergencyHotkey", &currentItem, hotkeyOptions)) {
                     State::emergencyHotkey = 'A' + currentItem;
                     ::UnregisterHotKey(hwnd, 1);
-                    ::RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::emergencyHotkey.load(std::memory_order_relaxed));
+                    RegisterHotKeyChecked(hwnd, 1, "Emergency", State::emergencyHotkey.load(std::memory_order_relaxed));
                 }
                 DrawWrappedTooltip("Customize the global OS hotkey used to instantly regain local control or sever a connection.");
 
@@ -1579,7 +1654,7 @@ namespace UI {
                     if (ImGui::Combo("##GameModeHotkey", &gmCurrentItem, hotkeyOptions)) {
                         State::gameModeHotkey = 'A' + gmCurrentItem;
                         ::UnregisterHotKey(hwnd, 2);
-                        ::RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, State::gameModeHotkey.load(std::memory_order_relaxed));
+                        RegisterHotKeyChecked(hwnd, 2, "Game Mode", State::gameModeHotkey.load(std::memory_order_relaxed));
                     }
                     DrawWrappedTooltip("Customize the global OS hotkey used to toggle Game Mode on/off.");
                 }
@@ -1588,47 +1663,60 @@ namespace UI {
                 ImGui::Text("Engine & Debug");
                 ImGui::Separator();
                 
-                AtomicCheckbox("Show Debug Console Tab", State::globalDebugMode);
+                if (AtomicCheckbox("Show Debug Console Tab", State::globalDebugMode)) {
+                    if (!State::globalDebugMode.load(std::memory_order_relaxed)) {
+                        DebugLog::GetGlobalLog().ReleaseMemory();
+                    }
+                }
                 DrawWrappedTooltip("Show or hide the real-time diagnostic console tab for troubleshooting.");
                 ImGui::EndChild();
                 ImGui::EndTabItem();
             }
 
-            if (State::globalDebugMode) {
+            static std::vector<DebugLog::LogEntry> localEntries;
+            static std::vector<size_t> filteredIndices;
+            static uint64_t localGen = 0;
+            static bool wasDebugEnabled = false;
+
+            if (!State::globalDebugMode.load(std::memory_order_relaxed)) {
+                if (wasDebugEnabled) {
+                    std::vector<DebugLog::LogEntry>().swap(localEntries);
+                    std::vector<size_t>().swap(filteredIndices);
+                    localGen = 0;
+                    wasDebugEnabled = false;
+                }
+            } else {
+                wasDebugEnabled = true;
                 bool tabDebug = ImGui::BeginTabItem("Debug Log");
                 if (tabDebug) {
-                    static std::vector<char> localLogCopy;
                     static ImGuiTextFilter logFilter;
                     static bool autoScroll = true;
 
                     if (ImGui::Button("Clear Log")) {
-                        std::lock_guard<std::mutex> lock(g_logMutex);
-                        g_logBufferLen = 0;
-                        if (!g_logBufferVec.empty()) g_logBufferVec[0] = '\0';
-                        if (!localLogCopy.empty()) localLogCopy[0] = '\0';
+                        DebugLog::GetGlobalLog().Clear();
+                        localEntries.clear();
+                        filteredIndices.clear();
+                        localGen = DebugLog::GetGlobalLog().Generation();
                     }
                     DrawWrappedTooltip("Clear all current debug messages.");
 
                     ImGui::SameLine();
                     if (ImGui::Button("Copy All")) {
-                        if (!localLogCopy.empty() && localLogCopy[0] != '\0') {
+                        if (!localEntries.empty()) {
+                            std::string copied;
                             if (logFilter.IsActive()) {
-                                std::string filteredLog;
-                                const char* s = localLogCopy.data();
-                                while (*s) {
-                                    const char* e = strchr(s, '\n');
-                                    if (!e) e = s + strlen(s);
-                                    if (logFilter.PassFilter(s, e)) {
-                                        filteredLog.append(s, e - s);
-                                        filteredLog.push_back('\n');
-                                    }
-                                    if (*e == '\n') s = e + 1;
-                                    else break;
+                                for (size_t idx : filteredIndices) {
+                                    copied.append(localEntries[idx].text);
+                                    copied.push_back('\n');
                                 }
-                                ImGui::SetClipboardText(filteredLog.c_str());
                             } else {
-                                ImGui::SetClipboardText(localLogCopy.data());
+                                copied.reserve(localEntries.size() * 80);
+                                for (const auto& entry : localEntries) {
+                                    copied.append(entry.text);
+                                    copied.push_back('\n');
+                                }
                             }
+                            ImGui::SetClipboardText(copied.c_str());
                         }
                     }
                     DrawWrappedTooltip("Copy debug log messages to clipboard (copies filtered lines when filter is active).");
@@ -1637,69 +1725,47 @@ namespace UI {
                     ImGui::Checkbox("Auto-Scroll", &autoScroll);
 
                     ImGui::SameLine();
-                    logFilter.Draw("Filter", 150.0f);
+                    bool filterChanged = logFilter.Draw("Filter", 150.0f);
                     DrawWrappedTooltip("Filter logs by keyword (comma-separated tokens, e.g. 'Network, -ping').");
 
                     ImGui::Separator();
-                    
-                    // Only lock and copy if new text was actually appended to the buffer
-                    bool needCopy = g_logDirty.exchange(false);
-                    if (needCopy || (localLogCopy.empty() && g_logBufferLen > 0)) {
-                        std::lock_guard<std::mutex> lock(g_logMutex);
-                        if (localLogCopy.empty()) localLogCopy.resize(1024 * 1024, 0);
-                        if (!g_logBufferVec.empty()) {
-                            std::memcpy(localLogCopy.data(), g_logBufferVec.data(), g_logBufferLen + 1);
-                        } else {
-                            localLogCopy[0] = '\0';
+
+                    bool updated = DebugLog::GetGlobalLog().CopySnapshotIfChanged(localGen, localEntries);
+                    if (logFilter.IsActive() && (updated || filterChanged)) {
+                        filteredIndices.clear();
+                        filteredIndices.reserve(localEntries.size());
+                        for (size_t i = 0; i < localEntries.size(); ++i) {
+                            const char* start = localEntries[i].text.c_str();
+                            const char* end = start + localEntries[i].text.size();
+                            if (logFilter.PassFilter(start, end)) {
+                                filteredIndices.push_back(i);
+                            }
                         }
+                    } else if (!logFilter.IsActive() && !filteredIndices.empty()) {
+                        filteredIndices.clear();
                     }
-                    
+
                     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.06f, 0.08f, 1.0f));
                     ImGui::BeginChild("LogScrollRegion", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
-                    if (!localLogCopy.empty() && localLogCopy[0] != '\0') {
-                        const char* line_start = localLogCopy.data();
-                        while (*line_start) {
-                            const char* line_end = strchr(line_start, '\n');
-                            if (!line_end) line_end = line_start + strlen(line_start);
-
-                            if (logFilter.PassFilter(line_start, line_end)) {
-                                ImVec4 col(0.82f, 0.82f, 0.82f, 1.0f); // Default light gray
-                                std::string_view sv(line_start, line_end - line_start);
-
-                                if (sv.find("[Security]") != std::string_view::npos ||
-                                    sv.find("PIN") != std::string_view::npos ||
-                                    sv.find("Blocked") != std::string_view::npos) {
-                                    col = ImVec4(1.0f, 0.75f, 0.22f, 1.0f); // Amber / Yellow
-                                } else if (sv.find("ERROR") != std::string_view::npos ||
-                                           sv.find("Error") != std::string_view::npos ||
-                                           sv.find("failed") != std::string_view::npos ||
-                                           sv.find("Failed") != std::string_view::npos ||
-                                           sv.find("CRITICAL") != std::string_view::npos ||
-                                           sv.find("dropped") != std::string_view::npos ||
-                                           sv.find("Dropped") != std::string_view::npos) {
-                                    col = ImVec4(1.0f, 0.35f, 0.35f, 1.0f); // Coral Red
-                                } else if (sv.find("[Network") != std::string_view::npos) {
-                                    col = ImVec4(0.28f, 0.80f, 1.0f, 1.0f); // Bright Cyan
-                                } else if (sv.find("[Audio]") != std::string_view::npos ||
-                                           sv.find("Audio") != std::string_view::npos) {
-                                    col = ImVec4(0.82f, 0.55f, 1.0f, 1.0f); // Purple / Violet
-                                } else if (sv.find("[KAM-Flow UI]") != std::string_view::npos ||
-                                           sv.find("[UI]") != std::string_view::npos) {
-                                    col = ImVec4(0.35f, 0.85f, 0.45f, 1.0f); // Mint Green
-                                }
-
-                                ImGui::PushStyleColor(ImGuiCol_Text, col);
-                                ImGui::TextUnformatted(line_start, line_end);
+                    const size_t displayCount = logFilter.IsActive() ? filteredIndices.size() : localEntries.size();
+                    if (displayCount > 0) {
+                        ImGuiListClipper clipper;
+                        clipper.Begin(static_cast<int>(displayCount));
+                        while (clipper.Step()) {
+                            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                                const size_t entryIdx = logFilter.IsActive()
+                                    ? filteredIndices[static_cast<size_t>(row)]
+                                    : static_cast<size_t>(row);
+                                const DebugLog::LogEntry& entry = localEntries[entryIdx];
+                                ImGui::PushStyleColor(ImGuiCol_Text, GetCategoryColor(entry.category));
+                                ImGui::TextUnformatted(entry.text.data(), entry.text.data() + entry.text.size());
                                 ImGui::PopStyleColor();
                             }
-
-                            if (*line_end == '\n') line_start = line_end + 1;
-                            else break;
                         }
                     }
 
-                    if (autoScroll && (needCopy || ImGui::GetScrollY() >= ImGui::GetScrollMaxY())) {
+                    if (autoScroll && (updated || ImGui::GetScrollY() >= ImGui::GetScrollMaxY())) {
                         ImGui::SetScrollHereY(1.0f);
                     }
 
@@ -1730,11 +1796,13 @@ namespace UI {
                     ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "No clients connected.");
                 } else {
                     for (const auto& c : clients) {
+                        ImGui::PushID(static_cast<int>(c.socket));
                         bool isSelected = std::find(g_selectedTransferClients.begin(), g_selectedTransferClients.end(), c.socket) != g_selectedTransferClients.end();
                         if (ImGui::Checkbox(c.name.c_str(), &isSelected)) {
                             if (isSelected) g_selectedTransferClients.push_back(c.socket);
                             else g_selectedTransferClients.erase(std::remove(g_selectedTransferClients.begin(), g_selectedTransferClients.end(), c.socket), g_selectedTransferClients.end());
                         }
+                        ImGui::PopID();
                     }
                 }
             } else {
@@ -1877,6 +1945,8 @@ namespace UI {
                     strncpy_s(g_nid.szInfo, infoMsg.c_str(), _TRUNCATE);
                     g_nid.dwInfoFlags = NIIF_INFO;
                     ::Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+                    // Clear NIF_INFO immediately so subsequent minimize (NIM_ADD) calls do not re-display stale toasts.
+                    g_nid.uFlags &= ~NIF_INFO;
                 } else {
                     FLASHWINFO fw = { sizeof(FLASHWINFO), hwnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 3, 0 };
                     ::FlashWindowEx(&fw);
@@ -1886,9 +1956,9 @@ namespace UI {
             s_lastNotifiedTransferId = 0;
         }
 
-        // Skip D3D rendering completely when minimized to save GPU cycles
+        // Skip D3D rendering completely when minimized to save GPU and CPU wakeups
         if (g_isMinimizedToTray) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60hz throttle
+            std::this_thread::sleep_for(std::chrono::milliseconds(100)); // ~10Hz idle message pump throttle
             return;
         }
 
@@ -1932,15 +2002,24 @@ namespace UI {
 
             D3D_FEATURE_LEVEL featureLevel;
             const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
+            bool recoveryUsedWarp = false;
             HRESULT res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &pSwapChain, &pd3dDevice, &featureLevel, &pd3dDeviceContext);
             if (res == DXGI_ERROR_UNSUPPORTED || res == E_FAIL) {
+                recoveryUsedWarp = true;
                 res = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &pSwapChain, &pd3dDevice, &featureLevel, &pd3dDeviceContext);
             }
             if (SUCCEEDED(res)) {
                 CreateRenderTarget();
                 ImGui_ImplDX11_InvalidateDeviceObjects();
                 ImGui_ImplDX11_CreateDeviceObjects();
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[UI] DX11 Device recovered (%s).",
+                                 recoveryUsedWarp ? "WARP Software" : "DX11 Hardware");
+                }
             } else {
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[UI] ERROR: DX11 Device recovery failed (0x%08X). Exiting.", res);
+                }
                 isAppRunning = false; // Unrecoverable — exit gracefully
             }
             return;
@@ -1975,10 +2054,8 @@ namespace UI {
             hwnd = nullptr; 
         }
 
-        if (g_logInterceptor) {
-            delete g_logInterceptor;
-            g_logInterceptor = nullptr;
-        }
+        g_logInterceptor.reset();
+        DebugLog::GetGlobalLog().ReleaseMemory();
     }
 
     /**

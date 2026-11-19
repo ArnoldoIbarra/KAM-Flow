@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Network Server Implementation
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -15,6 +15,7 @@
 #include "ClipboardManager.h"
 #include "ConfigManager.h"
 #include "CredentialManager.h"
+#include "DebugLog.h"
 #include "FileTransferManager.h"
 #include "MouseCapture.h"
 #include "NetworkMessages.h"
@@ -34,6 +35,10 @@
 
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "avrt.lib")
+
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 
 namespace Network {
 
@@ -88,6 +93,31 @@ std::mutex clientThreadsListMutex;
 
 /// Background thread for receiving connectionless UDP packets.
 std::thread udpListenerThread;
+/// Mutex serializing UDP packet sequence assignment and sendto() independently of per-client TCP locks.
+std::mutex serverUdpSendMutex;
+/// Tracks whether StartServer acquired a WinSock reference for this session.
+static std::atomic<bool> g_serverWsaInitialized{false};
+/// Signals GetConnectedClients() to immediately refresh its cached snapshot after any client list mutation.
+static std::atomic<bool> g_clientsCacheDirty{true};
+/// Monotonic server-wide UDP stats accumulated from disconnected/evicted clients so 30s deltas never underflow.
+static UdpReplayStats g_serverRetiredUdpStats = {};
+/// Lock-free server UDP decrypt and transmit error counters drained every 30s.
+static std::atomic<uint64_t> g_serverUdpDecryptFails{0};
+static std::atomic<uint64_t> g_serverUdpSendErrors{0};
+
+/**
+ * @brief Adds a departing client's UDP replay counters into g_serverRetiredUdpStats.
+ * Caller must hold clientsMutex.
+ * @param s The departing client's cumulative UDP replay counters.
+ * @return void
+ */
+static void AccumulateRetiredUdpStats(const UdpReplayStats &s) {
+  g_serverRetiredUdpStats.packetsAccepted += s.packetsAccepted;
+  g_serverRetiredUdpStats.packetsOutOfOrder += s.packetsOutOfOrder;
+  g_serverRetiredUdpStats.sequenceGaps += s.sequenceGaps;
+  g_serverRetiredUdpStats.staleDrops += s.staleDrops;
+  g_serverRetiredUdpStats.duplicateDrops += s.duplicateDrops;
+}
 
 /**
  * @brief Retrieves the active Master PIN from memory for display in the UI.
@@ -120,9 +150,17 @@ void RegenerateMasterPin() {
   Security::Shutdown();
   Security::Initialize(activeServerPin.c_str());
 
-  std::lock_guard<std::mutex> lock(clientsMutex);
-  for (const auto &client : activeClients) {
-    shutdown(client.socket, SD_BOTH);
+  size_t disconnectedCount = 0;
+  {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    disconnectedCount = activeClients.size();
+    for (const auto &client : activeClients) {
+      shutdown(client.socket, SD_BOTH);
+    }
+  }
+  if (State::globalDebugMode) {
+    UI::LogDebug("[Security] Master PIN regenerated. Disconnecting %zu active client(s).",
+                 disconnectedCount);
   }
 }
 
@@ -147,7 +185,8 @@ std::vector<ConnectedClientInfo> GetConnectedClients() {
 
   std::lock_guard<std::mutex> cacheLock(cacheMutex);
 
-  if (now - lastCacheTime > 500) {
+  if (g_clientsCacheDirty.exchange(false, std::memory_order_acq_rel) ||
+      (now - lastCacheTime > 500)) {
     std::lock_guard<std::mutex> lock(clientsMutex);
     cachedClients = activeClients;
     lastCacheTime = now;
@@ -180,12 +219,23 @@ void DisconnectClient(SOCKET clientSocket) {
  * @return void
  */
 void SetClientVolume(SOCKET clientSocket, float volume) {
-  std::lock_guard<std::mutex> lock(clientsMutex);
-  for (auto &client : activeClients) {
-    if (client.socket == clientSocket) {
-      client.audioVolume = volume;
-      break;
+  bool found = false;
+  bool isEnabled = true;
+  {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    for (auto &client : activeClients) {
+      if (client.socket == clientSocket) {
+        client.audioVolume = volume;
+        isEnabled = client.isAudioEnabled;
+        found = true;
+        g_clientsCacheDirty.store(true, std::memory_order_release);
+        break;
+      }
     }
+  }
+  if (found) {
+    // Sync lock-free audio state outside clientsMutex
+    Audio::SetClientAudioState(clientSocket, isEnabled, volume);
   }
 }
 
@@ -197,15 +247,26 @@ void SetClientVolume(SOCKET clientSocket, float volume) {
  * @return void
  */
 void ToggleClientAudio(SOCKET clientSocket, bool enabled) {
-  std::lock_guard<std::mutex> lock(clientsMutex);
-  for (auto &client : activeClients) {
-    if (client.socket == clientSocket) {
-      client.isAudioEnabled = enabled;
-      if (!enabled) {
-        Audio::ClearClientAudioQueue(clientSocket);
+  bool found = false;
+  float vol = 1.0f;
+  {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    for (auto &client : activeClients) {
+      if (client.socket == clientSocket) {
+        client.isAudioEnabled = enabled;
+        vol = client.audioVolume;
+        found = true;
+        if (!enabled) {
+          Audio::ClearClientAudioQueue(clientSocket);
+        }
+        g_clientsCacheDirty.store(true, std::memory_order_release);
+        break;
       }
-      break;
     }
+  }
+  if (found && enabled) {
+    // Sync lock-free audio state outside clientsMutex when re-enabled
+    Audio::SetClientAudioState(clientSocket, true, vol);
   }
 }
 
@@ -223,6 +284,7 @@ void UpdateClientGridPosition(SOCKET clientSocket, int x, int y) {
       client.gridX = x;
       client.gridY = y;
       Config::SaveClientLayout(client.name, x, y);
+      g_clientsCacheDirty.store(true, std::memory_order_release);
       break;
     }
   }
@@ -239,6 +301,7 @@ void ToggleClientClipboard(SOCKET clientSocket, bool enabled) {
   for (auto &client : activeClients) {
     if (client.socket == clientSocket) {
       client.isClipboardEnabled = enabled;
+      g_clientsCacheDirty.store(true, std::memory_order_release);
       break;
     }
   }
@@ -248,6 +311,9 @@ void ToggleClientClipboard(SOCKET clientSocket, bool enabled) {
  * @brief Retrieves the audio state for a specific client without deep-copying
  * structures.
  * @param clientSocket The socket of the client.
+ * @param isEnabled Output parameter receiving whether audio mixing is enabled for the client.
+ * @param volume Output parameter receiving the client's current volume multiplier.
+ * @return true if the client was found in activeClients, false otherwise.
  */
 bool GetClientAudioState(SOCKET clientSocket, bool &isEnabled, float &volume) {
   std::lock_guard<std::mutex> lock(clientsMutex);
@@ -263,14 +329,19 @@ bool GetClientAudioState(SOCKET clientSocket, bool &isEnabled, float &volume) {
 
 /**
  * @brief Background loop that broadcasts the Server's IP and Port to the local
- * subnet.
+ * subnet, iterating all active IPv4 interfaces for multi-NIC / virtual adapter resilience.
  * @param tcpPort The port the TCP Server is currently listening on.
  * @return void
  */
 void UDPBeaconLoop(uint16_t tcpPort) {
   SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (udpSocket == INVALID_SOCKET)
+  if (udpSocket == INVALID_SOCKET) {
+    if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] ERROR: UDP Beacon socket() failed (WSA Error: %d).",
+                   WSAGetLastError());
+    }
     return;
+  }
 
   int broadcastEnable = 1;
   setsockopt(udpSocket, SOL_SOCKET, SO_BROADCAST, (char *)&broadcastEnable,
@@ -290,6 +361,9 @@ void UDPBeaconLoop(uint16_t tcpPort) {
   DWORD size = sizeof(hostname);
   GetComputerNameA(hostname, &size);
 
+  bool loggedBeaconStart = false;
+  bool loggedIoctlFail = false;
+
   while (isBeaconRunning) {
     PacketHeader header = {PACKET_MAGIC, MessageType::EVENT_UDP_BEACON,
                            sizeof(UDPBeaconPayload), 0};
@@ -302,10 +376,47 @@ void UDPBeaconLoop(uint16_t tcpPort) {
     memcpy(buffer, &header, sizeof(header));
     memcpy(buffer + sizeof(header), &payload, sizeof(payload));
 
-    // Send to physical network
+    // Send to each active IPv4 interface's directed subnet broadcast address ((ip & mask) | ~mask)
+    // so multi-NIC machines (WSL, Hyper-V, Docker, VPNs) always reach the physical LAN subnet.
+    int ifaceCount = 0;
+    INTERFACE_INFO ifList[32];
+    DWORD bytesReturned = 0;
+    if (WSAIoctl(udpSocket, SIO_GET_INTERFACE_LIST, nullptr, 0, ifList,
+                 sizeof(ifList), &bytesReturned, nullptr, nullptr) == 0) {
+      int numInterfaces = bytesReturned / sizeof(INTERFACE_INFO);
+      for (int i = 0; i < numInterfaces; ++i) {
+        u_long flags = ifList[i].iiFlags;
+        if ((flags & IFF_UP) && !(flags & IFF_LOOPBACK)) {
+          uint32_t ip = ifList[i].iiAddress.AddressIn.sin_addr.s_addr;
+          uint32_t mask = ifList[i].iiNetmask.AddressIn.sin_addr.s_addr;
+          if (ip != 0 && mask != 0) {
+            sockaddr_in subnetBroadcast = {0};
+            subnetBroadcast.sin_family = AF_INET;
+            subnetBroadcast.sin_port = htons(8081);
+            subnetBroadcast.sin_addr.s_addr = (ip & mask) | (~mask);
+            sendto(udpSocket, buffer, sizeof(buffer), 0,
+                   (sockaddr *)&subnetBroadcast, sizeof(subnetBroadcast));
+            ++ifaceCount;
+          }
+        }
+      }
+    } else if (!loggedIoctlFail) {
+      loggedIoctlFail = true;
+      if (State::globalDebugMode) {
+        UI::LogDebug("[Network Server] WARNING: WSAIoctl(SIO_GET_INTERFACE_LIST) failed (WSA Error: %d); using global broadcast only.",
+                     WSAGetLastError());
+      }
+    }
+
+    if (!loggedBeaconStart && State::globalDebugMode) {
+      loggedBeaconStart = true;
+      UI::LogDebug("[Network Server] UDP Discovery Beacon active on %d IPv4 interface(s) (port 8081).",
+                   ifaceCount);
+    }
+
+    // Fallback global broadcast and loopback for local 1-PC testing
     sendto(udpSocket, buffer, sizeof(buffer), 0, (sockaddr *)&broadcastAddr,
            sizeof(broadcastAddr));
-    // Send to loopback for local 1-PC testing
     sendto(udpSocket, buffer, sizeof(buffer), 0, (sockaddr *)&localhostAddr,
            sizeof(localhostAddr));
 
@@ -314,217 +425,6 @@ void UDPBeaconLoop(uint16_t tcpPort) {
     }
   }
   closesocket(udpSocket);
-}
-
-/**
- * @brief Dedicated thread for an authenticated client to listen for return
- * control commands.
- * @param clientSocket The authenticated socket connection.
- * @return void
- */
-void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence) {
-  uint32_t rxSequence = initialRxSequence;
-  int rxHbCount = 0;
-
-  thread_local std::vector<uint8_t> tls_rawPayload;
-  thread_local std::vector<uint8_t> tls_decrypted;
-  tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
-  tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
-
-  while (isRunning) {
-    PacketHeader header;
-    int bytes =
-        recv(clientSocket, (char *)&header, sizeof(header), MSG_WAITALL);
-    if (bytes <= 0) {
-      int wsaErr = WSAGetLastError();
-      if (wsaErr == WSAETIMEDOUT) {
-        if (State::globalDebugMode)
-          UI::LogDebug("[Network Server] Client timed out (No Heartbeat "
-                       "received). WSA Error: %d",
-                       wsaErr);
-      } else {
-        if (State::globalDebugMode)
-          UI::LogDebug("[Network Server] Client socket severed. WSA Error: %d",
-                       wsaErr);
-      }
-      break;
-    }
-
-    if (header.magic == PACKET_MAGIC) {
-      if (header.payloadSize > MAX_PAYLOAD_SIZE) {
-        if (State::globalDebugMode)
-          UI::LogDebug("[Network Server] CRITICAL: Payload size exceeds safety "
-                       "bounds! Dropping connection.");
-        break;
-      }
-
-      tls_rawPayload.resize(header.payloadSize);
-      if (header.payloadSize > 0) {
-        int pBytes = recv(clientSocket, (char *)tls_rawPayload.data(),
-                          header.payloadSize, MSG_WAITALL);
-        if (pBytes != static_cast<int>(header.payloadSize)) {
-          if (State::globalDebugMode)
-            UI::LogDebug(
-                "[Network Server] WARNING: Partial payload received. (Got %d "
-                "of %u bytes, Error: %d). Dropping connection.",
-                pBytes, header.payloadSize, WSAGetLastError());
-          break;
-        }
-      }
-
-      if (header.sequenceNumber <= rxSequence && header.sequenceNumber != 0) {
-        if (State::globalDebugMode)
-          UI::LogDebug("[Security] Replay attack detected. Dropping packet.");
-        continue;
-      }
-      rxSequence = header.sequenceNumber;
-
-      const uint8_t *finalPayload = tls_rawPayload.data();
-      size_t finalSize = tls_rawPayload.size();
-
-      bool isEncrypted = (header.type != MessageType::EVENT_AUTH);
-
-      if (isEncrypted) {
-        if (!Security::DecryptPayload(tls_rawPayload.data(),
-                                      tls_rawPayload.size(), &header,
-                                      sizeof(header), tls_decrypted)) {
-          if (State::globalDebugMode)
-            UI::LogDebug("[Security] Failed to decrypt client packet.");
-          continue;
-        }
-        finalPayload = tls_decrypted.data();
-        finalSize = tls_decrypted.size();
-      }
-
-      if (header.type == MessageType::EVENT_HEARTBEAT) {
-        if (++rxHbCount % 10 == 0 && State::globalDebugMode) {
-          UI::LogDebug(
-              "[Network Server] Received Keep-Alive Heartbeat from Client.");
-        }
-        continue; // Keep-alive heartbeat acknowledged.
-      }
-
-      if (header.type == MessageType::EVENT_AUDIO_DATA) {
-        // Pass the raw PCM data to the audio manager for mixing and playback.
-        Audio::HandleAudioData(clientSocket, finalPayload, finalSize);
-      } else if (header.type == MessageType::EVENT_CLIPBOARD) {
-        if (finalSize > 0) {
-          // Convert byte stream back to a wide string and set it locally.
-          std::wstring text;
-          if (finalSize % sizeof(wchar_t) == 0 && finalSize > 0) {
-            text.assign((wchar_t *)finalPayload, finalSize / sizeof(wchar_t));
-            // Ensure the string is properly terminated before passing to
-            // clipboard
-            if (!text.empty() && text.back() == L'\0') {
-              text.pop_back();
-            }
-          }
-
-          if (!text.empty()) {
-            ClipboardManager::SetRemoteClipboard(text);
-          }
-        }
-      } else if (header.type == MessageType::EVENT_RETURN_CONTROL) {
-        // Gate return control to only accept events from the client that currently holds KVM focus
-        if (g_controllingClientSocket.load(std::memory_order_relaxed) != clientSocket) {
-          continue;
-        }
-
-        if (finalSize == sizeof(ReturnControlPayload)) {
-          ReturnControlPayload p;
-          memcpy(&p, finalPayload, sizeof(p));
-
-          int sourceX = 0, sourceY = 0;
-          {
-            std::lock_guard<std::mutex> lock(clientsMutex);
-            for (const auto &c : activeClients) {
-              if (c.socket == clientSocket) {
-                sourceX = c.gridX;
-                sourceY = c.gridY;
-                break;
-              }
-            }
-          }
-          RouteCursorTransition(sourceX, sourceY, p.exitEdge, p.normalizedX,
-                                p.normalizedY);
-        }
-      } else if (header.type == MessageType::EVENT_CLIENT_LOCKED) {
-        if (State::IsRemote()) {
-          if (State::globalDebugMode)
-            UI::LogDebug("[Network Server] Client input locked (UAC / SYSTEM window). Auto-reverting control to Server.");
-          Input::HandleReturnControl(0, 0.5f, 0.5f);
-          g_controllingClientSocket.store(INVALID_SOCKET,
-                                          std::memory_order_relaxed);
-          State::SetMode(State::ControlMode::LOCAL);
-        }
-      } else if (header.type == MessageType::EVENT_FILE_OFFER) {
-        if (finalSize == sizeof(FileOfferPayload)) {
-          FileOfferPayload p;
-          memcpy(&p, finalPayload, sizeof(p));
-          FileTransfer::HandleFileOffer(clientSocket, p);
-        }
-      } else if (header.type == MessageType::EVENT_FILE_ACCEPT) {
-        if (finalSize == sizeof(FileAcceptPayload)) {
-          FileAcceptPayload p;
-          memcpy(&p, finalPayload, sizeof(p));
-          FileTransfer::HandleFileAccept(clientSocket, p);
-        }
-      } else if (header.type == MessageType::EVENT_FILE_DECLINE) {
-        if (finalSize == sizeof(FileDeclinePayload)) {
-          FileDeclinePayload p;
-          memcpy(&p, finalPayload, sizeof(p));
-          FileTransfer::HandleFileDecline(clientSocket, p);
-        }
-      }
-    }
-  }
-
-  if (State::globalDebugMode)
-    UI::LogDebug("[Network Server] Client disconnected.");
-
-  // Remove the client from the active list under the lock, but release the lock
-  // BEFORE calling SetMode or closesocket. SetMode → BroadcastMessage →
-  // clientsMutex would deadlock if we still held the lock (std::mutex is
-  // non-recursive).
-  // Track whether this socket was already evicted by a reconnect. If the
-  // same client re-authenticated while this old thread was still blocking on
-  // recv(), AcceptClientsLoop already removed our entry and closed our socket.
-  bool wasEvicted = true;
-  {
-    std::lock_guard<std::mutex> lock(clientsMutex);
-    for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
-      if (it->socket == clientSocket) {
-        activeClients.erase(it);
-        g_hasClients.store(!activeClients.empty(), std::memory_order_relaxed);
-        clientSendMutexes.erase(clientSocket);
-        wasEvicted = false;
-        break;
-      }
-    }
-  }
-
-  // Only perform cleanup if we weren't already evicted by a reconnect.
-  // The eviction path already closed the socket and cleared the audio queue.
-  if (!wasEvicted) {
-    Audio::ClearClientAudioQueue(clientSocket);
-    closesocket(clientSocket);
-  }
-
-  // CRITICAL SAFETY: If the disconnected client was the one that had control,
-  // immediately revert to LOCAL to prevent input lockout.
-  // Only revert for the controlling client — other clients disconnecting
-  // should not affect the active KVM session.
-  // Skip if evicted: the reconnect path already cleared g_controllingClientSocket
-  // if needed, and the NEW connection may have already taken control.
-  if (!wasEvicted && State::IsRemote() &&
-      g_controllingClientSocket.load(std::memory_order_relaxed) ==
-          clientSocket) {
-    if (State::globalDebugMode)
-      UI::LogDebug("[Network Server] Controlling client dropped. "
-                   "Auto-reverting to LOCAL.");
-    g_controllingClientSocket.store(INVALID_SOCKET, std::memory_order_relaxed);
-    State::SetMode(State::ControlMode::LOCAL);
-  }
 }
 
 /**
@@ -573,6 +473,309 @@ static bool SendExact(SOCKET sock, const void *buffer, size_t length) {
 }
 
 /**
+ * @brief Dedicated thread for an authenticated client to listen for return
+ * control commands.
+ * @param clientSocket The authenticated socket connection.
+ * @param initialRxSequence The initial TCP sequence number received during authentication.
+ * @param clientName Authenticated client hostname for diagnostics.
+ * @param clientIp Authenticated client IPv4 address for diagnostics.
+ * @return void
+ */
+void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence,
+                        std::string clientName, std::string clientIp) {
+  uint32_t rxSequence = initialRxSequence;
+  static DebugLog::RateLimitState tcpReplayRate;
+  static DebugLog::RateLimitState tcpDecryptRate;
+  static DebugLog::RateLimitState clipBadRate;
+  static DebugLog::RateLimitState retFocusRate;
+
+  thread_local std::vector<uint8_t> tls_rawPayload;
+  thread_local std::vector<uint8_t> tls_decrypted;
+  tls_rawPayload.reserve(MAX_PAYLOAD_SIZE);
+  tls_decrypted.reserve(MAX_PAYLOAD_SIZE);
+
+  while (isRunning) {
+    PacketHeader header;
+    int errCode = 0;
+    if (!RecvExact(clientSocket, &header, sizeof(header), errCode)) {
+      if (errCode == WSAETIMEDOUT) {
+        if (State::globalDebugMode)
+          UI::LogDebug("[Network Server] Client '%s' (%s) timed out (No Heartbeat "
+                       "received). WSA Error: %d",
+                       clientName.c_str(), clientIp.c_str(), errCode);
+      } else {
+        if (State::globalDebugMode)
+          UI::LogDebug("[Network Server] Client '%s' (%s) socket severed. WSA Error: %d",
+                       clientName.c_str(), clientIp.c_str(), errCode);
+      }
+      break;
+    }
+
+    if (header.magic != PACKET_MAGIC) {
+      if (State::globalDebugMode)
+        UI::LogDebug("[Network Server] FATAL: Packet desync from '%s' (%s): bad magic 0x%08X. Dropping connection.",
+                     clientName.c_str(), clientIp.c_str(), header.magic);
+      break;
+    }
+
+    if (header.payloadSize > MAX_PAYLOAD_SIZE) {
+      if (State::globalDebugMode)
+        UI::LogDebug("[Network Server] CRITICAL: Payload size (%u bytes) exceeds safety "
+                     "bounds from '%s' (%s)! Dropping connection.",
+                     header.payloadSize, clientName.c_str(), clientIp.c_str());
+      break;
+    }
+
+    tls_rawPayload.resize(header.payloadSize);
+    if (header.payloadSize > 0) {
+      if (!RecvExact(clientSocket, tls_rawPayload.data(), header.payloadSize, errCode)) {
+        if (State::globalDebugMode)
+          UI::LogDebug(
+              "[Network Server] WARNING: Partial payload from '%s' (%s) (Expected %u bytes, Error: %d). Dropping connection.",
+              clientName.c_str(), clientIp.c_str(), header.payloadSize, errCode);
+        break;
+      }
+    }
+
+    if (header.sequenceNumber <= rxSequence && header.sequenceNumber != 0) {
+      if (State::globalDebugMode) {
+        uint32_t suppressed = 0;
+        if (tcpReplayRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+          char supBuf[32] = "";
+          if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+          UI::LogDebug("[Security] Replay attack / stale TCP packet from '%s' (%s): type=%s seq=%u <= rxSeq=%u%s.",
+                       clientName.c_str(), clientIp.c_str(),
+                       MessageTypeToString(header.type), header.sequenceNumber, rxSequence, supBuf);
+        }
+      }
+      continue;
+    }
+    rxSequence = header.sequenceNumber;
+
+    const uint8_t *finalPayload = tls_rawPayload.data();
+    size_t finalSize = tls_rawPayload.size();
+
+    bool isEncrypted = (header.type != MessageType::EVENT_AUTH);
+
+    if (isEncrypted) {
+      if (!Security::DecryptPayload(tls_rawPayload.data(),
+                                    tls_rawPayload.size(), &header,
+                                    sizeof(header), tls_decrypted)) {
+        if (State::globalDebugMode) {
+          uint32_t suppressed = 0;
+          if (tcpDecryptRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            char supBuf[32] = "";
+            if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+            UI::LogDebug("[Security] Failed to decrypt packet from '%s' (%s): type=%s seq=%u size=%zu%s.",
+                         clientName.c_str(), clientIp.c_str(),
+                         MessageTypeToString(header.type), header.sequenceNumber,
+                         tls_rawPayload.size(), supBuf);
+          }
+        }
+        continue;
+      }
+      finalPayload = tls_decrypted.data();
+      finalSize = tls_decrypted.size();
+    }
+
+    if (header.type == MessageType::EVENT_HEARTBEAT) {
+      continue; // Keep-alive heartbeat acknowledged.
+    }
+
+    if (header.type == MessageType::EVENT_AUDIO_DATA) {
+      // Pass the raw PCM data to the audio manager for mixing and playback.
+      Audio::HandleAudioData(clientSocket, finalPayload, finalSize);
+    } else if (header.type == MessageType::EVENT_CLIPBOARD) {
+      if (finalSize > 0 && State::enableClipboardSync) {
+        bool clientClipboardAllowed = false;
+        {
+          std::lock_guard<std::mutex> lock(clientsMutex);
+          for (const auto &c : activeClients) {
+            if (c.socket == clientSocket) {
+              clientClipboardAllowed = c.isClipboardEnabled;
+              break;
+            }
+          }
+        }
+        if (!clientClipboardAllowed) {
+          continue;
+        }
+
+        // Convert byte stream back to a wide string and set it locally.
+        std::wstring text;
+        if (finalSize % sizeof(wchar_t) == 0 && finalSize > 0) {
+          text.assign((wchar_t *)finalPayload, finalSize / sizeof(wchar_t));
+          // Ensure the string is properly terminated before passing to
+          // clipboard
+          if (!text.empty() && text.back() == L'\0') {
+            text.pop_back();
+          }
+        } else if (State::globalDebugMode) {
+          uint32_t suppressed = 0;
+          if (clipBadRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            UI::LogDebug("[Network Server] WARNING: Malformed clipboard payload (%zu bytes) from '%s'.",
+                         finalSize, clientName.c_str());
+          }
+        }
+
+        if (!text.empty()) {
+          ClipboardManager::SetRemoteClipboard(text);
+          // Relay clipboard update to all other connected clients without echoing back to sender
+          BroadcastClipboardMessage(finalPayload, finalSize, clientSocket);
+        }
+      }
+    } else if (header.type == MessageType::EVENT_RETURN_CONTROL) {
+      // Gate return control to only accept events from the client that currently holds KVM focus
+      if (g_controllingClientSocket.load(std::memory_order_relaxed) != clientSocket) {
+        if (State::globalDebugMode) {
+          uint32_t suppressed = 0;
+          if (retFocusRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            char supBuf[32] = "";
+            if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), " (+%u suppressed)", suppressed);
+            UI::LogDebug("[Network Server] Ignored RETURN_CONTROL from non-controlling client '%s'%s.",
+                         clientName.c_str(), supBuf);
+          }
+        }
+        continue;
+      }
+
+      if (finalSize == sizeof(ReturnControlPayload)) {
+        ReturnControlPayload p;
+        memcpy(&p, finalPayload, sizeof(p));
+
+        int sourceX = 0, sourceY = 0;
+        {
+          std::lock_guard<std::mutex> lock(clientsMutex);
+          for (const auto &c : activeClients) {
+            if (c.socket == clientSocket) {
+              sourceX = c.gridX;
+              sourceY = c.gridY;
+              break;
+            }
+          }
+        }
+        RouteCursorTransition(sourceX, sourceY, p.exitEdge, p.normalizedX,
+                              p.normalizedY);
+      } else if (State::globalDebugMode) {
+        UI::LogDebug("[Network Server] WARNING: Malformed RETURN_CONTROL payload (%zu bytes) from '%s'.",
+                     finalSize, clientName.c_str());
+      }
+    } else if (header.type == MessageType::EVENT_CLIENT_LOCKED) {
+      if (State::IsRemote()) {
+        if (State::globalDebugMode)
+          UI::LogDebug("[Network Server] Client '%s' input locked (UAC / SYSTEM window). Auto-reverting control to Server.",
+                       clientName.c_str());
+        Input::HandleReturnControl(0, 0.5f, 0.5f);
+        g_controllingClientSocket.store(INVALID_SOCKET,
+                                        std::memory_order_relaxed);
+        State::SetMode(State::ControlMode::LOCAL);
+      }
+    } else if (header.type == MessageType::EVENT_FILE_OFFER) {
+      if (finalSize == sizeof(FileOfferPayload)) {
+        FileOfferPayload p;
+        memcpy(&p, finalPayload, sizeof(p));
+        FileTransfer::HandleFileOffer(clientSocket, p);
+      } else if (State::globalDebugMode) {
+        UI::LogDebug("[Network Server] WARNING: Malformed FILE_OFFER payload (%zu bytes) from '%s'.",
+                     finalSize, clientName.c_str());
+      }
+    } else if (header.type == MessageType::EVENT_FILE_ACCEPT) {
+      if (finalSize == sizeof(FileAcceptPayload)) {
+        FileAcceptPayload p;
+        memcpy(&p, finalPayload, sizeof(p));
+        FileTransfer::HandleFileAccept(clientSocket, p);
+      } else if (State::globalDebugMode) {
+        UI::LogDebug("[Network Server] WARNING: Malformed FILE_ACCEPT payload (%zu bytes) from '%s'.",
+                     finalSize, clientName.c_str());
+      }
+    } else if (header.type == MessageType::EVENT_FILE_DECLINE) {
+      if (finalSize == sizeof(FileDeclinePayload)) {
+        FileDeclinePayload p;
+        memcpy(&p, finalPayload, sizeof(p));
+        FileTransfer::HandleFileDecline(clientSocket, p);
+      } else if (State::globalDebugMode) {
+        UI::LogDebug("[Network Server] WARNING: Malformed FILE_DECLINE payload (%zu bytes) from '%s'.",
+                     finalSize, clientName.c_str());
+      }
+    }
+  }
+
+  if (State::globalDebugMode)
+    UI::LogDebug("[Network Server] Client '%s' (%s) disconnected.",
+                 clientName.c_str(), clientIp.c_str());
+
+  // Remove the client from the active list under the lock, but release the lock
+  // BEFORE calling SetMode or closesocket. SetMode → BroadcastMessage →
+  // clientsMutex would deadlock if we still held the lock (std::mutex is
+  // non-recursive).
+  // Track whether this socket was already evicted by a reconnect. If the
+  // same client re-authenticated while this old thread was still blocking on
+  // recv(), AcceptClientsLoop already removed our entry and closed our socket.
+  bool wasEvicted = true;
+  UdpReplayStats finalStats = {};
+  bool finalHasUdp = false;
+  uint32_t finalTcpStalls = 0;
+  uint64_t finalConnectTick = 0;
+  {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
+      if (it->socket == clientSocket) {
+        finalStats = it->udpStats;
+        finalHasUdp = it->hasUdp;
+        finalTcpStalls = it->tcpStallCount;
+        finalConnectTick = it->connectTickMs;
+        AccumulateRetiredUdpStats(it->udpStats);
+        activeClients.erase(it);
+        g_hasClients.store(!activeClients.empty(), std::memory_order_relaxed);
+        clientSendMutexes.erase(clientSocket);
+        g_clientsCacheDirty.store(true, std::memory_order_release);
+        wasEvicted = false;
+        break;
+      }
+    }
+  }
+
+  // Only perform cleanup if we weren't already evicted by a reconnect.
+  // The eviction path already closed the socket and cleared the audio queue.
+  if (!wasEvicted) {
+    Audio::ClearClientAudioQueue(clientSocket);
+    closesocket(clientSocket);
+    if (State::globalDebugMode) {
+      double durSec = (finalConnectTick > 0)
+                          ? static_cast<double>(GetTickCount64() - finalConnectTick) / 1000.0
+                          : 0.0;
+      UI::LogDebug("[Session Summary] '%s' (%s) ended after %.1fs | Transport=%s | "
+                   "UDP rx=%llu lost=%llu ooo=%llu stale=%llu dup=%llu | TCP stalls=%u",
+                   clientName.c_str(), clientIp.c_str(), durSec,
+                   finalHasUdp ? "UDP" : "TCP-Fallback",
+                   static_cast<unsigned long long>(finalStats.packetsAccepted),
+                   static_cast<unsigned long long>(finalStats.sequenceGaps),
+                   static_cast<unsigned long long>(finalStats.packetsOutOfOrder),
+                   static_cast<unsigned long long>(finalStats.staleDrops),
+                   static_cast<unsigned long long>(finalStats.duplicateDrops),
+                   finalTcpStalls);
+    }
+  }
+
+  // CRITICAL SAFETY: If the disconnected client was the one that had control,
+  // immediately revert to LOCAL to prevent input lockout.
+  // Only revert for the controlling client — other clients disconnecting
+  // should not affect the active KVM session.
+  // Skip if evicted: the reconnect path already cleared g_controllingClientSocket
+  // if needed, and the NEW connection may have already taken control.
+  if (!wasEvicted && State::IsRemote() &&
+      g_controllingClientSocket.load(std::memory_order_relaxed) ==
+          clientSocket) {
+    if (State::globalDebugMode)
+      UI::LogDebug("[Network Server] Controlling client '%s' (%s) dropped. "
+                   "Auto-reverting to LOCAL.",
+                   clientName.c_str(), clientIp.c_str());
+    g_controllingClientSocket.store(INVALID_SOCKET, std::memory_order_relaxed);
+    State::SetMode(State::ControlMode::LOCAL);
+  }
+}
+
+/**
  * @brief Main listener loop that accepts incoming TCP connections and handles
  * the authentication handshake.
  * @return void
@@ -601,7 +804,7 @@ void AcceptClientsLoop() {
         accept(serverSocket, (sockaddr *)&clientAddr, &clientAddrSize);
 
     if (clientSocket != INVALID_SOCKET) {
-      DWORD timeout = 5000;
+      DWORD timeout = 2000;
       setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
                  sizeof(timeout));
 
@@ -642,11 +845,11 @@ void AcceptClientsLoop() {
           UI::LogDebug("[Network Server] Auth failed for %s:%d: unexpected message type %u (expected EVENT_AUTH).",
                        clientIpStr, clientPort, static_cast<unsigned int>(header.type));
         }
-      } else if (header.payloadSize < sizeof(AuthPayload) ||
+      } else if (header.payloadSize < sizeof(AuthPayload) + 28 ||
                  header.payloadSize > MAX_PAYLOAD_SIZE) {
         if (State::globalDebugMode) {
-          UI::LogDebug("[Network Server] Auth failed for %s:%d: invalid payload size %u (expected %zu..%u).",
-                       clientIpStr, clientPort, header.payloadSize, sizeof(AuthPayload), MAX_PAYLOAD_SIZE);
+          UI::LogDebug("[Network Server] Auth failed for %s:%d: invalid encrypted payload size %u (expected %zu..%u).",
+                       clientIpStr, clientPort, header.payloadSize, sizeof(AuthPayload) + 28, MAX_PAYLOAD_SIZE);
         }
       } else {
         std::vector<uint8_t> authBuffer(header.payloadSize);
@@ -656,36 +859,46 @@ void AcceptClientsLoop() {
                          clientIpStr, clientPort, errCode);
           }
         } else {
-          AuthPayload auth;
-          memcpy(&auth, authBuffer.data(), sizeof(AuthPayload));
-          if (auth.clientName[sizeof(auth.clientName) - 1] != '\0') {
-            auth.clientName[sizeof(auth.clientName) - 1] = '\0';
-          }
-          if (auth.pin[sizeof(auth.pin) - 1] != '\0') {
-            auth.pin[sizeof(auth.pin) - 1] = '\0';
-          }
-
-          volatile uint8_t diff = 0;
-          for (int i = 0; i < 8; ++i) {
-            diff |= auth.pin[i] ^ activeServerPin.c_str()[i];
-          }
-
-          if (diff != 0) {
+          // Decrypt the EVENT_AUTH payload using the key derived from activeServerPin.
+          // If the client used an incorrect PIN, AES-GCM authentication tag verification
+          // fails here without the PIN ever traversing the network in plaintext.
+          std::vector<uint8_t> decryptedAuth;
+          if (!Security::DecryptPayload(authBuffer.data(), authBuffer.size(), &header, sizeof(header), decryptedAuth) ||
+              decryptedAuth.size() < sizeof(AuthPayload)) {
             if (State::globalDebugMode) {
-              UI::LogDebug("[Network Server] Auth rejected for client '%s' (%s:%d): PIN mismatch.",
-                           auth.clientName, clientIpStr, clientPort);
+              UI::LogDebug("[Network Server] Auth rejected for %s:%d: AES-GCM tag mismatch (wrong Master PIN).",
+                           clientIpStr, clientPort);
             }
+            // Notify client explicitly so it halts wrong-PIN auto-reconnect loops immediately
+            PacketHeader rejectHdr = {PACKET_MAGIC, MessageType::EVENT_AUTH_REJECTED, 0, 0};
+            SendExact(clientSocket, &rejectHdr, sizeof(rejectHdr));
+            // Brief rate-limiting delay to throttle online PIN brute-force attempts.
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
           } else {
-            if (State::globalDebugMode)
-              UI::LogDebug("[Network Server] Client Authenticated: '%s' from %s:%d.",
-                           auth.clientName, clientIpStr, clientPort);
+            AuthPayload auth;
+            memcpy(&auth, decryptedAuth.data(), sizeof(AuthPayload));
+            auth.clientName[sizeof(auth.clientName) - 1] = '\0';
+
+            if (auth.authVerifier != PACKET_MAGIC || auth.sessionToken == 0) {
+              if (State::globalDebugMode) {
+                UI::LogDebug("[Network Server] Auth rejected for client '%s' (%s:%d): verifier mismatch.",
+                             auth.clientName, clientIpStr, clientPort);
+              }
+              PacketHeader rejectHdr = {PACKET_MAGIC, MessageType::EVENT_AUTH_REJECTED, 0, 0};
+              SendExact(clientSocket, &rejectHdr, sizeof(rejectHdr));
+              std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            } else {
+              if (State::globalDebugMode)
+                UI::LogDebug("[Network Server] Client Authenticated: '%s' from %s:%d.",
+                             auth.clientName, clientIpStr, clientPort);
 
               // Immediately send the server's native audio format directly to
               // the newly authenticated client. This is a critical handshake
               // step that establishes the format standard for all network audio
-              // streams. We send it directly instead of broadcasting to ensure
-              // this specific client receives it.
-              if (State::enableServerAudioMix) {
+              // streams (both loopback and mic broadcast), even if Master Mix is
+              // toggled on later. We send it directly instead of broadcasting to
+              // ensure this specific client receives it.
+              {
                 Audio::AudioFormat serverFormat;
                 if (Audio::GetDefaultDeviceFormat(serverFormat)) {
                   MessageType type = MessageType::EVENT_AUDIO_FORMAT;
@@ -706,13 +919,20 @@ void AcceptClientsLoop() {
                     memcpy(buffer.data(), &h, sizeof(h));
                     memcpy(buffer.data() + sizeof(h), ciphertext.data(),
                            ciphertext.size());
+                  } else if (State::globalDebugMode) {
+                    UI::LogDebug("[Network Server] WARNING: Failed to encrypt audio format handshake for '%s'.",
+                                 auth.clientName);
                   }
 
                   if (!buffer.empty()) {
                     if (!SendExact(clientSocket, buffer.data(), buffer.size()) && State::globalDebugMode) {
-                      UI::LogDebug("[Network Server] WARNING: Failed to send audio format handshake.");
+                      UI::LogDebug("[Network Server] WARNING: Failed to send audio format handshake to '%s' (WSA Error: %d).",
+                                   auth.clientName, WSAGetLastError());
                     }
                   }
+                } else if (State::globalDebugMode) {
+                  UI::LogDebug("[Network Server] WARNING: GetDefaultDeviceFormat failed; audio format handshake skipped for '%s'.",
+                               auth.clientName);
                 }
               }
 
@@ -750,8 +970,10 @@ void AcceptClientsLoop() {
                   if (it->name == safeName &&
                       it->socket != clientSocket) {
                     SOCKET oldSocket = it->socket;
+                    AccumulateRetiredUdpStats(it->udpStats);
                     activeClients.erase(it);
                     clientSendMutexes.erase(oldSocket);
+                    g_clientsCacheDirty.store(true, std::memory_order_release);
                     // Force the old ClientListenerLoop to exit by aborting its
                     // socket. The old thread's cleanup will harmlessly no-op
                     // since the entry is already removed.
@@ -778,6 +1000,7 @@ void AcceptClientsLoop() {
               int targetX = 0, targetY = 0;
               bool loaded =
                   Config::LoadClientLayout(safeName, targetX, targetY);
+              bool usedSavedLayout = false;
 
               {
                 std::lock_guard<std::mutex> lock(clientsMutex);
@@ -793,6 +1016,7 @@ void AcceptClientsLoop() {
                     }
                   }
                 }
+                usedSavedLayout = (loaded && !occupied);
                 // Perform a radial search to auto-assign the nearest empty slot
                 // to the Server.
                 if (!loaded || occupied) {
@@ -835,19 +1059,31 @@ void AcceptClientsLoop() {
                 memset(&emptyUdpAddr, 0, sizeof(emptyUdpAddr));
                 activeClients.push_back({clientSocket, emptyUdpAddr, false,
                                          ipStr, safeName, 1.0f, true, true,
-                                         targetX, targetY, 0});
+                                         targetX, targetY, 0, 0, auth.sessionToken});
+                activeClients.back().connectTickMs = GetTickCount64();
                 g_hasClients.store(true, std::memory_order_relaxed);
                 clientSendMutexes[clientSocket] =
                     std::make_shared<std::mutex>();
+                g_clientsCacheDirty.store(true, std::memory_order_release);
                 Config::SaveClientLayout(safeName, targetX, targetY);
               }
 
+              if (State::globalDebugMode) {
+                UI::LogDebug("[Network Server] Placed '%s' at grid (%d, %d) (%s).",
+                             safeName, targetX, targetY,
+                             usedSavedLayout ? "saved" : "auto-placed");
+              }
+
+              // Initialize lock-free audio state outside clientsMutex
+              Audio::SetClientAudioState(clientSocket, true, 1.0f);
+
               auto threadInfo = std::make_shared<ClientThreadInfo>();
               threadInfo->thread = std::thread(
-                  [clientSocket, seq = header.sequenceNumber, threadInfo]() {
+                  [clientSocket, seq = header.sequenceNumber, threadInfo,
+                   nameStr = std::string(safeName), ipCopy = std::string(ipStr)]() {
                     ::SetThreadPriority(::GetCurrentThread(),
                                         THREAD_PRIORITY_TIME_CRITICAL);
-                    ClientListenerLoop(clientSocket, seq);
+                    ClientListenerLoop(clientSocket, seq, nameStr, ipCopy);
                     threadInfo->isFinished = true;
                   });
 
@@ -859,13 +1095,15 @@ void AcceptClientsLoop() {
             }
           }
         }
+      }
       closesocket(clientSocket);
     }
   }
 }
 
 /**
- * @brief Listener thread for connectionless UDP streaming (Mouse and Audio).
+ * @brief Listener thread for connectionless UDP streaming (Mouse, Audio, and Return Control).
+ * @return void
  */
 void UDPListenerLoop() {
   std::vector<uint8_t> buffer(MAX_PAYLOAD_SIZE);
@@ -873,12 +1111,29 @@ void UDPListenerLoop() {
   sockaddr_in senderAddr;
   int senderAddrSize = sizeof(senderAddr);
 
+  static DebugLog::RateLimitState udpRecvErrRate;
+  static DebugLog::RateLimitState udpDecryptRate;
+  static DebugLog::RateLimitState udpHsMismatchRate;
+  static DebugLog::RateLimitState udpUnrecogRate;
+
   while (isRunning) {
     int bytes =
         recvfrom(serverUdpSocket, (char *)buffer.data(), (int)buffer.size(), 0,
                  (sockaddr *)&senderAddr, &senderAddrSize);
-    if (bytes <= 0)
+    if (bytes <= 0) {
+      if (bytes == SOCKET_ERROR && isRunning) {
+        int err = WSAGetLastError();
+        if (err != WSAETIMEDOUT && State::globalDebugMode) {
+          uint32_t suppressed = 0;
+          if (udpRecvErrRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            char supBuf[32] = "";
+            if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+            UI::LogDebug("[Network Server] UDP recvfrom error (WSA Error: %d%s).", err, supBuf);
+          }
+        }
+      }
       continue;
+    }
 
     if (bytes < sizeof(PacketHeader))
       continue;
@@ -898,6 +1153,17 @@ void UDPListenerLoop() {
 
     if (!Security::DecryptPayload(rawPayload, payloadSize, &header,
                                   sizeof(header), decrypted)) {
+      g_serverUdpDecryptFails.fetch_add(1, std::memory_order_relaxed);
+      if (State::globalDebugMode) {
+        uint32_t suppressed = 0;
+        if (udpDecryptRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+          char supBuf[32] = "";
+          if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+          UI::LogDebug("[Security] Server UDP decrypt failed: type=%s seq=%u size=%zu%s.",
+                       MessageTypeToString(header.type), header.sequenceNumber,
+                       payloadSize, supBuf);
+        }
+      }
       continue; // Decryption failed, drop packet
     }
 
@@ -908,18 +1174,30 @@ void UDPListenerLoop() {
         // Safely ensure null termination
         p.clientName[sizeof(p.clientName) - 1] = '\0';
 
+        char senderIpStr[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIpStr, INET_ADDRSTRLEN);
+
         SOCKET ackSocket = INVALID_SOCKET;
         {
           std::lock_guard<std::mutex> lock(clientsMutex);
           for (auto &c : activeClients) {
-            if (strncmp(c.name.c_str(), p.clientName, 32) == 0) {
+            // Verify hostname, IP address, AND the cryptographic 64-bit session token
+            // negotiated during the encrypted TCP handshake to prevent UDP stream hijacking.
+            if (c.ip == senderIpStr &&
+                c.sessionToken != 0 &&
+                c.sessionToken == p.sessionToken &&
+                strncmp(c.name.c_str(), p.clientName, 32) == 0) {
+              if (!VerifyUdpReplayWindow(header.sequenceNumber, c.udpRxSequence,
+                                         c.udpReplayMask, &c.udpStats)) {
+                break;
+              }
               c.udpAddr = senderAddr;
               c.hasUdp = true;
               ackSocket = c.socket;
               if (State::globalDebugMode)
                 UI::LogDebug("[Network Server] UDP Stream Handshake matched "
-                             "for %s. Connection verified.",
-                             p.clientName);
+                             "for %s (%s). Connection verified.",
+                             p.clientName, senderIpStr);
               break;
             }
           }
@@ -928,6 +1206,12 @@ void UDPListenerLoop() {
         if (ackSocket != INVALID_SOCKET) {
           SendToClient(ackSocket, MessageType::EVENT_UDP_HANDSHAKE_ACK, nullptr,
                        0);
+        } else if (State::globalDebugMode) {
+          uint32_t suppressed = 0;
+          if (udpHsMismatchRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            UI::LogDebug("[Network Server] UDP handshake mismatch from %s (client '%s', token=%llu) — no matching active TCP session.",
+                         senderIpStr, p.clientName, static_cast<unsigned long long>(p.sessionToken));
+          }
         }
       }
       continue;
@@ -942,21 +1226,13 @@ void UDPListenerLoop() {
         if (c.hasUdp &&
             c.udpAddr.sin_addr.s_addr == senderAddr.sin_addr.s_addr &&
             c.udpAddr.sin_port == senderAddr.sin_port) {
-          // Tolerate minor UDP reordering instead of strict drop.
-          // Audio (100Hz) and control packets share the same client UDP
-          // sequence counter, so audio frequently arrives "behind" the
-          // latest control packet. A window of 32 accepts slightly late
-          // packets while still dropping genuinely stale/duplicate data.
-          const uint32_t UDP_REORDER_WINDOW = 32;
-          if (header.sequenceNumber != 0 &&
-              c.udpRxSequence > UDP_REORDER_WINDOW &&
-              header.sequenceNumber < c.udpRxSequence - UDP_REORDER_WINDOW) {
-            matchingSocket = (SOCKET)-1; // Flag as stale drop
+          // Enforce 64-bit sliding bitmask anti-replay window (RFC 6479 style).
+          // Tolerates minor UDP out-of-order delivery across audio and control
+          // streams while strictly rejecting duplicate replays within the window.
+          if (!VerifyUdpReplayWindow(header.sequenceNumber, c.udpRxSequence,
+                                     c.udpReplayMask, &c.udpStats)) {
+            matchingSocket = (SOCKET)-1; // Flag as stale or replayed drop
             break;
-          }
-          // Advance the high watermark if this is a newer packet
-          if (header.sequenceNumber > c.udpRxSequence) {
-            c.udpRxSequence = header.sequenceNumber;
           }
           matchingSocket = c.socket;
           sourceX = c.gridX;
@@ -966,7 +1242,22 @@ void UDPListenerLoop() {
       }
     }
 
-    if (matchingSocket == INVALID_SOCKET || matchingSocket == (SOCKET)-1)
+    if (matchingSocket == INVALID_SOCKET) {
+      if (State::globalDebugMode) {
+        uint32_t suppressed = 0;
+        if (udpUnrecogRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+          char senderIpStr[INET_ADDRSTRLEN] = "Unknown";
+          inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIpStr, INET_ADDRSTRLEN);
+          char supBuf[32] = "";
+          if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+          UI::LogDebug("[Network Server] Dropped UDP packet from unrecognized endpoint %s:%u (type=%s%s).",
+                       senderIpStr, ntohs(senderAddr.sin_port),
+                       MessageTypeToString(header.type), supBuf);
+        }
+      }
+      continue;
+    }
+    if (matchingSocket == (SOCKET)-1)
       continue;
 
     if (header.type == MessageType::EVENT_AUDIO_DATA ||
@@ -999,6 +1290,12 @@ void UDPListenerLoop() {
 bool StartServer(uint16_t port) {
   serverTxSequence = 0; // Reset monotonic counter for new sessions
   serverUdpTxSequence = 0;
+  g_serverUdpDecryptFails.store(0, std::memory_order_relaxed);
+  g_serverUdpSendErrors.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    g_serverRetiredUdpStats = {};
+  }
 
   if (!CredentialManager::LoadSecret("KAMFlow_LocalServer", activeServerPin)) {
     // First boot: Generate a secure 8-digit random PIN (per-digit, no leading
@@ -1014,8 +1311,7 @@ bool StartServer(uint16_t port) {
     activeServerPin = pin;
     CredentialManager::SaveSecret("KAMFlow_LocalServer", activeServerPin);
     if (State::globalDebugMode)
-      UI::LogDebug("[Security] Generated new Master PIN: %s",
-                   activeServerPin.c_str());
+      UI::LogDebug("[Security] Generated new 8-digit Master PIN and stored in Credential Vault.");
   }
 
   // Reset the crypto engine before re-init to handle server restarts cleanly.
@@ -1029,18 +1325,51 @@ bool StartServer(uint16_t port) {
     return false;
   }
 
-  WSADATA wsa;
-  WSAStartup(MAKEWORD(2, 2), &wsa);
+  if (!g_serverWsaInitialized.exchange(true)) {
+    WSADATA wsa;
+    int wsaErr = WSAStartup(MAKEWORD(2, 2), &wsa);
+    if (wsaErr != 0) {
+      g_serverWsaInitialized.store(false);
+      if (State::globalDebugMode) {
+        UI::LogDebug("[Network Server] ERROR: WSAStartup failed (%d).", wsaErr);
+      }
+      return false;
+    }
+  }
   serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (serverSocket == INVALID_SOCKET) {
+    if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] ERROR: TCP socket() failed (WSA Error: %d).", WSAGetLastError());
+    }
+    if (g_serverWsaInitialized.exchange(false)) WSACleanup();
+    return false;
+  }
 
-  sockaddr_in addr;
+  sockaddr_in addr = {0};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = INADDR_ANY;
   addr.sin_port = htons(port);
 
-  if (bind(serverSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+  if (bind(serverSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] ERROR: TCP bind() failed on port %u (WSA Error: %d).",
+                   port, WSAGetLastError());
+    }
+    closesocket(serverSocket);
+    serverSocket = INVALID_SOCKET;
+    if (g_serverWsaInitialized.exchange(false)) WSACleanup();
     return false;
-  listen(serverSocket, SOMAXCONN);
+  }
+  if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR) {
+    if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] ERROR: TCP listen() failed on port %u (WSA Error: %d).",
+                   port, WSAGetLastError());
+    }
+    closesocket(serverSocket);
+    serverSocket = INVALID_SOCKET;
+    if (g_serverWsaInitialized.exchange(false)) WSACleanup();
+    return false;
+  }
 
   // Ensure accept() can be interrupted by closesocket() during shutdown
   DWORD acceptTimeout = 1000;
@@ -1048,13 +1377,45 @@ bool StartServer(uint16_t port) {
              (const char *)&acceptTimeout, sizeof(acceptTimeout));
 
   serverUdpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (bind(serverUdpSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR)
+  if (serverUdpSocket == INVALID_SOCKET) {
+    if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] ERROR: UDP socket() failed (WSA Error: %d).", WSAGetLastError());
+    }
+    closesocket(serverSocket);
+    serverSocket = INVALID_SOCKET;
+    if (g_serverWsaInitialized.exchange(false)) WSACleanup();
     return false;
+  }
+  if (bind(serverUdpSocket, (sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+    if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] ERROR: UDP bind() failed on port %u (WSA Error: %d).",
+                   port, WSAGetLastError());
+    }
+    closesocket(serverUdpSocket);
+    serverUdpSocket = INVALID_SOCKET;
+    closesocket(serverSocket);
+    serverSocket = INVALID_SOCKET;
+    if (g_serverWsaInitialized.exchange(false)) WSACleanup();
+    return false;
+  }
 
   // Prevent indefinite blocking on recvfrom() to allow clean shutdown
   DWORD udpTimeout = 500;
   setsockopt(serverUdpSocket, SOL_SOCKET, SO_RCVTIMEO,
              (const char *)&udpTimeout, sizeof(udpTimeout));
+
+  // 512 KB kernel buffer prevents UDP drops under simultaneous 1000Hz mouse + 48kHz audio bursts
+  int udpBufSize = 524288;
+  setsockopt(serverUdpSocket, SOL_SOCKET, SO_RCVBUF,
+             (const char *)&udpBufSize, sizeof(udpBufSize));
+  setsockopt(serverUdpSocket, SOL_SOCKET, SO_SNDBUF,
+             (const char *)&udpBufSize, sizeof(udpBufSize));
+
+  // Suppress Windows ICMP Port Unreachable (WSAECONNRESET) errors on shared UDP socket
+  BOOL bNewBehavior = FALSE;
+  DWORD dwBytesReturned = 0;
+  WSAIoctl(serverUdpSocket, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior),
+           nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 
   isRunning = true;
   serverThread = std::thread([]() {
@@ -1063,8 +1424,17 @@ bool StartServer(uint16_t port) {
   });
 
   udpListenerThread = std::thread([]() {
-    ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    DWORD taskIndex = 0;
+    HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+    if (!hMmcss) {
+      ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    } else if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] UDPListenerLoop: MMCSS registered (index=%u).", taskIndex);
+    }
     UDPListenerLoop();
+    if (hMmcss) {
+      AvRevertMmThreadCharacteristics(hMmcss);
+    }
   });
 
   isBeaconRunning = true;
@@ -1072,22 +1442,61 @@ bool StartServer(uint16_t port) {
 
   serverHeartbeatThread = std::thread([]() {
     ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    int txHbCount = 0;
+    int heartbeatCycles = 0;
+    UdpReplayStats prevAgg = {};
     while (isRunning) {
       for (int i = 0; i < 20 && isRunning; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
-      if (isRunning) {
-        BroadcastMessage(MessageType::EVENT_HEARTBEAT, nullptr, 0);
+      if (!isRunning) break;
 
-        if (++txHbCount % 10 == 0 && State::globalDebugMode) {
-          UI::LogDebug(
-              "[Network Server] Sent Keep-Alive Heartbeat to Clients.");
+      BroadcastMessage(MessageType::EVENT_HEARTBEAT, nullptr, 0);
+
+      if (++heartbeatCycles >= 15) {
+        heartbeatCycles = 0;
+        UdpReplayStats currAgg = {};
+        {
+          std::lock_guard<std::mutex> lock(clientsMutex);
+          currAgg = g_serverRetiredUdpStats;
+          for (const auto &c : activeClients) {
+            currAgg.packetsAccepted += c.udpStats.packetsAccepted;
+            currAgg.packetsOutOfOrder += c.udpStats.packetsOutOfOrder;
+            currAgg.sequenceGaps += c.udpStats.sequenceGaps;
+            currAgg.staleDrops += c.udpStats.staleDrops;
+            currAgg.duplicateDrops += c.udpStats.duplicateDrops;
+          }
+        }
+        uint64_t decFail = g_serverUdpDecryptFails.exchange(0, std::memory_order_relaxed);
+        uint64_t txErr = g_serverUdpSendErrors.exchange(0, std::memory_order_relaxed);
+
+        auto deltaU64 = [](uint64_t cur, uint64_t prev) -> uint64_t {
+          return (cur >= prev) ? (cur - prev) : 0;
+        };
+        uint64_t dRx = deltaU64(currAgg.packetsAccepted, prevAgg.packetsAccepted);
+        uint64_t dOoo = deltaU64(currAgg.packetsOutOfOrder, prevAgg.packetsOutOfOrder);
+        uint64_t dLost = deltaU64(currAgg.sequenceGaps, prevAgg.sequenceGaps);
+        uint64_t dStale = deltaU64(currAgg.staleDrops, prevAgg.staleDrops);
+        uint64_t dDup = deltaU64(currAgg.duplicateDrops, prevAgg.duplicateDrops);
+        prevAgg = currAgg;
+
+        if ((ShouldEmitPerfSummary(dLost + dStale + dDup + decFail + txErr) || dOoo > 50) &&
+            State::globalDebugMode) {
+          UI::LogDebug("[Network Perf] Server UDP 30s: rx=%llu lost=%llu ooo=%llu stale=%llu dup=%llu decFail=%llu txErr=%llu",
+                       static_cast<unsigned long long>(dRx),
+                       static_cast<unsigned long long>(dLost),
+                       static_cast<unsigned long long>(dOoo),
+                       static_cast<unsigned long long>(dStale),
+                       static_cast<unsigned long long>(dDup),
+                       static_cast<unsigned long long>(decFail),
+                       static_cast<unsigned long long>(txErr));
         }
       }
     }
   });
 
+  if (State::globalDebugMode) {
+    UI::LogDebug("[Network Server] Listening on TCP & UDP port %u.", port);
+  }
   return true;
 }
 
@@ -1142,7 +1551,16 @@ void StopServer() {
     activeClientThreadsList.clear();
   }
 
-  WSACleanup();
+  {
+    std::lock_guard<std::mutex> lock(clientsMutex);
+    activeClients.clear();
+    g_hasClients.store(false, std::memory_order_relaxed);
+    g_clientsCacheDirty.store(true, std::memory_order_release);
+  }
+
+  if (g_serverWsaInitialized.exchange(false)) {
+    WSACleanup();
+  }
   Security::Shutdown();
 }
 
@@ -1163,39 +1581,47 @@ bool BroadcastMessage(MessageType type, const void *payload,
     std::shared_ptr<std::mutex> mtx;
     bool useUdp;
     sockaddr_in udpAddr;
+    uint32_t prevHbSkips;
   };
   // thread_local reuses the vector's internal buffer across calls, eliminating
   // ~1000 heap allocations/second at 1000Hz mouse polling. clear() only resets
   // the size without freeing memory.
   thread_local std::vector<SendTarget> targets;
   targets.clear();
-  static bool hasLoggedTcpFallback = false;
+  thread_local std::vector<std::string> fallbackLogNames;
+  fallbackLogNames.clear();
   {
     std::lock_guard<std::mutex> lock(clientsMutex);
     if (activeClients.empty())
       return false;
-    for (const auto &c : activeClients) {
+    for (auto &c : activeClients) {
       SOCKET targetSock = c.socket;
       bool isMediaPacket = (type == MessageType::EVENT_MOUSE ||
                             type == MessageType::EVENT_AUDIO_DATA ||
                             type == MessageType::EVENT_MIC_DATA);
       bool useUdp = isMediaPacket && c.hasUdp;
 
-      if (isMediaPacket && !c.hasUdp && State::globalDebugMode) {
-        if (!hasLoggedTcpFallback) {
-          UI::LogDebug("[Network Server] UDP not available. Falling back to "
-                       "TCP for media streams.");
-          hasLoggedTcpFallback = true;
+      if (isMediaPacket && !c.hasUdp) {
+        if (!c.hasLoggedTcpFallback) {
+          c.hasLoggedTcpFallback = true;
+          if (State::globalDebugMode) {
+            fallbackLogNames.push_back(c.name);
+          }
         }
       } else if (c.hasUdp) {
-        hasLoggedTcpFallback = false; // Reset if UDP becomes available again
+        c.hasLoggedTcpFallback = false; // Reset if UDP becomes available again
       }
 
       auto it = clientSendMutexes.find(targetSock);
       if (it != clientSendMutexes.end()) {
-        targets.push_back({targetSock, it->second, useUdp, c.udpAddr});
+        targets.push_back({targetSock, it->second, useUdp, c.udpAddr, c.consecutiveHbSkips});
       }
     }
+  }
+  for (const auto &name : fallbackLogNames) {
+    UI::LogDebug("[Network Server] UDP not available for '%s'. Falling back to "
+                 "TCP for media streams.",
+                 name.c_str());
   }
 
   // Per-client send: a congested Client A no longer blocks sends to Client B
@@ -1204,16 +1630,32 @@ bool BroadcastMessage(MessageType type, const void *payload,
   // Heartbeat) will interleave sequence numbers into the TCP stream, causing
   // the receiver to drop packets as false-positive Replay Attacks.
   for (auto &t : targets) {
-    // For heartbeats, use try_to_lock so we skip clients whose send mutex is
-    // held by a concurrent data stream (mouse, audio). If the mutex is
-    // contended, data IS flowing through the socket — proving the connection
-    // is alive — so the heartbeat is unnecessary. Without this, a gaming CPU
-    // stall can cause send() to block for >10s, preventing heartbeats from
-    // reaching the client and triggering SO_RCVTIMEO disconnects.
-    std::unique_lock<std::mutex> sendLock(*t.mtx, std::defer_lock);
-    if (type == MessageType::EVENT_HEARTBEAT) {
-      if (!sendLock.try_lock())
+    // Decouple UDP media sends from per-client TCP locks so large TCP clipboard/file
+    // writes never stall latency-sensitive mouse or audio streams.
+    // For TCP heartbeats, use try_to_lock so we skip clients whose send mutex is
+    // held by a concurrent TCP stream.
+    std::unique_lock<std::mutex> sendLock(t.useUdp ? serverUdpSendMutex : *t.mtx, std::defer_lock);
+    if (!t.useUdp && type == MessageType::EVENT_HEARTBEAT) {
+      if (!sendLock.try_lock()) {
+        // sendLock is not held here; acquire clientsMutex briefly to track consecutive heartbeat starvation.
+        uint32_t skips = 0;
+        std::string skipName;
+        {
+          std::lock_guard<std::mutex> lock(clientsMutex);
+          for (auto &c : activeClients) {
+            if (c.socket == t.sock) {
+              skips = ++c.consecutiveHbSkips;
+              skipName = c.name;
+              break;
+            }
+          }
+        }
+        if (skips >= 3 && State::globalDebugMode) {
+          UI::LogDebug("[Network Perf] WARNING: %u consecutive heartbeats skipped for '%s' (~%us TCP send saturation).",
+                       skips, skipName.c_str(), skips * 2);
+        }
         continue; // Socket is actively streaming; heartbeat is unnecessary.
+      }
     } else {
       sendLock.lock();
     }
@@ -1237,6 +1679,14 @@ bool BroadcastMessage(MessageType type, const void *payload,
         memcpy(tls_sendBuffer.data() + sizeof(h), tls_ciphertext.data(),
                tls_ciphertext.size());
       } else {
+        if (State::globalDebugMode) {
+          static DebugLog::RateLimitState bcastEncRate;
+          uint32_t suppressed = 0;
+          if (bcastEncRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            UI::LogDebug("[Network Server] WARNING: Broadcast EncryptPayload failed for type=%s.",
+                         MessageTypeToString(type));
+          }
+        }
         continue;
       }
     } else {
@@ -1247,21 +1697,59 @@ bool BroadcastMessage(MessageType type, const void *payload,
 
     uint64_t tStart = GetTickCount64();
     if (isUdp) {
-      sendto(serverUdpSocket, (const char *)tls_sendBuffer.data(),
-             (int)tls_sendBuffer.size(), 0, (sockaddr *)&t.udpAddr,
-             sizeof(t.udpAddr));
+      if (sendto(serverUdpSocket, (const char *)tls_sendBuffer.data(),
+                 (int)tls_sendBuffer.size(), 0, (sockaddr *)&t.udpAddr,
+                 sizeof(t.udpAddr)) == SOCKET_ERROR) {
+        int err = WSAGetLastError();
+        g_serverUdpSendErrors.fetch_add(1, std::memory_order_relaxed);
+        if (State::globalDebugMode) {
+          static DebugLog::RateLimitState bcastUdpErrRate;
+          uint32_t suppressed = 0;
+          if (bcastUdpErrRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            char supBuf[32] = "";
+            if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+            UI::LogDebug("[Network Server] WARNING: Broadcast UDP sendto failed for type=%s (WSA Error: %d%s).",
+                         MessageTypeToString(type), err, supBuf);
+          }
+        }
+      }
     } else {
       if (!SendExact(t.sock, tls_sendBuffer.data(), tls_sendBuffer.size())) {
+        int err = WSAGetLastError();
+        if (State::globalDebugMode) {
+          static DebugLog::RateLimitState bcastTcpErrRate;
+          uint32_t suppressed = 0;
+          if (bcastTcpErrRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            UI::LogDebug("[Network Server] WARNING: Broadcast TCP SendExact failed for type=%s (WSA Error: %d).",
+                         MessageTypeToString(type), err);
+          }
+        }
         shutdown(t.sock,
                  SD_BOTH); // Force the listener loop to sever the dead socket.
       }
     }
     uint64_t tEnd = GetTickCount64();
+    bool tcpStalled = (!isUdp && (tEnd - tStart) > 200);
+    bool resetHbSkips = (!isUdp && type == MessageType::EVENT_HEARTBEAT && t.prevHbSkips > 0);
+    sendLock.unlock();
+
+    if (tcpStalled || resetHbSkips) {
+      std::lock_guard<std::mutex> lock(clientsMutex);
+      for (auto &c : activeClients) {
+        if (c.socket == t.sock) {
+          if (tcpStalled) c.tcpStallCount++;
+          if (resetHbSkips) c.consecutiveHbSkips = 0;
+          break;
+        }
+      }
+    }
+
     // 200ms threshold reduces log noise during normal gaming where brief
     // kernel-level stalls are expected from CPU/GPU contention.
-    if (State::globalDebugMode && (tEnd - tStart) > 200 && !isUdp) {
-      UI::LogDebug("[Network Server] WARNING: send() to client blocked for "
+    if (State::globalDebugMode && tcpStalled) {
+      UI::LogDebug("[Network Server] WARNING: Broadcast (%s) to client blocked for "
                    "%llu ms! TCP congested.",
+                   MessageTypeToString(type),
                    (unsigned long long)(tEnd - tStart));
     }
   }
@@ -1273,9 +1761,11 @@ bool BroadcastMessage(MessageType type, const void *payload,
  * @brief Packages clipboard data and broadcasts it to all enabled clients.
  * @param payload Pointer to the raw wide-character string data.
  * @param payloadSize Size of the string data in bytes.
+ * @param excludeSocket Optional client socket to exclude from the broadcast (prevents echoing back to sender).
  * @return true if data was sent to at least one client.
  */
-bool BroadcastClipboardMessage(const void *payload, size_t payloadSize) {
+bool BroadcastClipboardMessage(const void *payload, size_t payloadSize,
+                               SOCKET excludeSocket) {
   // Snapshot clipboard-enabled targets with their per-client send mutexes.
   struct SendTarget {
     SOCKET sock;
@@ -1287,7 +1777,7 @@ bool BroadcastClipboardMessage(const void *payload, size_t payloadSize) {
     if (activeClients.empty())
       return false;
     for (const auto &c : activeClients) {
-      if (c.isClipboardEnabled) {
+      if (c.isClipboardEnabled && c.socket != excludeSocket) {
         auto it = clientSendMutexes.find(c.socket);
         if (it != clientSendMutexes.end()) {
           targets.push_back({c.socket, it->second});
@@ -1318,13 +1808,27 @@ bool BroadcastClipboardMessage(const void *payload, size_t payloadSize) {
              tls_ciphertext.size());
 
       if (!SendExact(t.sock, tls_sendBuffer.data(), tls_sendBuffer.size())) {
+        int err = WSAGetLastError();
+        if (State::globalDebugMode) {
+          UI::LogDebug("[Network Server] WARNING: Clipboard SendExact failed (WSA Error: %d).", err);
+        }
         shutdown(t.sock, SD_BOTH);
       }
+    } else if (State::globalDebugMode) {
+      UI::LogDebug("[Network Server] WARNING: Failed to encrypt clipboard broadcast.");
     }
   }
   return true;
 }
 
+/**
+ * @brief Packages a payload with a header, encrypts it via AES-GCM, and sends it directly to a specific client.
+ * @param clientSocket The TCP socket handle identifying the target client.
+ * @param type The MessageType identifier.
+ * @param payload Pointer to the raw payload buffer (may be nullptr if payloadSize is 0).
+ * @param payloadSize Size of the raw payload in bytes.
+ * @return true if the packet was encrypted and queued/sent successfully, false otherwise.
+ */
 bool SendToClient(SOCKET clientSocket, MessageType type, const void *payload,
                   size_t payloadSize) {
   bool useUdp = false;
@@ -1355,7 +1859,8 @@ bool SendToClient(SOCKET clientSocket, MessageType type, const void *payload,
   if (!sendMtx)
     return false; // Client disconnected before we could send
 
-  std::lock_guard<std::mutex> sendLock(*sendMtx);
+  // Use the dedicated UDP send mutex for UDP media so blocking TCP transfers never starve mouse/mic traffic.
+  std::unique_lock<std::mutex> sendLock(useUdp ? serverUdpSendMutex : *sendMtx);
 
   // Generate sequence and encrypt under the per-client lock
   uint32_t seq = useUdp ? ++serverUdpTxSequence : ++serverTxSequence;
@@ -1376,21 +1881,63 @@ bool SendToClient(SOCKET clientSocket, MessageType type, const void *payload,
       ok = sendto(serverUdpSocket, (const char *)tls_sendBuffer.data(),
                   (int)tls_sendBuffer.size(), 0, (sockaddr *)&udpAddr,
                   sizeof(udpAddr)) != SOCKET_ERROR;
+      if (!ok) {
+        int err = WSAGetLastError();
+        g_serverUdpSendErrors.fetch_add(1, std::memory_order_relaxed);
+        if (State::globalDebugMode) {
+          static DebugLog::RateLimitState sendUdpErrRate;
+          uint32_t suppressed = 0;
+          if (sendUdpErrRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            char supBuf[32] = "";
+            if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+            UI::LogDebug("[Network Server] WARNING: SendToClient UDP sendto failed (type=%s, WSA Error: %d%s).",
+                         MessageTypeToString(type), err, supBuf);
+          }
+        }
+      }
     } else {
       ok = SendExact(targetSock, tls_sendBuffer.data(), tls_sendBuffer.size());
       if (!ok) {
+        int err = WSAGetLastError();
+        if (State::globalDebugMode) {
+          static DebugLog::RateLimitState sendTcpErrRate;
+          uint32_t suppressed = 0;
+          if (sendTcpErrRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+            UI::LogDebug("[Network Server] WARNING: SendToClient TCP SendExact failed (type=%s, WSA Error: %d).",
+                         MessageTypeToString(type), err);
+          }
+        }
         // A failed/partial TCP write leaves the stream misframed; sever it so the
         // listener loop tears the client down cleanly (matches BroadcastMessage).
         shutdown(targetSock, SD_BOTH);
       }
     }
     uint64_t tEnd = GetTickCount64();
-    if (State::globalDebugMode && (tEnd - tStart) > 200 && !useUdp) {
-      UI::LogDebug("[Network Server] WARNING: SendToClient blocked for %llu "
+    bool tcpStalled = (!useUdp && (tEnd - tStart) > 200);
+    sendLock.unlock();
+    if (tcpStalled) {
+      std::lock_guard<std::mutex> lock(clientsMutex);
+      for (auto &c : activeClients) {
+        if (c.socket == targetSock) {
+          c.tcpStallCount++;
+          break;
+        }
+      }
+    }
+    if (State::globalDebugMode && tcpStalled) {
+      UI::LogDebug("[Network Server] WARNING: SendToClient (%s) blocked for %llu "
                    "ms! TCP congested.",
+                   MessageTypeToString(type),
                    (unsigned long long)(tEnd - tStart));
     }
     return ok;
+  } else if (State::globalDebugMode) {
+    static DebugLog::RateLimitState sendEncErrRate;
+    uint32_t suppressed = 0;
+    if (sendEncErrRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+      UI::LogDebug("[Network Server] WARNING: SendToClient EncryptPayload failed (type=%s).",
+                   MessageTypeToString(type));
+    }
   }
   return false;
 }
@@ -1448,15 +1995,20 @@ bool RouteCursorTransition(int sourceX, int sourceY, uint8_t exitEdge,
       g_controllingClientSocket.store(INVALID_SOCKET,
                                       std::memory_order_relaxed);
       State::SetMode(State::ControlMode::LOCAL);
+      if (State::globalDebugMode) {
+        UI::LogDebug("[KVM] Focus -> LOCAL (entryEdge=%u).", entryEdge);
+      }
       return true;
     }
 
     SOCKET targetSocket = INVALID_SOCKET;
+    std::string targetName;
     {
       std::lock_guard<std::mutex> lock(clientsMutex);
       for (const auto &c : activeClients) {
         if (c.gridX == targetX && c.gridY == targetY) {
           targetSocket = c.socket;
+          targetName = c.name;
           break;
         }
       }
@@ -1476,8 +2028,16 @@ bool RouteCursorTransition(int sourceX, int sourceY, uint8_t exitEdge,
         g_controllingClientSocket.store(targetSocket,
                                         std::memory_order_relaxed);
         State::SetMode(State::ControlMode::REMOTE);
+        if (State::globalDebugMode) {
+          UI::LogDebug("[KVM] Focus -> Client '%s' (%d,%d) (entryEdge=%u).",
+                       targetName.c_str(), targetX, targetY, entryEdge);
+        }
         return true;
       } else {
+        if (State::globalDebugMode) {
+          UI::LogDebug("[KVM] WARNING: Failed to send SYNC_CURSOR to '%s' (%d,%d); continuing raycast.",
+                       targetName.c_str(), targetX, targetY);
+        }
         // A client socket error occurred; continue raycasting.
         targetSocket = INVALID_SOCKET;
       }
@@ -1490,6 +2050,41 @@ bool RouteCursorTransition(int sourceX, int sourceY, uint8_t exitEdge,
   }
 
   // Hit a boundary wall; no device exists in that physical direction.
+  return false;
+}
+
+/**
+ * @brief Fast non-blocking check returning true if an active node exists in the given exit direction.
+ * Allows WH_MOUSE_LL to validate edge transitions without executing blocking TCP send() calls on the hook thread.
+ * @param sourceX The grid X coordinate of the originating machine.
+ * @param sourceY The grid Y coordinate of the originating machine.
+ * @param exitEdge The exit direction (0=Left, 1=Right, 2=Top, 3=Bottom).
+ * @return bool True if an active target node exists along the directional ray.
+ */
+bool HasTargetInDirection(int sourceX, int sourceY, uint8_t exitEdge) {
+  int dx = 0, dy = 0;
+  if (exitEdge == 0) dx = -1;
+  else if (exitEdge == 1) dx = 1;
+  else if (exitEdge == 2) dy = -1;
+  else if (exitEdge == 3) dy = 1;
+  else return false;
+
+  int targetX = sourceX + dx;
+  int targetY = sourceY + dy;
+
+  std::lock_guard<std::mutex> lock(clientsMutex);
+  while (targetX >= -10 && targetX <= 10 && targetY >= -10 && targetY <= 10) {
+    if (targetX == 0 && targetY == 0) {
+      return true;
+    }
+    for (const auto &c : activeClients) {
+      if (c.gridX == targetX && c.gridY == targetY && c.socket != INVALID_SOCKET) {
+        return true;
+      }
+    }
+    targetX += dx;
+    targetY += dy;
+  }
   return false;
 }
 } // namespace Network

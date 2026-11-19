@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Keyboard Capture Hook Interface
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /// @file KeyboardCapture.h

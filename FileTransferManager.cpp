@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// File Transfer Manager Implementation
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -23,6 +23,7 @@
 #include <mutex>
 #include <map>
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include <ws2tcpip.h>
 
@@ -41,10 +42,18 @@ namespace FileTransfer {
         uint64_t fileSize;
         std::string fileName;
         uint64_t transferredSize;
+        std::string peerIp;
     };
     std::map<uint32_t, TransferContext> g_transfers;
 
-    std::vector<std::shared_ptr<std::thread>> g_transferThreads;
+    /**
+     * @brief Tracks an asynchronous OOB transfer thread and its completion state for reaping.
+     */
+    struct TransferThreadInfo {
+        std::thread thread;
+        std::atomic<bool> isFinished{false};
+    };
+    std::vector<std::shared_ptr<TransferThreadInfo>> g_transferThreads;
     std::vector<SOCKET> g_activeSockets;
     std::atomic<bool> g_isTransferManagerRunning(true);
 
@@ -57,14 +66,84 @@ namespace FileTransfer {
     void OOB_ServerTask(uint32_t transferId, uint16_t port);
     void OOB_ClientTask(uint32_t transferId, uint16_t port);
 
+    /**
+     * @brief Resolves the remote IPv4 address string of a connected TCP socket.
+     * @param s The connected socket handle.
+     * @return The dotted-quad IPv4 string, or empty string on failure.
+     */
+    static std::string GetSocketPeerIp(SOCKET s) {
+        if (s == INVALID_SOCKET) return "";
+        sockaddr_in peerAddr = {0};
+        int peerLen = sizeof(peerAddr);
+        if (getpeername(s, (sockaddr*)&peerAddr, &peerLen) == 0) {
+            char ipStr[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, &(peerAddr.sin_addr), ipStr, INET_ADDRSTRLEN)) {
+                return std::string(ipStr);
+            }
+        }
+        return "";
+    }
+
+    /**
+     * @brief Joins and removes completed OOB transfer threads. Must be called with g_mutex held.
+     * @return void
+     */
+    static void ReapFinishedTransferThreadsLocked() {
+        for (auto it = g_transferThreads.begin(); it != g_transferThreads.end();) {
+            if ((*it)->isFinished.load(std::memory_order_acquire)) {
+                if ((*it)->thread.joinable()) {
+                    (*it)->thread.join();
+                }
+                it = g_transferThreads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    /**
+     * @brief Loops send() until all requested bytes are transmitted over the TCP socket.
+     * @param s The connected TCP socket.
+     * @param buf Source byte buffer.
+     * @param len Total number of bytes to send.
+     * @return true if all bytes were sent, false on socket error.
+     */
+    static bool SendExact(SOCKET s, const char* buf, int len) {
+        int total = 0;
+        while (total < len) {
+            int n = send(s, buf + total, len - total, 0);
+            if (n <= 0) return false;
+            total += n;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Loops recv() until all requested bytes are received from the TCP socket.
+     * @param s The connected TCP socket.
+     * @param buf Destination byte buffer.
+     * @param len Total number of bytes to read.
+     * @return true if all bytes were read, false on disconnect or error.
+     */
+    static bool RecvExact(SOCKET s, char* buf, int len) {
+        int total = 0;
+        while (total < len) {
+            int n = recv(s, buf + total, len - total, 0);
+            if (n <= 0) return false;
+            total += n;
+        }
+        return true;
+    }
+
 #pragma pack(push, 1)
     /**
      * @brief Internal header sent before every file chunk on the OOB socket.
-     * Ensures the Out-Of-Band stream remains authenticated and prevents chunk-reordering attacks.
+     * Bound into AES-GCM AAD to prevent chunk-reordering, truncation, and injection attacks.
      */
     struct FileChunkHeader {
         uint32_t magic;       ///< Must equal Network::PACKET_MAGIC
         uint32_t transferId;  ///< Matches the negotiated transfer ID
+        uint32_t chunkIndex;  ///< Strictly monotonic chunk index (0, 1, 2...)
         uint32_t chunkSize;   ///< Size of the encrypted chunk payload
         bool isEOF;           ///< True if this is the final chunk to close the stream
     };
@@ -87,24 +166,41 @@ namespace FileTransfer {
         if (ctx.isSender) {
             std::ifstream file(ctx.filePath, std::ios::binary);
             if (!file.is_open()) {
-                if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Failed to open source file.");
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[FileTransfer] ERROR: Failed to open source file '%s' (err=%lu).",
+                                 ctx.filePath.c_str(), GetLastError());
+                }
                 return;
             }
 
+            // Pre-allocate reusable buffers once outside the chunk loop to eliminate per-chunk heap churn
             std::vector<uint8_t> buffer(65536); // Stream 64KB memory-safe chunks
+            std::vector<uint8_t> ciphertext;
+            ciphertext.reserve(65536 + 28);
+            std::vector<uint8_t> packet;
+            packet.reserve(sizeof(FileChunkHeader) + 65536 + 28);
+            uint32_t chunkIndex = 0;
+            bool sendCompletedCleanly = false;
+            auto transferStart = std::chrono::steady_clock::now();
+
             while (file) {
                 file.read((char*)buffer.data(), buffer.size());
-                size_t bytesRead = file.gcount();
+                size_t bytesRead = (size_t)file.gcount();
                 bool isEOF = file.eof() || file.peek() == EOF;
 
                 if (bytesRead > 0 || isEOF) {
-                    FileChunkHeader header = { Network::PACKET_MAGIC, transferId, 0, isEOF };
+                    uint32_t currentChunkIdx = chunkIndex++;
+                    FileChunkHeader header = { Network::PACKET_MAGIC, transferId, currentChunkIdx, 0, isEOF };
                     
-                    std::vector<uint8_t> packet;
                     if (bytesRead > 0) {
                         header.chunkSize = (uint32_t)(bytesRead + 28); // Account for 12b IV + 16b Tag
-                        std::vector<uint8_t> ciphertext;
-                        if (!Security::EncryptPayload(buffer.data(), bytesRead, &header, sizeof(header), ciphertext)) break;
+                        if (!Security::EncryptPayload(buffer.data(), bytesRead, &header, sizeof(header), ciphertext)) {
+                            if (State::globalDebugMode) {
+                                UI::LogDebug("[FileTransfer] ERROR: Chunk %u encryption failed (ID: %u).",
+                                             currentChunkIdx, transferId);
+                            }
+                            break;
+                        }
                         
                         packet.resize(sizeof(header) + ciphertext.size());
                         memcpy(packet.data(), &header, sizeof(header));
@@ -114,73 +210,162 @@ namespace FileTransfer {
                         memcpy(packet.data(), &header, sizeof(header));
                     }
 
-                    if (send(sock, (const char*)packet.data(), (int)packet.size(), 0) == SOCKET_ERROR) {
-                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Connection dropped during send.");
+                    if (!SendExact(sock, (const char*)packet.data(), (int)packet.size())) {
+                        if (State::globalDebugMode) {
+                            UI::LogDebug("[FileTransfer] Connection dropped during send (ID: %u, chunk: %u, WSA Error: %d).",
+                                         transferId, currentChunkIdx, WSAGetLastError());
+                        }
                         break;
                     }
+                    bool aborted = false;
                     {
                         std::lock_guard<std::mutex> lock(g_mutex);
                         if (g_transfers.find(transferId) != g_transfers.end()) {
                             g_transfers[transferId].transferredSize += bytesRead;
                         } else {
-                            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u aborted by user.", transferId);
-                            break;
+                            aborted = true;
                         }
                     }
+                    if (aborted) {
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u aborted by user.", transferId);
+                        break;
+                    }
                 }
-                if (isEOF) break;
+                if (isEOF) {
+                    sendCompletedCleanly = true;
+                    break;
+                }
             }
-            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] File sent completely.");
+            if (sendCompletedCleanly && State::globalDebugMode) {
+                double elapsedSec = (std::max)(0.001, std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count());
+                double mb = static_cast<double>(ctx.fileSize) / (1024.0 * 1024.0);
+                UI::LogDebug("[FileTransfer] Sent '%s' (ID: %u, %.2f MB in %.2fs, %.1f MB/s).",
+                             ctx.fileName.c_str(), transferId, mb, elapsedSec, mb / elapsedSec);
+            }
         } else {
             std::ofstream file(ctx.filePath, std::ios::binary);
             if (!file.is_open()) {
-                if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Failed to open destination file.");
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[FileTransfer] ERROR: Failed to open destination file '%s' (err=%lu).",
+                                 ctx.filePath.c_str(), GetLastError());
+                }
                 return;
             }
 
+            // Pre-allocate reusable receive buffers once outside the loop
+            std::vector<uint8_t> ciphertext;
+            ciphertext.reserve(65536 + 28);
+            std::vector<uint8_t> plaintext;
+            plaintext.reserve(65536);
+            uint32_t expectedChunkIndex = 0;
+            bool transferCompletedCleanly = false;
+            auto transferStart = std::chrono::steady_clock::now();
+
             while (true) {
                 FileChunkHeader header;
-                int b = recv(sock, (char*)&header, sizeof(header), MSG_WAITALL);
-                if (b <= 0 || header.magic != Network::PACKET_MAGIC || header.transferId != transferId) {
-                    if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Error or connection closed during receive.");
+                if (!RecvExact(sock, (char*)&header, sizeof(header))) {
+                    if (State::globalDebugMode) {
+                        UI::LogDebug("[FileTransfer] Connection closed or recv failed on header (ID: %u, chunk: %u, WSA Error: %d).",
+                                     transferId, expectedChunkIndex, WSAGetLastError());
+                    }
                     break;
                 }
+                if (header.magic != Network::PACKET_MAGIC) {
+                    if (State::globalDebugMode) {
+                        UI::LogDebug("[FileTransfer] ERROR: Bad chunk magic 0x%08X (ID: %u).",
+                                     header.magic, transferId);
+                    }
+                    break;
+                }
+                if (header.transferId != transferId) {
+                    if (State::globalDebugMode) {
+                        UI::LogDebug("[FileTransfer] ERROR: Chunk transferId mismatch (got %u, expected %u).",
+                                     header.transferId, transferId);
+                    }
+                    break;
+                }
+                if (header.chunkIndex != expectedChunkIndex) {
+                    if (State::globalDebugMode) {
+                        UI::LogDebug("[FileTransfer] ERROR: Chunk index desync (got %u, expected %u, ID: %u).",
+                                     header.chunkIndex, expectedChunkIndex, transferId);
+                    }
+                    break;
+                }
+                ++expectedChunkIndex;
 
                 if (header.chunkSize > 0) {
                     // Enforce payload bounds to prevent OOM std::bad_alloc attacks (CWE-400)
                     if (header.chunkSize > Network::MAX_PAYLOAD_SIZE) {
-                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] CRITICAL: Chunk size exceeds safety bounds! Aborting.");
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] CRITICAL: Chunk size exceeds safety bounds (%u bytes, ID: %u)! Aborting.", header.chunkSize, transferId);
                         break;
                     }
                     
-                    std::vector<uint8_t> ciphertext(header.chunkSize);
-                    int cb = recv(sock, (char*)ciphertext.data(), (int)ciphertext.size(), MSG_WAITALL);
-                    if (cb != (int)ciphertext.size()) {
-                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Partial chunk receive.");
+                    ciphertext.resize(header.chunkSize);
+                    if (!RecvExact(sock, (char*)ciphertext.data(), (int)ciphertext.size())) {
+                        if (State::globalDebugMode) {
+                            UI::LogDebug("[FileTransfer] Partial chunk receive (ID: %u, chunk: %u, WSA Error: %d).",
+                                         transferId, header.chunkIndex, WSAGetLastError());
+                        }
                         break;
                     }
 
-                    std::vector<uint8_t> plaintext;
                     if (Security::DecryptPayload(ciphertext.data(), ciphertext.size(), &header, sizeof(header), plaintext)) {
-                        file.write((const char*)plaintext.data(), plaintext.size());
+                        if (!file.write((const char*)plaintext.data(), plaintext.size())) {
+                            DWORD writeErr = GetLastError();
+                            if (State::globalDebugMode) {
+                                UI::LogDebug("[FileTransfer] ERROR: Disk write failed for transfer %u at chunk %u (err=%lu).",
+                                             transferId, header.chunkIndex, writeErr);
+                            }
+                            break;
+                        }
+                        bool aborted = false;
                         {
                             std::lock_guard<std::mutex> lock(g_mutex);
                             if (g_transfers.find(transferId) != g_transfers.end()) {
                                 g_transfers[transferId].transferredSize += plaintext.size();
                             } else {
-                                if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u aborted by user.", transferId);
-                                break;
+                                aborted = true;
                             }
                         }
+                        if (aborted) {
+                            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u aborted by user.", transferId);
+                            break;
+                        }
                     } else {
-                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Chunk decryption failed!");
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Chunk %u decryption failed (ID: %u)!", header.chunkIndex, transferId);
                         break;
                     }
                 }
 
                 if (header.isEOF) {
-                    if (State::globalDebugMode) UI::LogDebug("[FileTransfer] File received and saved completely.");
+                    uint64_t finalTransferred = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(g_mutex);
+                        if (g_transfers.find(transferId) != g_transfers.end()) {
+                            finalTransferred = g_transfers[transferId].transferredSize;
+                        }
+                    }
+                    if (finalTransferred != ctx.fileSize) {
+                        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] WARNING: EOF reached but received size (%llu) != expected (%llu).",
+                            (unsigned long long)finalTransferred, (unsigned long long)ctx.fileSize);
+                    } else {
+                        transferCompletedCleanly = true;
+                        if (State::globalDebugMode) {
+                            double elapsedSec = (std::max)(0.001, std::chrono::duration<double>(std::chrono::steady_clock::now() - transferStart).count());
+                            double mb = static_cast<double>(ctx.fileSize) / (1024.0 * 1024.0);
+                            UI::LogDebug("[FileTransfer] Received '%s' (ID: %u, %.2f MB in %.2fs, %.1f MB/s).",
+                                         ctx.fileName.c_str(), transferId, mb, elapsedSec, mb / elapsedSec);
+                        }
+                    }
                     break;
+                }
+            }
+            file.close();
+            if (!transferCompletedCleanly) {
+                DeleteFileA(ctx.filePath.c_str());
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[FileTransfer] Removed incomplete file for failed/aborted transfer %u: %s",
+                                 transferId, ctx.filePath.c_str());
                 }
             }
         }
@@ -202,7 +387,12 @@ namespace FileTransfer {
         struct OobGuard { ~OobGuard() { g_isOobPortInUse.store(false, std::memory_order_relaxed); } } guard;
 
         SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listenSock == INVALID_SOCKET) return;
+        if (listenSock == INVALID_SOCKET) {
+            if (State::globalDebugMode) {
+                UI::LogDebug("[FileTransfer] ERROR: OOB listener socket() failed (WSA Error: %d).", WSAGetLastError());
+            }
+            return;
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -215,7 +405,12 @@ namespace FileTransfer {
         addr.sin_family = AF_INET; addr.sin_port = htons(port); addr.sin_addr.s_addr = INADDR_ANY;
 
         if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR || listen(listenSock, 1) == SOCKET_ERROR) {
-            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Bind/Listen failed on port %u", port);
+            if (State::globalDebugMode) {
+                UI::LogDebug("[FileTransfer] ERROR: OOB Bind/Listen failed on port %u (WSA Error: %d).",
+                             port, WSAGetLastError());
+            }
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_activeSockets.erase(std::remove(g_activeSockets.begin(), g_activeSockets.end(), listenSock), g_activeSockets.end());
             closesocket(listenSock); 
             return;
         }
@@ -247,24 +442,51 @@ namespace FileTransfer {
         SOCKET oobSock = accept(listenSock, (sockaddr*)&clientAddr, &clientSize);
         closesocket(listenSock); // Listener no longer needed
 
+        std::string expectedPeerIp;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_activeSockets.erase(std::remove(g_activeSockets.begin(), g_activeSockets.end(), listenSock), g_activeSockets.end());
-            if (oobSock != INVALID_SOCKET) {
-                g_activeSockets.push_back(oobSock);
+            auto it = g_transfers.find(transferId);
+            if (it != g_transfers.end()) {
+                expectedPeerIp = it->second.peerIp;
             }
         }
 
-        if (oobSock != INVALID_SOCKET && g_isTransferManagerRunning) {
-            int flag = 1; setsockopt(oobSock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
-            DWORD timeout = 10000; // 10s idle teardown
-            setsockopt(oobSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-            setsockopt(oobSock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-            ExecuteTransferIO(oobSock, transferId);
+        if (oobSock != INVALID_SOCKET) {
+            char connectedIp[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &(clientAddr.sin_addr), connectedIp, INET_ADDRSTRLEN);
+
+            // Verify the connecting peer IP matches the authenticated session peer that negotiated the transfer
+            if (!expectedPeerIp.empty() && expectedPeerIp != connectedIp) {
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[FileTransfer] SECURITY: Rejected unauthorized OOB connection from %s (expected %s).",
+                                 connectedIp, expectedPeerIp.c_str());
+                }
+                closesocket(oobSock);
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_transfers.erase(transferId);
+                return;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_activeSockets.push_back(oobSock);
+            }
+
+            if (g_isTransferManagerRunning) {
+                int flag = 1; setsockopt(oobSock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+                DWORD timeout = 10000; // 10s idle teardown
+                setsockopt(oobSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+                setsockopt(oobSock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+                ExecuteTransferIO(oobSock, transferId);
+            }
             closesocket(oobSock);
 
             std::lock_guard<std::mutex> lock(g_mutex);
             g_activeSockets.erase(std::remove(g_activeSockets.begin(), g_activeSockets.end(), oobSock), g_activeSockets.end());
+        } else if (g_isTransferManagerRunning && State::globalDebugMode) {
+            UI::LogDebug("[FileTransfer] ERROR: OOB accept() failed on port %u (transfer %u, WSA Error: %d).",
+                         port, transferId, WSAGetLastError());
         }
     }
 
@@ -281,21 +503,41 @@ namespace FileTransfer {
         // Micro-delay ensures the Server thread has executed bind() before we connect
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-        SOCKET oobSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (oobSock == INVALID_SOCKET) return;
-
-        std::string serverIp = "127.0.0.1";
-        auto targets = CredentialManager::GetSavedTargets("KAMFlow_Server_");
-        if (!targets.empty()) {
-            serverIp = targets[0].substr(15);
+        std::string serverIp;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_transfers.find(transferId);
+            if (it != g_transfers.end() && !it->second.peerIp.empty()) {
+                serverIp = it->second.peerIp;
+            }
+        }
+        if (serverIp.empty()) {
+            serverIp = "127.0.0.1";
+            auto targets = CredentialManager::GetSavedTargets("KAMFlow_Server_");
+            if (!targets.empty()) {
+                serverIp = targets[0].substr(15);
+            }
         }
         
         sockaddr_in addr = {0};
         addr.sin_family = AF_INET; addr.sin_port = htons(port); inet_pton(AF_INET, serverIp.c_str(), &addr.sin_addr);
 
+        SOCKET oobSock = INVALID_SOCKET;
         bool connected = false;
-        for (int i = 0; i < 5; ++i) { // 2.5s cumulative retry
-            if (connect(oobSock, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) { connected = true; break; }
+        int lastErr = 0;
+        for (int i = 0; i < 5 && g_isTransferManagerRunning; ++i) { // 2.5s cumulative retry
+            oobSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (oobSock == INVALID_SOCKET) {
+                lastErr = WSAGetLastError();
+                break;
+            }
+            if (connect(oobSock, (sockaddr*)&addr, sizeof(addr)) != SOCKET_ERROR) {
+                connected = true;
+                break;
+            }
+            lastErr = WSAGetLastError();
+            closesocket(oobSock);
+            oobSock = INVALID_SOCKET;
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
 
@@ -314,8 +556,8 @@ namespace FileTransfer {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_activeSockets.erase(std::remove(g_activeSockets.begin(), g_activeSockets.end(), oobSock), g_activeSockets.end());
         } else {
-            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Client failed to connect to %s:%u", serverIp.c_str(), port);
-            closesocket(oobSock);
+            if (State::globalDebugMode) UI::LogDebug("[FileTransfer] OOB Client failed to connect to %s:%u (WSA Error: %d).", serverIp.c_str(), port, lastErr);
+            if (oobSock != INVALID_SOCKET) closesocket(oobSock);
         }
     }
 
@@ -334,7 +576,7 @@ namespace FileTransfer {
      */
     void Shutdown() {
         g_isTransferManagerRunning = false;
-        std::vector<std::shared_ptr<std::thread>> threadsToJoin;
+        std::vector<std::shared_ptr<TransferThreadInfo>> threadsToJoin;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_pendingOffers.clear();
@@ -350,7 +592,7 @@ namespace FileTransfer {
         }
         
         for (auto& t : threadsToJoin) {
-            if (t && t->joinable()) t->join();
+            if (t && t->thread.joinable()) t->thread.join();
         }
 
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Manager Shutdown.");
@@ -371,7 +613,15 @@ namespace FileTransfer {
             if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Error: Could not open file for reading: %s", absoluteFilePath.c_str());
             return;
         }
-        uint64_t fileSize = file.tellg();
+        std::streampos endPos = file.tellg();
+        if (endPos < 0) {
+            file.close();
+            if (State::globalDebugMode) {
+                UI::LogDebug("[FileTransfer] ERROR: Failed to determine file size for '%s'.", absoluteFilePath.c_str());
+            }
+            return;
+        }
+        uint64_t fileSize = static_cast<uint64_t>(endPos);
         file.close();
 
         std::string fileName = absoluteFilePath.substr(absoluteFilePath.find_last_of("/\\") + 1);
@@ -388,6 +638,7 @@ namespace FileTransfer {
             ctx.fileSize = fileSize;
             ctx.fileName = fileName;
             ctx.transferredSize = 0;
+            ctx.peerIp = GetSocketPeerIp(target);
             g_transfers[offer.transferId] = ctx;
 
             // Dispatch to correct role to utilize the main KVM socket for the handshake
@@ -415,6 +666,7 @@ namespace FileTransfer {
      */
     std::vector<ActiveTransfer> GetActiveTransfers() {
         std::lock_guard<std::mutex> lock(g_mutex);
+        ReapFinishedTransferThreadsLocked();
         std::vector<ActiveTransfer> active;
         for (const auto& kv : g_transfers) {
             active.push_back({kv.first, kv.second.fileName, kv.second.fileSize, kv.second.transferredSize});
@@ -463,6 +715,7 @@ namespace FileTransfer {
             ctx.fileSize = expectedSize;
             ctx.fileName = fileName;
             ctx.transferredSize = 0;
+            ctx.peerIp = GetSocketPeerIp(targetSocket);
             g_transfers[transferId] = ctx;
             
             g_pendingOffers.erase(std::remove_if(g_pendingOffers.begin(), g_pendingOffers.end(),
@@ -474,14 +727,30 @@ namespace FileTransfer {
         acceptPayload.tcpPort = 8082; // Default out-of-band streaming port
         
         if (State::currentRole == State::AppRole::SERVER) {
-            auto t = std::make_shared<std::thread>(OOB_ServerTask, transferId, acceptPayload.tcpPort);
-            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
+            auto info = std::make_shared<TransferThreadInfo>();
+            info->thread = std::thread([info, transferId, port = acceptPayload.tcpPort]() {
+                OOB_ServerTask(transferId, port);
+                info->isFinished.store(true, std::memory_order_release);
+            });
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                ReapFinishedTransferThreadsLocked();
+                g_transferThreads.push_back(info);
+            }
             if (targetSocket != INVALID_SOCKET) {
                 Network::SendToClient(targetSocket, Network::MessageType::EVENT_FILE_ACCEPT, &acceptPayload, sizeof(acceptPayload));
             }
         } else {
-            auto t = std::make_shared<std::thread>(OOB_ClientTask, transferId, acceptPayload.tcpPort);
-            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
+            auto info = std::make_shared<TransferThreadInfo>();
+            info->thread = std::thread([info, transferId, port = acceptPayload.tcpPort]() {
+                OOB_ClientTask(transferId, port);
+                info->isFinished.store(true, std::memory_order_release);
+            });
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                ReapFinishedTransferThreadsLocked();
+                g_transferThreads.push_back(info);
+            }
             Network::SendToServer(Network::MessageType::EVENT_FILE_ACCEPT, &acceptPayload, sizeof(acceptPayload));
         }
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u Accepted. Will save to: %s", transferId, saveDirectory.c_str());
@@ -519,7 +788,37 @@ namespace FileTransfer {
     void CancelTransfer(uint32_t transferId) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_transfers.erase(transferId);
+        // Unblock any active OOB socket I/O immediately instead of waiting for SO_RCVTIMEO.
+        for (SOCKET sock : g_activeSockets) {
+            if (sock != INVALID_SOCKET) {
+                shutdown(sock, SD_BOTH);
+            }
+        }
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Cancelling active transfer %u...", transferId);
+    }
+
+    /**
+     * @brief Strips directory paths and replaces illegal Windows filename characters from an untrusted peer filename.
+     * @param rawBuf Raw filename character buffer received from the network.
+     * @param maxLen Maximum byte length of the raw buffer.
+     * @return A sanitized base filename safe for Win32 file save dialogs.
+     */
+    static std::string SanitizeFileName(const char* rawBuf, size_t maxLen) {
+        std::string name(rawBuf, strnlen(rawBuf, maxLen));
+        size_t slash = name.find_last_of("/\\");
+        if (slash != std::string::npos) {
+            name = name.substr(slash + 1);
+        }
+        for (char& c : name) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            if (uc < 32 || strchr("<>:\"/\\|?*", c) != nullptr) {
+                c = '_';
+            }
+        }
+        if (name.empty() || name == "." || name == "..") {
+            return "TransferredFile.bin";
+        }
+        return name;
     }
 
     /**
@@ -530,6 +829,10 @@ namespace FileTransfer {
      */
     void HandleFileOffer(SOCKET senderSocket, const Network::FileOfferPayload& payload) {
         if (!State::enableFileTransfer) {
+            if (State::globalDebugMode) {
+                UI::LogDebug("[FileTransfer] Auto-declined incoming offer %u ('%s'): file transfers are disabled.",
+                             payload.transferId, SanitizeFileName(payload.fileName, sizeof(payload.fileName)).c_str());
+            }
             Network::FileDeclinePayload decline;
             decline.transferId = payload.transferId;
             if (State::currentRole == State::AppRole::SERVER) {
@@ -539,9 +842,10 @@ namespace FileTransfer {
             }
             return; // Auto-decline if transfers are disabled locally
         }
+        std::string safeName = SanitizeFileName(payload.fileName, sizeof(payload.fileName));
         std::lock_guard<std::mutex> lock(g_mutex);
-        g_pendingOffers.push_back({ payload.transferId, payload.fileSize, std::string(payload.fileName, strnlen(payload.fileName, sizeof(payload.fileName))), senderSocket });
-        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Received File Offer: %s", payload.fileName);
+        g_pendingOffers.push_back({ payload.transferId, payload.fileSize, safeName, senderSocket });
+        if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Received File Offer: %s", safeName.c_str());
     }
 
     /**
@@ -572,12 +876,45 @@ namespace FileTransfer {
             return;
         }
 
+        std::string senderIp = GetSocketPeerIp(senderSocket);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_transfers.find(payload.transferId);
+            if (it == g_transfers.end()) {
+                g_isOobPortInUse.store(false, std::memory_order_relaxed);
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[FileTransfer] HandleFileAccept ignored: unknown or cancelled transfer %u.",
+                                 payload.transferId);
+                }
+                return;
+            }
+            if (it->second.peerIp.empty() && !senderIp.empty()) {
+                it->second.peerIp = senderIp;
+            }
+        }
+
         if (State::currentRole == State::AppRole::SERVER) {
-            auto t = std::make_shared<std::thread>(OOB_ServerTask, payload.transferId, payload.tcpPort);
-            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
+            auto info = std::make_shared<TransferThreadInfo>();
+            info->thread = std::thread([info, transferId = payload.transferId, port = payload.tcpPort]() {
+                OOB_ServerTask(transferId, port);
+                info->isFinished.store(true, std::memory_order_release);
+            });
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                ReapFinishedTransferThreadsLocked();
+                g_transferThreads.push_back(info);
+            }
         } else {
-            auto t = std::make_shared<std::thread>(OOB_ClientTask, payload.transferId, payload.tcpPort);
-            { std::lock_guard<std::mutex> lock(g_mutex); g_transferThreads.push_back(t); }
+            auto info = std::make_shared<TransferThreadInfo>();
+            info->thread = std::thread([info, transferId = payload.transferId, port = payload.tcpPort]() {
+                OOB_ClientTask(transferId, port);
+                info->isFinished.store(true, std::memory_order_release);
+            });
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                ReapFinishedTransferThreadsLocked();
+                g_transferThreads.push_back(info);
+            }
         }
         if (State::globalDebugMode) UI::LogDebug("[FileTransfer] Transfer %u Accepted by remote host. Establishing OOB stream.", payload.transferId);
     }

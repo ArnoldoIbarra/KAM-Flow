@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// SecurityManager Windows Implementation using CNG
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -11,6 +11,7 @@
  */
 
 #include "SecurityManager.h"
+#include "DebugLog.h"
 #include "StateManager.h"
 
 #define WIN32_NO_STATUS
@@ -28,6 +29,7 @@ namespace Security {
     BCRYPT_KEY_HANDLE hKey = NULL;
     std::vector<uint8_t> keyObjectBuffer;
     std::atomic<bool> g_isSecurityShutdown{false};
+    static std::mutex g_securityMutex;
 
     /// Monotonically increasing generation counter. Bumped on every Shutdown()
     /// so that thread-local key caches auto-invalidate on reconnect cycles.
@@ -62,12 +64,27 @@ namespace Security {
     
     thread_local ThreadLocalKey tls_key;
 
+    /**
+     * @brief Retrieves or lazily duplicates a thread-local AES-GCM key handle for the active key generation.
+     * @return A valid BCRYPT_KEY_HANDLE for the calling thread, or NULL if security is uninitialized or shut down.
+     */
     BCRYPT_KEY_HANDLE GetThreadLocalKey() {
         if (g_isSecurityShutdown.load(std::memory_order_acquire)) return NULL;
 
         uint32_t currentGen = g_keyGeneration.load(std::memory_order_acquire);
 
-        // If the TLS key exists but belongs to an old generation (pre-reconnect),
+        // Lock-free fast path when this thread already holds a key matching the active generation.
+        if (tls_key.hKey != NULL && tls_key.generation == currentGen) {
+            return tls_key.hKey;
+        }
+
+        // Slow path: synchronize against Initialize()/Shutdown() before accessing master handles.
+        std::lock_guard<std::mutex> lock(g_securityMutex);
+        if (g_isSecurityShutdown.load(std::memory_order_acquire)) return NULL;
+
+        currentGen = g_keyGeneration.load(std::memory_order_acquire);
+
+        // If the TLS key exists but belongs to an old generation (pre-reconnect or PIN regen),
         // destroy it so we re-duplicate from the new master key below.
         if (tls_key.hKey != NULL && tls_key.generation != currentGen) {
             BCryptDestroyKey(tls_key.hKey);
@@ -77,13 +94,37 @@ namespace Security {
         }
 
         if (tls_key.hKey != NULL) return tls_key.hKey;
-        if (hKey == NULL) return NULL;
+        if (hKey == NULL || hAesAlg == NULL) return NULL;
 
         DWORD cbKeyObject = 0, cbData = 0;
-        BCryptGetProperty(hAesAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObject, sizeof(DWORD), &cbData, 0);
+        NTSTATUS propStatus = BCryptGetProperty(hAesAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObject, sizeof(DWORD), &cbData, 0);
+        if (propStatus != STATUS_SUCCESS || cbKeyObject == 0) {
+            if (State::globalDebugMode) {
+                static DebugLog::RateLimitState keyPropRate;
+                uint32_t suppressed = 0;
+                if (keyPropRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                    char supBuf[32] = "";
+                    if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), " (+%u suppressed)", suppressed);
+                    UI::LogDebug("[Security] Failed to query AES key object size (status=0x%08X%s).",
+                                 static_cast<uint32_t>(propStatus), supBuf);
+                }
+            }
+            return NULL;
+        }
         tls_key.keyObjectBuffer.resize(cbKeyObject);
         
-        if (BCryptDuplicateKey(hKey, &tls_key.hKey, tls_key.keyObjectBuffer.data(), cbKeyObject, 0) != STATUS_SUCCESS) {
+        NTSTATUS dupStatus = BCryptDuplicateKey(hKey, &tls_key.hKey, tls_key.keyObjectBuffer.data(), cbKeyObject, 0);
+        if (dupStatus != STATUS_SUCCESS) {
+            if (State::globalDebugMode) {
+                static DebugLog::RateLimitState dupKeyRate;
+                uint32_t suppressed = 0;
+                if (dupKeyRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                    char supBuf[32] = "";
+                    if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), " (+%u suppressed)", suppressed);
+                    UI::LogDebug("[Security] Failed to duplicate thread-local AES key (status=0x%08X%s).",
+                                 static_cast<uint32_t>(dupStatus), supBuf);
+                }
+            }
             return NULL;
         }
         tls_key.generation = currentGen;
@@ -91,53 +132,100 @@ namespace Security {
     }
 
     /**
-     * @brief Initializes CNG, sets the AES-GCM chaining mode, and hashes the PIN to a 256-bit key.
+     * @brief Initializes CNG, sets the AES-GCM chaining mode, and stretches the PIN to a 256-bit key via PBKDF2.
      * @param pin The 8-digit security PIN string.
      * @return true if initialization and key derivation succeeded, false otherwise.
      */
     bool Initialize(const char* pin) {
+        std::lock_guard<std::mutex> lock(g_securityMutex);
         if (hAesAlg != NULL) return true;
         g_isSecurityShutdown.store(false, std::memory_order_release);
 
-        if (BCryptOpenAlgorithmProvider(&hAesAlg, BCRYPT_AES_ALGORITHM, NULL, 0) != STATUS_SUCCESS) {
-            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to open CNG AES Provider.");
+        NTSTATUS status = BCryptOpenAlgorithmProvider(&hAesAlg, BCRYPT_AES_ALGORITHM, NULL, 0);
+        if (status != STATUS_SUCCESS) {
+            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to open CNG AES Provider (status=0x%08X).", static_cast<uint32_t>(status));
             return false;
         }
 
-        if (BCryptSetProperty(hAesAlg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0) != STATUS_SUCCESS) {
+        status = BCryptSetProperty(hAesAlg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+        if (status != STATUS_SUCCESS) {
+            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to set AES-GCM chaining mode (status=0x%08X).", static_cast<uint32_t>(status));
+            BCryptCloseAlgorithmProvider(hAesAlg, 0);
+            hAesAlg = NULL;
             return false;
         }
 
-        uint8_t derivedKey[32];
-        BCRYPT_ALG_HANDLE hHashAlg = NULL;
-        BCryptOpenAlgorithmProvider(&hHashAlg, BCRYPT_SHA256_ALGORITHM, NULL, 0);
-        
-        BCRYPT_HASH_HANDLE hHash = NULL;
-        BCryptCreateHash(hHashAlg, &hHash, NULL, 0, NULL, 0, 0);
-        BCryptHashData(hHash, (PUCHAR)pin, (ULONG)strlen(pin), 0);
-        BCryptFinishHash(hHash, derivedKey, sizeof(derivedKey), 0);
-        
-        BCryptDestroyHash(hHash);
-        BCryptCloseAlgorithmProvider(hHashAlg, 0);
+        // Derive the 256-bit AES-GCM key using PBKDF2-HMAC-SHA256 (10,000 iterations)
+        // with a domain-specific salt instead of a single unsalted SHA-256 hash.
+        uint8_t derivedKey[32] = {0};
+        static const uint8_t kDomainSalt[] = "KAM-Flow-Enterprise-AES256-GCM-Salt-v3.5";
+        BCRYPT_ALG_HANDLE hPrfAlg = NULL;
+        status = BCryptOpenAlgorithmProvider(&hPrfAlg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+        if (status != STATUS_SUCCESS) {
+            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to open HMAC-SHA256 provider for PBKDF2 (status=0x%08X).", static_cast<uint32_t>(status));
+            BCryptCloseAlgorithmProvider(hAesAlg, 0);
+            hAesAlg = NULL;
+            return false;
+        }
+
+        NTSTATUS kdfStatus = BCryptDeriveKeyPBKDF2(
+            hPrfAlg,
+            (PUCHAR)pin,
+            (ULONG)strlen(pin),
+            (PUCHAR)kDomainSalt,
+            (ULONG)(sizeof(kDomainSalt) - 1),
+            10000,
+            derivedKey,
+            sizeof(derivedKey),
+            0
+        );
+        BCryptCloseAlgorithmProvider(hPrfAlg, 0);
+
+        if (kdfStatus != STATUS_SUCCESS) {
+            SecureZeroMemory(derivedKey, sizeof(derivedKey));
+            if (State::globalDebugMode) UI::LogDebug("[Security] PBKDF2 key derivation failed (status=0x%08X).", static_cast<uint32_t>(kdfStatus));
+            BCryptCloseAlgorithmProvider(hAesAlg, 0);
+            hAesAlg = NULL;
+            return false;
+        }
 
         DWORD cbKeyObject = 0, cbData = 0;
         BCryptGetProperty(hAesAlg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&cbKeyObject, sizeof(DWORD), &cbData, 0);
         keyObjectBuffer.resize(cbKeyObject);
 
-        if (BCryptGenerateSymmetricKey(hAesAlg, &hKey, keyObjectBuffer.data(), cbKeyObject, derivedKey, sizeof(derivedKey), 0) != STATUS_SUCCESS) {
-            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to generate Symmetric Key.");
+        status = BCryptGenerateSymmetricKey(hAesAlg, &hKey, keyObjectBuffer.data(), cbKeyObject, derivedKey, sizeof(derivedKey), 0);
+        if (status != STATUS_SUCCESS) {
+            SecureZeroMemory(derivedKey, sizeof(derivedKey));
+            if (State::globalDebugMode) UI::LogDebug("[Security] Failed to generate Symmetric Key (status=0x%08X).", static_cast<uint32_t>(status));
+            BCryptCloseAlgorithmProvider(hAesAlg, 0);
+            hAesAlg = NULL;
             return false;
         }
 
         SecureZeroMemory(derivedKey, sizeof(derivedKey));
 
-        // Seed the counter-based nonce with a 4-byte random session prefix.
-        // This single BCryptGenRandom call replaces the per-packet calls that
-        // were causing 1000+ kernel-mode CSPRNG invocations per second.
-        BCryptGenRandom(NULL, g_noncePrefix, sizeof(g_noncePrefix), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-        g_nonceCounter.store(0, std::memory_order_relaxed);
+        // Seed the counter-based nonce with a 4-byte random session prefix (MSB partitioned by role:
+        // Server MSB = 0, Client MSB = 1) plus a 32-bit random high half in the 64-bit counter.
+        // This provides a 63-bit random per-session nonce namespace (collision-safe across reconnects
+        // and multi-client sessions) while leaving 2^32 monotonic packets per session.
+        NTSTATUS rngStatus1 = BCryptGenRandom(NULL, g_noncePrefix, sizeof(g_noncePrefix), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (rngStatus1 != STATUS_SUCCESS && State::globalDebugMode) {
+            UI::LogDebug("[Security] WARNING: BCryptGenRandom for nonce prefix failed (status=0x%08X).", static_cast<uint32_t>(rngStatus1));
+        }
+        if (State::currentRole.load(std::memory_order_relaxed) == State::AppRole::CLIENT) {
+            g_noncePrefix[0] |= 0x80;  // Client namespace: MSB = 1
+        } else {
+            g_noncePrefix[0] &= 0x7F;  // Server namespace: MSB = 0
+        }
+        uint32_t randomCounterHigh = 0;
+        NTSTATUS rngStatus2 = BCryptGenRandom(NULL, (PUCHAR)&randomCounterHigh, sizeof(randomCounterHigh), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (rngStatus2 != STATUS_SUCCESS && State::globalDebugMode) {
+            UI::LogDebug("[Security] WARNING: BCryptGenRandom for nonce counter failed (status=0x%08X).", static_cast<uint32_t>(rngStatus2));
+        }
+        uint64_t initialCounter = (static_cast<uint64_t>(randomCounterHigh) << 32);
+        g_nonceCounter.store(initialCounter, std::memory_order_relaxed);
         
-        if (State::globalDebugMode) UI::LogDebug("[Security] Hardware AES-GCM Provider Initialized.");
+        if (State::globalDebugMode) UI::LogDebug("[Security] Hardware AES-GCM Provider Initialized (PBKDF2-SHA256).");
         return true;
     }
 
@@ -178,25 +266,35 @@ namespace Security {
         authInfo.pbTag = authTag;
         authInfo.cbTag = sizeof(authTag);
 
-        std::vector<uint8_t> tempCiphertext(plainSize);
+        // Allocate/resize outCiphertext once and encrypt directly into the slice after the 12-byte IV.
+        // This eliminates the per-packet tempCiphertext heap allocation (~1100 allocs/sec at 1000Hz mouse + 100Hz audio).
+        outCiphertext.resize(sizeof(iv) + plainSize + sizeof(authTag));
         uint8_t ivTemp[12];
         // Preserve the original IV since BCryptEncrypt mutates the passed buffer during execution.
         memcpy(ivTemp, iv, sizeof(iv));
 
         PUCHAR ptBuffer = plainSize > 0 ? (PUCHAR)plaintext : NULL;
-        PUCHAR ctBuffer = plainSize > 0 ? tempCiphertext.data() : NULL;
+        PUCHAR ctBuffer = plainSize > 0 ? (outCiphertext.data() + sizeof(iv)) : NULL;
 
-        if (BCryptEncrypt(localKey, ptBuffer, (ULONG)plainSize, &authInfo, ivTemp, sizeof(ivTemp), 
-                          ctBuffer, (ULONG)tempCiphertext.size(), &cbResult, 0) != STATUS_SUCCESS) {
+        NTSTATUS encStatus = BCryptEncrypt(localKey, ptBuffer, (ULONG)plainSize, &authInfo, ivTemp, sizeof(ivTemp), 
+                                           ctBuffer, (ULONG)plainSize, &cbResult, 0);
+        if (encStatus != STATUS_SUCCESS) {
             outCiphertext.clear();
+            if (State::globalDebugMode) {
+                static DebugLog::RateLimitState encRate;
+                uint32_t suppressed = 0;
+                if (encRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                    char supBuf[32] = "";
+                    if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), " (+%u suppressed)", suppressed);
+                    UI::LogDebug("[Security] BCryptEncrypt failed (status=0x%08X, size=%zu%s).",
+                                 static_cast<uint32_t>(encStatus), plainSize, supBuf);
+                }
+            }
             return false;
         }
 
         outCiphertext.resize(sizeof(iv) + cbResult + sizeof(authTag));
         memcpy(outCiphertext.data(), iv, sizeof(iv));
-        if (cbResult > 0) {
-            memcpy(outCiphertext.data() + sizeof(iv), tempCiphertext.data(), cbResult);
-        }
         memcpy(outCiphertext.data() + sizeof(iv) + cbResult, authTag, sizeof(authTag));
 
         return true;
@@ -245,9 +343,20 @@ namespace Security {
         PUCHAR ctBuffer = actualCipherSize > 0 ? (PUCHAR)actualCiphertext : NULL;
         PUCHAR ptBuffer = actualCipherSize > 0 ? outPlaintext.data() : NULL;
 
-        if (BCryptDecrypt(localKey, ctBuffer, (ULONG)actualCipherSize, &authInfo, ivTemp, sizeof(ivTemp), 
-                          ptBuffer, (ULONG)actualCipherSize, &cbResult, 0) != STATUS_SUCCESS) {
+        NTSTATUS decStatus = BCryptDecrypt(localKey, ctBuffer, (ULONG)actualCipherSize, &authInfo, ivTemp, sizeof(ivTemp), 
+                                           ptBuffer, (ULONG)actualCipherSize, &cbResult, 0);
+        if (decStatus != STATUS_SUCCESS) {
             outPlaintext.clear();
+            if (decStatus != STATUS_AUTH_TAG_MISMATCH && State::globalDebugMode) {
+                static DebugLog::RateLimitState decRate;
+                uint32_t suppressed = 0;
+                if (decRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                    char supBuf[32] = "";
+                    if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), " (+%u suppressed)", suppressed);
+                    UI::LogDebug("[Security] Unexpected BCryptDecrypt error (status=0x%08X%s).",
+                                 static_cast<uint32_t>(decStatus), supBuf);
+                }
+            }
             return false;
         }
 
@@ -261,6 +370,7 @@ namespace Security {
      * @return void
      */
     void Shutdown() {
+        std::lock_guard<std::mutex> lock(g_securityMutex);
         g_isSecurityShutdown.store(true, std::memory_order_release);
         // Bump the generation counter so all thread-local key caches
         // auto-invalidate on the next GetThreadLocalKey() call. Without this,

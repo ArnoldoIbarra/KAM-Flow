@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Mouse Capture Hook Implementation
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -10,9 +10,11 @@
  */
 
 #include "MouseCapture.h"
+#include "DebugLog.h"
 #include "StateManager.h"
 #include "NetworkMessages.h"
 #include "NetworkServer.h"
+#include "UIManager.h"
 #include <iostream>
 #include <algorithm>
 #include <thread>
@@ -43,13 +45,31 @@ namespace Input {
     std::thread g_mouseNetworkThread;
     const size_t MAX_MOUSE_QUEUE_DEPTH = 64;
 
+    /// Lock-free hook anomaly counters incremented inside WH_MOUSE_LL and drained by MouseNetworkThreadLoop.
+    std::atomic<uint32_t> g_mouseOverflows{0};
+    std::atomic<uint32_t> g_mouseDroppedActions{0};
+    std::atomic<uint32_t> g_mouseTeleportDiscards{0};
+
+    /// Queued screen-edge transition so WH_MOUSE_LL never blocks on TCP socket sends.
+    struct PendingEdgeTransition {
+        bool active = false;
+        uint8_t exitEdge = 0;
+        float normX = 0.0f;
+        float normY = 0.0f;
+    };
+    PendingEdgeTransition g_pendingEdgeTransition;
+
     /// Coordinates where the mouse entered the boundary.
     POINT entryPoint = { 0, 0 };
     /// Coordinates where the mouse is locked during Remote Mode.
     POINT lockedPoint = { 0, 0 };
     
     /// Flags indicating which edge was breached.
-    bool isTransitionedOut = false;
+    std::atomic<bool> isTransitionedOut{false};
+
+    /// Sub-pixel mouse sensitivity fractional accumulators shared across remote move frames.
+    std::atomic<float> fracX{0.0f};
+    std::atomic<float> fracY{0.0f};
 
     /// Signature value for dwExtraInfo to tag our cursor re-centering events.
     /// Prevents the feedback loop where cursor repositioning generates phantom
@@ -133,65 +153,110 @@ namespace Input {
      */
     void MouseNetworkThreadLoop() {
         ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        uint64_t lastPerfTick = GetTickCount64();
+        uint32_t peakBatchSize = 0;
+        uint32_t slowSends = 0;
+        uint32_t intervalOverflows = 0;
+        uint32_t intervalDroppedActions = 0;
+        uint32_t intervalTeleportDiscards = 0;
+
         while (g_isMouseNetworkThreadRunning) {
             std::queue<Network::MousePayload> localQueue;
+            PendingEdgeTransition pendingTr;
             {
                 std::unique_lock<std::mutex> lock(g_mouseQueueMutex);
                 // Wake instantly on each event — zero artificial delay. If multiple
                 // events arrive during the network send phase, they batch naturally
                 // via the queue swap and get coalesced into one packet.
                 g_mouseQueueCv.wait(lock, [] { 
-                    return !g_mouseQueue.empty() || !g_isMouseNetworkThreadRunning; 
+                    return !g_mouseQueue.empty() || g_pendingEdgeTransition.active || !g_isMouseNetworkThreadRunning; 
                 });
 
-                if (!g_isMouseNetworkThreadRunning && g_mouseQueue.empty()) {
+                if (!g_isMouseNetworkThreadRunning && g_mouseQueue.empty() && !g_pendingEdgeTransition.active) {
                     break;
                 }
+
+                pendingTr = g_pendingEdgeTransition;
+                g_pendingEdgeTransition.active = false;
 
                 // Swap queues instantly to release the mutex back to the hook thread
                 std::swap(localQueue, g_mouseQueue);
             }
 
-            if (localQueue.empty()) continue; // Timeout with no events, just loop back
-
-            // Perform the blocking network calls outside of the OS hook chain
-            Network::MousePayload coalescedMove = { 0, 0, 0, 0 };
-            bool hasCoalescedMove = false;
-
-            while (!localQueue.empty()) {
-                auto p = localQueue.front();
-                localQueue.pop();
-
-                // If it is a pure relative move, sum the deltas to compress multiple events into one packet
-                if (p.flags == MOUSEEVENTF_MOVE && p.mouseData == 0) {
-                    coalescedMove.deltaX += p.deltaX;
-                    coalescedMove.deltaY += p.deltaY;
-                    coalescedMove.flags = MOUSEEVENTF_MOVE;
-                    hasCoalescedMove = true;
-                } else {
-                    // Send any accumulated movement BEFORE sending the discrete click/scroll
-                    if (hasCoalescedMove) {
-                        SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
-                        if (ctrl != INVALID_SOCKET) {
-                            Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
-                        }
-                        coalescedMove = { 0, 0, 0, 0 };
-                        hasCoalescedMove = false;
-                    }
-                    // Send the discrete action
-                    SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
-                    if (ctrl != INVALID_SOCKET) {
-                        Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &p, sizeof(p));
+            if (pendingTr.active) {
+                if (!Network::RouteCursorTransition(0, 0, pendingTr.exitEdge, pendingTr.normX, pendingTr.normY)) {
+                    isTransitionedOut.store(false, std::memory_order_relaxed);
+                    if (State::globalDebugMode) {
+                        UI::LogDebug("[KVM] WARNING: RouteCursorTransition failed for exitEdge=%u; staying LOCAL.",
+                                     pendingTr.exitEdge);
                     }
                 }
             }
 
-            // Flush any remaining accumulated movement
-            if (hasCoalescedMove) {
-                SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
-                if (ctrl != INVALID_SOCKET) {
-                    Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &coalescedMove, sizeof(coalescedMove));
+            if (!localQueue.empty()) {
+                peakBatchSize = (std::max)(peakBatchSize, static_cast<uint32_t>(localQueue.size()));
+
+                auto sendMousePayload = [&](const Network::MousePayload& payload) {
+                    SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
+                    if (ctrl != INVALID_SOCKET) {
+                        uint64_t t0 = GetTickCount64();
+                        Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &payload, sizeof(payload));
+                        if ((GetTickCount64() - t0) > 15) {
+                            ++slowSends;
+                        }
+                    }
+                };
+
+                // Perform the blocking network calls outside of the OS hook chain
+                Network::MousePayload coalescedMove = { 0, 0, 0, 0 };
+                bool hasCoalescedMove = false;
+
+                while (!localQueue.empty()) {
+                    auto p = localQueue.front();
+                    localQueue.pop();
+
+                    // If it is a pure relative move, sum the deltas to compress multiple events into one packet
+                    if (p.flags == MOUSEEVENTF_MOVE && p.mouseData == 0) {
+                        coalescedMove.deltaX += p.deltaX;
+                        coalescedMove.deltaY += p.deltaY;
+                        coalescedMove.flags = MOUSEEVENTF_MOVE;
+                        hasCoalescedMove = true;
+                    } else {
+                        // Send any accumulated movement BEFORE sending the discrete click/scroll
+                        if (hasCoalescedMove) {
+                            sendMousePayload(coalescedMove);
+                            coalescedMove = { 0, 0, 0, 0 };
+                            hasCoalescedMove = false;
+                        }
+                        // Send the discrete action
+                        sendMousePayload(p);
+                    }
                 }
+
+                // Flush any remaining accumulated movement
+                if (hasCoalescedMove) {
+                    sendMousePayload(coalescedMove);
+                }
+            }
+
+            uint64_t nowTick = GetTickCount64();
+            if (nowTick - lastPerfTick >= 30000) {
+                intervalOverflows += g_mouseOverflows.exchange(0, std::memory_order_relaxed);
+                intervalDroppedActions += g_mouseDroppedActions.exchange(0, std::memory_order_relaxed);
+                intervalTeleportDiscards += g_mouseTeleportDiscards.exchange(0, std::memory_order_relaxed);
+                if ((Network::ShouldEmitPerfSummary(intervalOverflows + intervalDroppedActions +
+                                                    intervalTeleportDiscards + slowSends) ||
+                     peakBatchSize > 16) &&
+                    State::globalDebugMode) {
+                    UI::LogDebug("[Input Perf] Mouse 30s: peakBatch=%u, slowSends(>15ms)=%u, overflows=%u, dropClicks=%u, teleports=%u",
+                                 peakBatchSize, slowSends, intervalOverflows, intervalDroppedActions, intervalTeleportDiscards);
+                }
+                lastPerfTick = nowTick;
+                peakBatchSize = 0;
+                slowSends = 0;
+                intervalOverflows = 0;
+                intervalDroppedActions = 0;
+                intervalTeleportDiscards = 0;
             }
         }
     }
@@ -207,9 +272,6 @@ namespace Input {
         uint32_t mouseData = 0;
         int dx = 0, dy = 0;
 
-        static float fracX = 0.0f;
-        static float fracY = 0.0f;
-
         if (wParam == WM_MOUSEMOVE) {
             // Delta from lockedPoint is correct because return 1 from the LL hook
             // DOES prevent the OS from updating the cursor position. The cursor
@@ -219,22 +281,23 @@ namespace Input {
             int rawDx = ms->pt.x - lockedPoint.x;
             int rawDy = ms->pt.y - lockedPoint.y;
 
-            // Failsafe: If a background app or rare hook timeout forcefully moved
-            // the cursor away from lockedPoint, re-anchor it. Uses SendInput (not
-            // SetCursorPos) so the LLMHF_INJECTED flag is set, preventing the
-            // resulting phantom WM_MOUSEMOVE from being double-processed.
-            if (abs(rawDx) > 200 || abs(rawDy) > 200) {
+            // Failsafe: Only discard movement if delta exceeds 1500px in a single tick
+            // (true external teleport). Fast 1000Hz / high-DPI mouse flicks can exceed 200px
+            // during brief DWM stalls and must be preserved, re-anchoring immediately after.
+            if (abs(rawDx) > 1500 || abs(rawDy) > 1500) {
+                g_mouseTeleportDiscards.fetch_add(1, std::memory_order_relaxed);
                 ReanchorCursor();
                 return;
             }
+            bool needsReanchor = (abs(rawDx) > 150 || abs(rawDy) > 150);
 
             if (rawDx != 0 || rawDy != 0) {
-                float sx = rawDx * State::mouseSensitivity + fracX;
-                float sy = rawDy * State::mouseSensitivity + fracY;
+                float sx = rawDx * State::mouseSensitivity + fracX.load(std::memory_order_relaxed);
+                float sy = rawDy * State::mouseSensitivity + fracY.load(std::memory_order_relaxed);
                 dx = static_cast<int>(sx);
                 dy = static_cast<int>(sy);
-                fracX = sx - dx;
-                fracY = sy - dy;
+                fracX.store(sx - dx, std::memory_order_relaxed);
+                fracY.store(sy - dy, std::memory_order_relaxed);
 
                 if (dx != 0 || dy != 0) {
                     Network::MousePayload p = { dx, dy, 0, MOUSEEVENTF_MOVE };
@@ -244,15 +307,17 @@ namespace Input {
                     // coalesce ALL pending moves into one delta to prevent stale burst
                     // playback that makes the cursor teleport after resuming.
                     if (g_mouseQueue.size() >= MAX_MOUSE_QUEUE_DEPTH) {
+                        g_mouseOverflows.fetch_add(1, std::memory_order_relaxed);
                         Network::MousePayload coalesced = { 0, 0, 0, 0 };
                         while (!g_mouseQueue.empty()) {
                             auto& front = g_mouseQueue.front();
                             if (front.flags == MOUSEEVENTF_MOVE && front.mouseData == 0) {
                                 coalesced.deltaX += front.deltaX;
                                 coalesced.deltaY += front.deltaY;
+                            } else {
+                                g_mouseDroppedActions.fetch_add(1, std::memory_order_relaxed);
                             }
-                            // Non-move events (clicks, scrolls) are silently dropped
-                            // during overflow — they are stale and no longer relevant.
+                            // Non-move events (clicks, scrolls) are dropped during overflow.
                             g_mouseQueue.pop();
                         }
                         // Push the coalesced sum plus the new event as a single move
@@ -266,6 +331,9 @@ namespace Input {
 
                     g_mouseQueueCv.notify_one();
                 }
+            }
+            if (needsReanchor) {
+                ReanchorCursor();
             }
             return; 
         } else {
@@ -325,7 +393,6 @@ namespace Input {
 
             if (!State::IsRemote() && isTransitionedOut) {
                 isTransitionedOut = false;
-                SetCursorPos(entryPoint.x + 30, entryPoint.y); 
             }
 
             if (State::IsRemote()) {
@@ -385,12 +452,19 @@ namespace Input {
                             else if (exitEdge == 3) testPt.y += 2;
 
                             if (MonitorFromPoint(testPt, MONITOR_DEFAULTTONULL) == NULL) {
-                                if (Network::RouteCursorTransition(0, 0, exitEdge, normX, normY)) {
-                                    isTransitionedOut = true;
+                                // Check non-blockingly if a target node exists, then offload TCP RouteCursorTransition
+                                // to MouseNetworkThreadLoop so WH_MOUSE_LL never blocks on socket I/O.
+                                if (Network::HasTargetInDirection(0, 0, exitEdge)) {
+                                    isTransitionedOut.store(true, std::memory_order_relaxed);
                                     entryPoint = ms->pt;
                                     lockedPoint = { (cachedMi.rcMonitor.left + cachedMi.rcMonitor.right) / 2, (cachedMi.rcMonitor.top + cachedMi.rcMonitor.bottom) / 2 };
                                     ReanchorCursor();
                                     consecutiveEdgeHits = 0;
+                                    {
+                                        std::lock_guard<std::mutex> lock(g_mouseQueueMutex);
+                                        g_pendingEdgeTransition = { true, exitEdge, normX, normY };
+                                        g_mouseQueueCv.notify_one();
+                                    }
                                     return 1;
                                 }
                             }
@@ -449,5 +523,8 @@ namespace Input {
         std::lock_guard<std::mutex> lock(g_mouseQueueMutex);
         std::queue<Network::MousePayload> empty;
         std::swap(g_mouseQueue, empty);
+        g_pendingEdgeTransition.active = false;
+        fracX.store(0.0f, std::memory_order_relaxed);
+        fracY.store(0.0f, std::memory_order_relaxed);
     }
 }

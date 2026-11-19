@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Config Manager Interface
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /// @file ConfigManager.h
@@ -21,7 +21,7 @@ namespace Config {
     bool LoadConfig();
 
     /// Saves the current configuration to the .ini file.
-    void SaveConfig(const std::string& targetIp, uint16_t port);
+    void SaveConfig();
 
     /// Saves a client's spatial matrix grid coordinates.
     void SaveClientLayout(const std::string& clientName, int x, int y);

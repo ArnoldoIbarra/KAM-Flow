@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// File Transfer Manager Interface
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /// @file FileTransferManager.h

@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Keyboard Capture Hook Implementation
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -14,10 +14,12 @@
  */
 
 #include "KeyboardCapture.h"
+#include "DebugLog.h"
 #include "StateManager.h"
 #include "NetworkMessages.h" 
 #include "NetworkServer.h"   
 #include "UIManager.h"
+#include <cstdio>
 #include <iostream>
 #include <queue>
 #include <mutex>
@@ -56,6 +58,7 @@ namespace Input {
         while (g_isKeyboardNetworkThreadRunning) {
             Network::KeyboardPayload p;
             bool hasPayload = false;
+            size_t depth = 0;
             {
                 std::unique_lock<std::mutex> lock(g_keyboardQueueMutex);
                 g_keyboardQueueCv.wait(lock, [] {
@@ -67,6 +70,7 @@ namespace Input {
                 }
 
                 if (!g_keyboardQueue.empty()) {
+                    depth = g_keyboardQueue.size();
                     p = g_keyboardQueue.front();
                     g_keyboardQueue.pop();
                     hasPayload = true;
@@ -77,9 +81,22 @@ namespace Input {
             // Keyboard events are never coalesced — each keypress/release must
             // be delivered individually to preserve correct modifier state.
             if (hasPayload) {
+                uint64_t elapsedMs = 0;
                 SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
                 if (ctrl != INVALID_SOCKET) {
+                    uint64_t t0 = GetTickCount64();
                     Network::SendToClient(ctrl, Network::MessageType::EVENT_KEYBOARD, &p, sizeof(p));
+                    elapsedMs = GetTickCount64() - t0;
+                }
+                if ((depth >= 16 || elapsedMs > 50) && State::globalDebugMode) {
+                    static DebugLog::RateLimitState kbdPerfRate;
+                    uint32_t suppressed = 0;
+                    if (kbdPerfRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                        char supBuf[32] = "";
+                        if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+                        UI::LogDebug("[Input Perf] WARNING: Keyboard queue backlog (depth=%zu, send=%llums%s).",
+                                     depth, static_cast<unsigned long long>(elapsedMs), supBuf);
+                    }
                 }
             }
         }
@@ -120,6 +137,8 @@ namespace Input {
 
             if (isKeyDown && kbd->vkCode == State::emergencyHotkey && isCtrlDown && isAltDown) {
                 if (State::globalDebugMode) UI::LogDebug("[KAM-Flow] Emergency Override Triggered. Returning control to Server.");
+                isCtrlDown = false;
+                isAltDown = false;
                 State::SetMode(State::ControlMode::LOCAL);
                 return 1;
             }
@@ -139,6 +158,18 @@ namespace Input {
                     std::lock_guard<std::mutex> lock(g_keyboardQueueMutex);
                     g_keyboardQueue.push(p);
                     g_keyboardQueueCv.notify_one();
+                }
+
+                // Allow modifier KEYUP events to pass through to the local OS as well so
+                // any modifier depressed before a screen-edge transition cannot get stuck on the Server.
+                if (isKeyUp) {
+                    DWORD vk = kbd->vkCode;
+                    if (vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+                        vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+                        vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+                        vk == VK_LWIN || vk == VK_RWIN) {
+                        return CallNextHookEx(globalKeyboardHook, nCode, wParam, lParam);
+                    }
                 }
                 
                 return 1; 

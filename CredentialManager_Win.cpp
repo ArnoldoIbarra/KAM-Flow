@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Credential Manager Windows Implementation
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -10,6 +10,7 @@
  */
 
 #include "CredentialManager.h"
+#include "DebugLog.h"
 #include "StateManager.h"
 #include "UIManager.h"
 #include <windows.h>
@@ -33,7 +34,7 @@ namespace CredentialManager {
         cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
 
         if (!CredWriteA(&cred, 0)) {
-            if (State::globalDebugMode) UI::LogDebug("[CredManager] Failed to save credential for %s", targetName.c_str());
+            if (State::globalDebugMode) UI::LogDebug("[CredManager] Failed to save credential for %s (err=%lu)", targetName.c_str(), GetLastError());
             return false;
         }
         return true;
@@ -52,6 +53,10 @@ namespace CredentialManager {
             CredFree(pCred);
             return true;
         }
+        DWORD err = GetLastError();
+        if (err != ERROR_NOT_FOUND && State::globalDebugMode) {
+            UI::LogDebug("[CredManager] Failed to read credential '%s' (err=%lu).", targetName.c_str(), err);
+        }
         return false;
     }
 
@@ -61,7 +66,14 @@ namespace CredentialManager {
      * @return true if successfully deleted, false otherwise.
      */
     bool DeleteSecret(const std::string& targetName) {
-        return CredDeleteA(targetName.c_str(), CRED_TYPE_GENERIC, 0) != 0;
+        if (CredDeleteA(targetName.c_str(), CRED_TYPE_GENERIC, 0) != 0) {
+            return true;
+        }
+        DWORD err = GetLastError();
+        if (err != ERROR_NOT_FOUND && State::globalDebugMode) {
+            UI::LogDebug("[CredManager] Failed to delete credential '%s' (err=%lu).", targetName.c_str(), err);
+        }
+        return false;
     }
 
     /**
@@ -77,6 +89,18 @@ namespace CredentialManager {
         if (CredEnumerateA(filter.c_str(), 0, &count, &pCreds)) {
             for (DWORD i = 0; i < count; ++i) targets.push_back(pCreds[i]->TargetName);
             CredFree(pCreds);
+        } else {
+            DWORD err = GetLastError();
+            if (err != ERROR_NOT_FOUND && State::globalDebugMode) {
+                static DebugLog::RateLimitState enumRate;
+                uint32_t suppressed = 0;
+                if (enumRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                    char supBuf[32] = "";
+                    if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), " (+%u suppressed)", suppressed);
+                    UI::LogDebug("[CredManager] Failed to enumerate credentials for '%s' (err=%lu%s).",
+                                 prefix.c_str(), err, supBuf);
+                }
+            }
         }
         return targets;
     }

@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Credential Manager Interface
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /// @file CredentialManager.h

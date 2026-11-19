@@ -47,8 +47,44 @@ namespace Network {
         EVENT_CLIENT_LOCKED, ///< Sent by Client when UAC/Secure Desktop blocks input.
         EVENT_FILE_OFFER,    ///< Sender proposes an out-of-band file transfer.
         EVENT_FILE_ACCEPT,   ///< Receiver accepts the transfer and specifies the temporary port.
-        EVENT_FILE_DECLINE   ///< Receiver declines the file transfer.
+        EVENT_FILE_DECLINE,  ///< Receiver declines the file transfer.
+        EVENT_AUTH_REJECTED  ///< Server rejects EVENT_AUTH due to Master PIN / AES-GCM tag mismatch.
     };
+
+    /// Returns a human-readable protocol message name for diagnostic logging.
+    inline const char* MessageTypeToString(MessageType type) {
+        switch (type) {
+            case MessageType::EVENT_MOUSE:             return "MOUSE";
+            case MessageType::EVENT_KEYBOARD:          return "KEYBOARD";
+            case MessageType::EVENT_STATE:             return "STATE";
+            case MessageType::EVENT_AUTH:              return "AUTH";
+            case MessageType::EVENT_UDP_HANDSHAKE:     return "UDP_HANDSHAKE";
+            case MessageType::EVENT_UDP_HANDSHAKE_ACK: return "UDP_HANDSHAKE_ACK";
+            case MessageType::EVENT_SYNC_CURSOR:       return "SYNC_CURSOR";
+            case MessageType::EVENT_RETURN_CONTROL:    return "RETURN_CONTROL";
+            case MessageType::EVENT_UDP_BEACON:        return "UDP_BEACON";
+            case MessageType::EVENT_HEARTBEAT:         return "HEARTBEAT";
+            case MessageType::EVENT_AUDIO_FORMAT:      return "AUDIO_FORMAT";
+            case MessageType::EVENT_AUDIO_DATA:        return "AUDIO_DATA";
+            case MessageType::EVENT_MIC_DATA:          return "MIC_DATA";
+            case MessageType::EVENT_CLIPBOARD:         return "CLIPBOARD";
+            case MessageType::EVENT_CLIENT_LOCKED:     return "CLIENT_LOCKED";
+            case MessageType::EVENT_FILE_OFFER:        return "FILE_OFFER";
+            case MessageType::EVENT_FILE_ACCEPT:       return "FILE_ACCEPT";
+            case MessageType::EVENT_FILE_DECLINE:      return "FILE_DECLINE";
+            case MessageType::EVENT_AUTH_REJECTED:     return "AUTH_REJECTED";
+            default:                                   return "UNKNOWN";
+        }
+    }
+
+    /// Returns true for high-frequency streaming/heartbeat messages excluded from routine packet logs.
+    inline bool IsHighFrequencyMessage(MessageType type) {
+        return type == MessageType::EVENT_MOUSE ||
+               type == MessageType::EVENT_KEYBOARD ||
+               type == MessageType::EVENT_AUDIO_DATA ||
+               type == MessageType::EVENT_MIC_DATA ||
+               type == MessageType::EVENT_HEARTBEAT;
+    }
 
 #pragma pack(push, 1)
 
@@ -67,11 +103,13 @@ namespace Network {
     };
 
     /**
-     * @brief Payload containing the authentication PIN and Encryption State.
+     * @brief Payload encrypted under AES-GCM for zero-plaintext-PIN authentication.
      */
     struct AuthPayload {
-        /// Null-terminated 8-digit security PIN.
-        char pin[9]; 
+        /// Must equal PACKET_MAGIC after AES-GCM decryption to prove knowledge of the Master PIN.
+        uint32_t authVerifier; 
+        /// Cryptographic 64-bit session token binding the client's UDP stream to this TCP session.
+        uint64_t sessionToken;
         /// Hostname of the Client machine for UI display.
         char clientName[32];
     };
@@ -80,6 +118,8 @@ namespace Network {
      * @brief Payload sent over UDP to verify routing and associate the stream with a TCP session.
      */
     struct UDPHandshakePayload {
+        /// Cryptographic 64-bit session token matching the authenticated TCP session.
+        uint64_t sessionToken;
         /// Hostname of the Client machine to match against active TCP sessions.
         char clientName[32];
     };
@@ -195,4 +235,80 @@ namespace Network {
     };
 
 #pragma pack(pop)
+
+    /// Counters tracking UDP delivery, out-of-order arrivals, sequence gaps, stale drops, and duplicates.
+    struct UdpReplayStats {
+        uint64_t packetsAccepted = 0;
+        uint64_t packetsOutOfOrder = 0;
+        uint64_t sequenceGaps = 0;
+        uint64_t staleDrops = 0;
+        uint64_t duplicateDrops = 0;
+    };
+
+    /// Returns true when any performance anomaly counter warrants emitting a periodic summary.
+    inline bool ShouldEmitPerfSummary(uint64_t anomalySum) {
+        return anomalySum > 0;
+    }
+
+    /**
+     * @brief Verifies and updates a 64-packet sliding anti-replay bitmask window (RFC 6479 style)
+     * while optionally recording packet loss, reordering, stale drops, and duplicate drops.
+     * @param seq Incoming packet sequence number.
+     * @param maxSeq Reference to the highest sequence number seen so far.
+     * @param windowMask Reference to the 64-bit sliding bitmask tracking received packets.
+     * @param stats Optional pointer receiving cumulative delivery and anomaly counters.
+     * @return true if the packet is fresh and valid, false if stale or duplicate.
+     */
+    inline bool VerifyUdpReplayWindow(uint32_t seq, uint32_t& maxSeq, uint64_t& windowMask, UdpReplayStats* stats) {
+        if (seq == 0) {
+            if (stats) stats->duplicateDrops++;
+            return false;
+        }
+        if (seq > maxSeq) {
+            uint32_t shift = seq - maxSeq;
+            if (maxSeq > 0 && shift > 1 && stats) {
+                stats->sequenceGaps += (shift - 1);
+            }
+            if (shift >= 64) {
+                windowMask = 1ULL;
+            } else {
+                windowMask = (windowMask << shift) | 1ULL;
+            }
+            maxSeq = seq;
+            if (stats) stats->packetsAccepted++;
+            return true;
+        }
+        uint32_t diff = maxSeq - seq;
+        if (diff >= 64) {
+            if (stats) stats->staleDrops++;
+            return false; // Too old (falls behind the 64-packet reorder window)
+        }
+        uint64_t bit = 1ULL << diff;
+        if (windowMask & bit) {
+            if (stats) stats->duplicateDrops++;
+            return false; // Duplicate / Replay attack within window!
+        }
+        windowMask |= bit;
+        if (stats) {
+            stats->packetsAccepted++;
+            stats->packetsOutOfOrder++;
+            if (stats->sequenceGaps > 0) {
+                stats->sequenceGaps--;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @brief Verifies and updates a 64-packet sliding anti-replay bitmask window (RFC 6479 style).
+     * Accepts out-of-order UDP packets within 64 sequence numbers while strictly rejecting
+     * duplicate or replayed sequence numbers.
+     * @param seq Incoming packet sequence number.
+     * @param maxSeq Reference to the highest sequence number seen so far.
+     * @param windowMask Reference to the 64-bit sliding bitmask tracking received packets.
+     * @return true if the packet is fresh and valid, false if stale or duplicate.
+     */
+    inline bool VerifyUdpReplayWindow(uint32_t seq, uint32_t& maxSeq, uint64_t& windowMask) {
+        return VerifyUdpReplayWindow(seq, maxSeq, windowMask, nullptr);
+    }
 }

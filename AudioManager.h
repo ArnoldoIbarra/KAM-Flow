@@ -65,6 +65,9 @@ namespace Audio {
     /// Called by the network layer to queue incoming audio data from a specific client.
     void HandleAudioData(uintptr_t clientIdentifier, const void* pcmData, size_t dataSize);
 
+    /// Updates the lock-free cached audio mixing state (enabled and volume) for a specific client.
+    void SetClientAudioState(uintptr_t clientIdentifier, bool isEnabled, float volume);
+
     /// Called by the network layer to purge a disconnected or disabled client's audio buffer.
     void ClearClientAudioQueue(uintptr_t clientIdentifier);
 

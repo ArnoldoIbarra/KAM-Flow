@@ -38,6 +38,13 @@ namespace Network {
         int gridX;               ///< Spatial X coordinate relative to Server at (0,0).
         int gridY;               ///< Spatial Y coordinate relative to Server at (0,0).
         uint32_t udpRxSequence;  ///< Independent UDP receive sequence counter for this client.
+        uint64_t udpReplayMask;  ///< 64-packet sliding bitmask to reject duplicate UDP packets.
+        uint64_t sessionToken;   ///< Cryptographic token binding UDP handshakes to this TCP session.
+        bool hasLoggedTcpFallback = false; ///< Tracks whether TCP media fallback was logged for this client.
+        UdpReplayStats udpStats = {};       ///< Cumulative UDP delivery, reorder, loss, stale, and duplicate counters.
+        uint32_t tcpStallCount = 0;         ///< Count of TCP writes to this client exceeding 200ms.
+        uint32_t consecutiveHbSkips = 0;    ///< Consecutive heartbeat try_lock skips due to TCP send saturation.
+        uint64_t connectTickMs = 0;         ///< GetTickCount64() timestamp when this client authenticated.
     };
 
     /// Initializes WinSock2 and starts the background listening thread.
@@ -76,8 +83,8 @@ namespace Network {
     /// Retrieves the audio state for a specific client to avoid heavy vector copies.
     bool GetClientAudioState(SOCKET clientSocket, bool& isEnabled, float& volume);
 
-    /// Packages clipboard data and broadcasts it to all enabled clients.
-    bool BroadcastClipboardMessage(const void* payload, size_t payloadSize);
+    /// Packages clipboard data and broadcasts it to all enabled clients (optionally excluding the sender).
+    bool BroadcastClipboardMessage(const void* payload, size_t payloadSize, SOCKET excludeSocket = INVALID_SOCKET);
 
     /// Sends a payload directly to a specific client.
     bool SendToClient(SOCKET clientSocket, MessageType type, const void* payload, size_t payloadSize);
@@ -87,6 +94,9 @@ namespace Network {
 
     /// Calculates grid trajectory and routes control to the appropriate machine.
     bool RouteCursorTransition(int sourceX, int sourceY, uint8_t exitEdge, float normX, float normY);
+
+    /// Fast non-blocking check returning true if an active node exists in the given exit direction.
+    bool HasTargetInDirection(int sourceX, int sourceY, uint8_t exitEdge);
 
     /// Retrieves the active Master PIN from memory for display in the UI.
     std::string GetMasterPin();

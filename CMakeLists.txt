@@ -39,6 +39,7 @@ set(SOURCES
     NetworkClient.cpp
     ConfigManager.cpp
     UIManager.cpp
+    DebugLog.cpp
     SecurityManager_Win.cpp
     CredentialManager_Win.cpp
     AudioManager_Win.cpp
@@ -61,3 +62,12 @@ target_include_directories(KAM-Flow PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 
 # Link Windows subsystems, multimedia timers, and DirectX 11
 target_link_libraries(KAM-Flow PRIVATE user32 ws2_32 d3d11 d3dcompiler comdlg32 bcrypt advapi32 ole32 shell32 winmm)
+
+# Non-elevated console unit test executable for CTest
+enable_testing()
+add_executable(KAMFlowTests
+    tests/KAMFlowTests.cpp
+    DebugLog.cpp
+)
+target_include_directories(KAMFlowTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME KAMFlowTests COMMAND KAMFlowTests)

@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Config Manager Implementation
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -11,6 +11,7 @@
 
 #include "ConfigManager.h"
 #include "StateManager.h"
+#include "UIManager.h"
 #include <windows.h>
 #include <string>
 #include <iostream>
@@ -48,12 +49,22 @@ namespace Config {
         bool fileExists = (attribs != INVALID_FILE_ATTRIBUTES && !(attribs & FILE_ATTRIBUTE_DIRECTORY));
 
         if (!fileExists) {
-            SaveConfig("127.0.0.1", 8080);
+            SaveConfig();
+            if (State::globalDebugMode) {
+                UI::LogDebug("[Config] No config file found; created default %s.", fullPath.c_str());
+            }
             return true;
         }
 
+        bool hadClamp = false;
+        bool sensParseFailed = false;
+
         // Load system role configuration.
         int savedRole = GetPrivateProfileIntA("System", "DefaultRole", 0, fullPath.c_str());
+        if (savedRole < 0 || savedRole > 2) {
+            savedRole = 0;
+            hadClamp = true;
+        }
         State::defaultRole = static_cast<State::AppRole>(savedRole);
 
         // Load global debug and security preferences.
@@ -66,20 +77,24 @@ namespace Config {
         State::enableFileTransfer = GetPrivateProfileIntA("Control", "EnableFileTransfer", 1, fullPath.c_str()) != 0;
         State::enableClientAutoReconnect = GetPrivateProfileIntA("Network", "EnableClientAutoReconnect", 1, fullPath.c_str()) != 0;
 
-        State::edgeDeadzonePercent = GetPrivateProfileIntA("Control", "EdgeDeadzonePercent", 5, fullPath.c_str());
-        if (State::edgeDeadzonePercent < 0) State::edgeDeadzonePercent = 0;
-        if (State::edgeDeadzonePercent > 10) State::edgeDeadzonePercent = 10;
+        int deadzone = GetPrivateProfileIntA("Control", "EdgeDeadzonePercent", 5, fullPath.c_str());
+        if (deadzone < 0) { deadzone = 0; hadClamp = true; }
+        if (deadzone > 10) { deadzone = 10; hadClamp = true; }
+        State::edgeDeadzonePercent = deadzone;
 
         char floatBuf[32];
         GetPrivateProfileStringA("Control", "MouseSensitivity", "1.0", floatBuf, sizeof(floatBuf), fullPath.c_str());
+        float sens = 1.0f;
         try {
-            State::mouseSensitivity = std::stof(floatBuf);
+            sens = std::stof(floatBuf);
         } catch (...) {
-            State::mouseSensitivity = 1.0f;
+            sens = 1.0f;
+            sensParseFailed = true;
         }
         // Clamp to safe values in case the .ini was manually edited outside the UI.
-        if (State::mouseSensitivity < 0.1f) State::mouseSensitivity = 0.1f;
-        if (State::mouseSensitivity > 3.0f) State::mouseSensitivity = 3.0f;
+        if (sens < 0.1f) { sens = 0.1f; hadClamp = true; }
+        if (sens > 3.0f) { sens = 3.0f; hadClamp = true; }
+        State::mouseSensitivity = sens;
 
         char hotkeyBuf[8];
         GetPrivateProfileStringA("Control", "EmergencyHotkey", "M", hotkeyBuf, sizeof(hotkeyBuf), fullPath.c_str());
@@ -96,47 +111,67 @@ namespace Config {
         State::enableClientAudioStream = GetPrivateProfileIntA("Audio", "EnableClientAudioStream", 1, fullPath.c_str()) != 0;
         State::enableClientMicReceive = GetPrivateProfileIntA("Audio", "EnableClientMicReceive", 0, fullPath.c_str()) != 0;
 
-        State::audioJitterBufferMs = GetPrivateProfileIntA("Audio", "JitterBufferMs", 80, fullPath.c_str());
-        if (State::audioJitterBufferMs < 20) State::audioJitterBufferMs = 20;
-        if (State::audioJitterBufferMs > 500) State::audioJitterBufferMs = 500;
+        int jitterMs = GetPrivateProfileIntA("Audio", "JitterBufferMs", 80, fullPath.c_str());
+        if (jitterMs < 20) { jitterMs = 20; hadClamp = true; }
+        if (jitterMs > 200) { jitterMs = 200; hadClamp = true; }
+        State::audioJitterBufferMs = jitterMs;
+
+        if (State::globalDebugMode) {
+            UI::LogDebug("[Config] Loaded %s (DefaultRole=%d, Jitter=%dms, Deadzone=%d%%, Sens=%.2f, GameMode=%d)",
+                         fullPath.c_str(), static_cast<int>(State::defaultRole),
+                         State::audioJitterBufferMs.load(), State::edgeDeadzonePercent.load(),
+                         State::mouseSensitivity.load(), State::enableGameMode.load() ? 1 : 0);
+            if (sensParseFailed || hadClamp) {
+                UI::LogDebug("[Config] WARNING: Some settings in '%s' were malformed or out of range and were clamped to safe bounds.",
+                             fullPath.c_str());
+            }
+        }
 
         return true;
     }
 
     /**
      * @brief Saves the current configuration from the global State to the kamflow.ini file.
-     * @param targetIp The IP address string to save for network connections.
-     * @param port The port number to save for network connections.
+     * @return void
      */
-    void SaveConfig(const std::string& targetIp, uint16_t port) {
+    void SaveConfig() {
         const std::string& fullPath = GetResolvedPath();
+        DWORD firstWriteErr = 0;
+        auto writeIni = [&](const char* section, const char* key, const char* value) {
+            if (!WritePrivateProfileStringA(section, key, value, fullPath.c_str()) && firstWriteErr == 0) {
+                firstWriteErr = GetLastError();
+            }
+        };
 
-        WritePrivateProfileStringA("System", "DefaultRole", std::to_string(static_cast<int>(State::defaultRole)).c_str(), fullPath.c_str());
-        WritePrivateProfileStringA("System", "GlobalDebugMode", State::globalDebugMode.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("System", "MinimizeToTray", State::minimizeToTray.load() ? "1" : "0", fullPath.c_str());
+        writeIni("System", "DefaultRole", std::to_string(static_cast<int>(State::defaultRole)).c_str());
+        writeIni("System", "GlobalDebugMode", State::globalDebugMode.load() ? "1" : "0");
+        writeIni("System", "MinimizeToTray", State::minimizeToTray.load() ? "1" : "0");
 
-        WritePrivateProfileStringA("Network", "TargetIP", targetIp.c_str(), fullPath.c_str());
-        WritePrivateProfileStringA("Network", "Port", std::to_string(port).c_str(), fullPath.c_str());
-        WritePrivateProfileStringA("Network", "EnableClientAutoReconnect", State::enableClientAutoReconnect.load() ? "1" : "0", fullPath.c_str());
+        writeIni("Network", "EnableClientAutoReconnect", State::enableClientAutoReconnect.load() ? "1" : "0");
 
-        WritePrivateProfileStringA("Control", "EnableKeyboardSync", State::enableKeyboardSync.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Control", "EnableClipboardSync", State::enableClipboardSync.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Control", "EnableFileTransfer", State::enableFileTransfer.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Control", "EdgeDeadzonePercent", std::to_string(State::edgeDeadzonePercent.load()).c_str(), fullPath.c_str());
+        writeIni("Control", "EnableKeyboardSync", State::enableKeyboardSync.load() ? "1" : "0");
+        writeIni("Control", "EnableClipboardSync", State::enableClipboardSync.load() ? "1" : "0");
+        writeIni("Control", "EnableFileTransfer", State::enableFileTransfer.load() ? "1" : "0");
+        writeIni("Control", "EdgeDeadzonePercent", std::to_string(State::edgeDeadzonePercent.load()).c_str());
 
-        WritePrivateProfileStringA("Control", "MouseSensitivity", std::to_string(State::mouseSensitivity.load()).c_str(), fullPath.c_str());
+        writeIni("Control", "MouseSensitivity", std::to_string(State::mouseSensitivity.load()).c_str());
         std::string hkStr(1, State::emergencyHotkey.load());
-        WritePrivateProfileStringA("Control", "EmergencyHotkey", hkStr.c_str(), fullPath.c_str());
+        writeIni("Control", "EmergencyHotkey", hkStr.c_str());
 
-        WritePrivateProfileStringA("Control", "EnableGameMode", State::enableGameMode.load() ? "1" : "0", fullPath.c_str());
+        writeIni("Control", "EnableGameMode", State::enableGameMode.load() ? "1" : "0");
         std::string gmHkStr(1, State::gameModeHotkey.load());
-        WritePrivateProfileStringA("Control", "GameModeHotkey", gmHkStr.c_str(), fullPath.c_str());
+        writeIni("Control", "GameModeHotkey", gmHkStr.c_str());
 
-        WritePrivateProfileStringA("Audio", "EnableServerAudioMix", State::enableServerAudioMix.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "EnableServerMicBroadcast", State::enableServerMicBroadcast.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "EnableClientAudioStream", State::enableClientAudioStream.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "EnableClientMicReceive", State::enableClientMicReceive.load() ? "1" : "0", fullPath.c_str());
-        WritePrivateProfileStringA("Audio", "JitterBufferMs", std::to_string(State::audioJitterBufferMs.load()).c_str(), fullPath.c_str());
+        writeIni("Audio", "EnableServerAudioMix", State::enableServerAudioMix.load() ? "1" : "0");
+        writeIni("Audio", "EnableServerMicBroadcast", State::enableServerMicBroadcast.load() ? "1" : "0");
+        writeIni("Audio", "EnableClientAudioStream", State::enableClientAudioStream.load() ? "1" : "0");
+        writeIni("Audio", "EnableClientMicReceive", State::enableClientMicReceive.load() ? "1" : "0");
+        writeIni("Audio", "JitterBufferMs", std::to_string(State::audioJitterBufferMs.load()).c_str());
+
+        if (firstWriteErr != 0 && State::globalDebugMode) {
+            UI::LogDebug("[Config] WARNING: Failed to write config file '%s' (err=%lu — check folder write permissions).",
+                         fullPath.c_str(), firstWriteErr);
+        }
     }
 
     /**
@@ -149,7 +184,12 @@ namespace Config {
     void SaveClientLayout(const std::string& clientName, int x, int y) {
         const std::string& fullPath = GetResolvedPath();
         std::string val = std::to_string(x) + "," + std::to_string(y);
-        WritePrivateProfileStringA("SpatialLayout", clientName.c_str(), val.c_str(), fullPath.c_str());
+        if (!WritePrivateProfileStringA("SpatialLayout", clientName.c_str(), val.c_str(), fullPath.c_str())) {
+            if (State::globalDebugMode) {
+                UI::LogDebug("[Config] WARNING: Failed to save layout for '%s' to '%s' (err=%lu).",
+                             clientName.c_str(), fullPath.c_str(), GetLastError());
+            }
+        }
     }
 
     /**
@@ -171,7 +211,13 @@ namespace Config {
                 outX = std::stoi(s.substr(0, comma));
                 outY = std::stoi(s.substr(comma + 1));
                 return true;
-            } catch (...) { return false; }
+            } catch (...) {
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[Config] WARNING: Malformed SpatialLayout entry for '%s': '%s'.",
+                                 clientName.c_str(), buf);
+                }
+                return false;
+            }
         }
         return false;
     }

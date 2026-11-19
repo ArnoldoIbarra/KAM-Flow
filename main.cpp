@@ -1,7 +1,7 @@
 // =============================================================================
 // KAM-Flow - © Arnoldo Ibarra - Proprietary and Confidential
 // =============================================================================
-// Main Application Entry Point
+// Simple Keyboard and Mouse sharing with Audio Mixing 
 // =============================================================================
 
 /**
@@ -55,11 +55,11 @@ void KVMHookThreadLoop() {
     
     if (!State::enableGameMode) {
         if (!Input::StartMouseCapture()) {
-            UI::LogDebug("[Error] Failed to install Mouse Hook!");
+            UI::LogDebug("[Error] Failed to install Mouse Hook (err=%lu)!", GetLastError());
         }
     }
     if (!Input::StartKeyboardCapture()) {
-        UI::LogDebug("[Error] Failed to install Keyboard Hook!");
+        UI::LogDebug("[Error] Failed to install Keyboard Hook (err=%lu)!", GetLastError());
         return;
     }
     
@@ -68,7 +68,9 @@ void KVMHookThreadLoop() {
             if (msg.wParam == 1) {
                 Input::StopMouseCapture();
             } else {
-                Input::StartMouseCapture();
+                if (!Input::StartMouseCapture()) {
+                    UI::LogDebug("[Error] Failed to re-install Mouse Hook after disabling Game Mode (err=%lu).", GetLastError());
+                }
             }
             continue;
         }
@@ -81,15 +83,28 @@ void KVMHookThreadLoop() {
 }
 
 /**
- * @brief RAII guard to elevate the Windows system timer resolution to 1ms.
+ * @brief RAII guard to elevate the Windows system timer resolution to 1ms only when an active role is engaged.
  * Guarantees timeEndPeriod(1) is safely invoked on all exit paths.
  */
 struct TimerResolutionGuard {
-    TimerResolutionGuard() {
-        timeBeginPeriod(1);
+    bool isEngaged = false;
+
+    void Engage() {
+        if (!isEngaged) {
+            MMRESULT tr = timeBeginPeriod(1);
+            if (tr != TIMERR_NOERROR) {
+                if (State::globalDebugMode) UI::LogDebug("[System] WARNING: timeBeginPeriod(1) failed (err=%u).", tr);
+                return;
+            }
+            isEngaged = true;
+            if (State::globalDebugMode) UI::LogDebug("[System] System Timer Resolution elevated to 1ms (High Precision).");
+        }
     }
+
     ~TimerResolutionGuard() {
-        timeEndPeriod(1);
+        if (isEngaged) {
+            timeEndPeriod(1);
+        }
     }
 };
 
@@ -100,8 +115,7 @@ struct TimerResolutionGuard {
  * @return int Status code (0 for success).
  */
 int main(int argc, char* argv[]) {
-    // Elevate system timer resolution to 1ms (1000 Hz) to eliminate thread scheduling jitter
-    // and avoid coarse 15.6ms sleep quantization during high-frequency network/mouse streaming.
+    // Guard for 1ms system timer resolution (engaged once a Server/Client role starts)
     TimerResolutionGuard timerGuard;
 
     // Load persisted settings from kamflow.ini (This naturally manages initial console state)
@@ -116,7 +130,6 @@ int main(int argc, char* argv[]) {
     } else {
         if (State::globalDebugMode) UI::LogDebug("[System] Process elevated to HIGH_PRIORITY_CLASS.");
     }
-    if (State::globalDebugMode) UI::LogDebug("[System] System Timer Resolution elevated to 1ms (High Precision).");
 
     // === SINGLE INSTANCE ENFORCEMENT ===
     // Always check, regardless of debug mode. The previous code skipped this when
@@ -155,7 +168,10 @@ int main(int argc, char* argv[]) {
                         _stricmp(pe32.szExeFile, "KAM-Flow.exe") == 0) {
                         HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe32.th32ProcessID);
                         if (hProc) {
-                            TerminateProcess(hProc, 1);
+                            if (TerminateProcess(hProc, 1) && State::globalDebugMode) {
+                                UI::LogDebug("[System] Terminated phantom KAM-Flow process (PID %lu) from previous crash.",
+                                             pe32.th32ProcessID);
+                            }
                             CloseHandle(hProc);
                         }
                     }
@@ -263,13 +279,16 @@ int main(int argc, char* argv[]) {
 
             // Deferred Ignition: Start threads immediately once the UI sets the role
             if (!subsystemsStarted && State::currentRole != State::AppRole::NONE) {
+                timerGuard.Engage();
                 if (State::currentRole == State::AppRole::CLIENT) {
                     if (State::globalDebugMode) UI::LogDebug("[Role] CLIENT MODE locked in. Starting UDP Discovery.");
                     Network::StartDiscoveryListener();
                     ClipboardManager::Start();
                 } else if (State::currentRole == State::AppRole::SERVER) {
                     if (State::globalDebugMode) UI::LogDebug("[Role] SERVER MODE locked in.");
-                    Network::StartServer(8080);
+                    if (!Network::StartServer(8080)) {
+                        UI::LogDebug("[Error] Network::StartServer(8080) failed! Server is not listening.");
+                    }
                     // If audio mixing is enabled in the config, start the renderer now.
                     if (State::enableServerAudioMix) {
                         Audio::StartAudioRenderer();
@@ -287,7 +306,7 @@ int main(int argc, char* argv[]) {
         
         // --- GRACEFUL DATA PERSISTENCE ---
         // Save the precise state of all checkboxes right before the window collapses
-        Config::SaveConfig("127.0.0.1", 8080);
+        Config::SaveConfig();
         
         UI::Shutdown();
     }
