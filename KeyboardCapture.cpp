@@ -25,6 +25,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 namespace Input {
@@ -81,12 +82,13 @@ namespace Input {
             // Keyboard events are never coalesced — each keypress/release must
             // be delivered individually to preserve correct modifier state.
             if (hasPayload) {
-                uint64_t elapsedMs = 0;
+                int64_t elapsedMs = 0;
                 SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
                 if (ctrl != INVALID_SOCKET) {
-                    uint64_t t0 = GetTickCount64();
+                    auto t0 = std::chrono::steady_clock::now();
                     Network::SendToClient(ctrl, Network::MessageType::EVENT_KEYBOARD, &p, sizeof(p));
-                    elapsedMs = GetTickCount64() - t0;
+                    elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
                 }
                 if ((depth >= 16 || elapsedMs > 50) && State::globalDebugMode) {
                     static DebugLog::RateLimitState kbdPerfRate;
@@ -94,8 +96,8 @@ namespace Input {
                     if (kbdPerfRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
                         char supBuf[32] = "";
                         if (suppressed > 0) snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
-                        UI::LogDebug("[Input Perf] WARNING: Keyboard queue backlog (depth=%zu, send=%llums%s).",
-                                     depth, static_cast<unsigned long long>(elapsedMs), supBuf);
+                        UI::LogDebug("[Input Perf] WARNING: Keyboard queue backlog (depth=%zu, send=%lldms%s).",
+                                     depth, static_cast<long long>(elapsedMs), supBuf);
                     }
                 }
             }

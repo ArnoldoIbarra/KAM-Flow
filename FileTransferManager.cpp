@@ -12,6 +12,7 @@
 
 #include "FileTransferManager.h"
 #include "StateManager.h"
+#include "NetworkMessages.h"
 #include "NetworkServer.h"
 #include "NetworkClient.h"
 #include "SecurityManager.h"
@@ -57,7 +58,7 @@ namespace FileTransfer {
     std::vector<SOCKET> g_activeSockets;
     std::atomic<bool> g_isTransferManagerRunning(true);
 
-    /// Guards the hardcoded OOB port (8082) against concurrent bind collisions.
+    /// Guards the OOB port (Network::DEFAULT_FILE_TRANSFER_PORT) against concurrent bind collisions.
     /// Only one file transfer stream may be active at a time. Checked before
     /// spawning OOB tasks and cleared when the task completes.
     std::atomic<bool> g_isOobPortInUse(false);
@@ -724,7 +725,7 @@ namespace FileTransfer {
 
         Network::FileAcceptPayload acceptPayload;
         acceptPayload.transferId = transferId;
-        acceptPayload.tcpPort = 8082; // Default out-of-band streaming port
+        acceptPayload.tcpPort = Network::DEFAULT_FILE_TRANSFER_PORT; // Default out-of-band streaming port
         
         if (State::currentRole == State::AppRole::SERVER) {
             auto info = std::make_shared<TransferThreadInfo>();
@@ -855,7 +856,7 @@ namespace FileTransfer {
      * @return void
      */
     void HandleFileAccept(SOCKET senderSocket, const Network::FileAcceptPayload& payload) {
-        // Enforce one-at-a-time: prevent a second OOB stream from colliding on port 8082.
+        // Enforce one-at-a-time: prevent a second OOB stream from colliding on the OOB port.
         bool expected = false;
         if (!g_isOobPortInUse.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
             if (State::globalDebugMode) UI::LogDebug("[FileTransfer] HandleFileAccept rejected for transfer %u: OOB port already in use.", payload.transferId);

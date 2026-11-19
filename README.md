@@ -235,9 +235,9 @@ If you manage Windows Firewall or third-party firewall software manually, allow 
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| `8080` | TCP & UDP | Main encrypted connection (control, keyboard, mouse, clipboard, audio) |
-| `8081` | UDP | Automatic local-network Server discovery |
-| `8082` | TCP | Encrypted file transfers |
+| `39240` | TCP & UDP | Main encrypted connection (control, keyboard, mouse, clipboard, audio) |
+| `39241` | UDP | Automatic local-network Server discovery |
+| `39242` | TCP | Encrypted file transfers |
 
 ### Using the Built-in Debug Log
 

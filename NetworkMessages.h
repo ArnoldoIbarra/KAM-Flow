@@ -26,6 +26,13 @@ namespace Network {
     /// Hard limit to prevent std::bad_alloc attacks (1 Megabyte, expanded for Clipboard sharing)
     const uint32_t MAX_PAYLOAD_SIZE = 1048576; 
 
+    /// Default TCP and UDP port for encrypted KVM control, input, clipboard, and media streams.
+    constexpr uint16_t DEFAULT_SERVER_PORT = 39240;
+    /// Default UDP port for local-network Server auto-discovery beacons.
+    constexpr uint16_t DEFAULT_DISCOVERY_PORT = 39241;
+    /// Default temporary TCP port for out-of-band encrypted file transfers.
+    constexpr uint16_t DEFAULT_FILE_TRANSFER_PORT = 39242;
+
     /**
      * @brief Identifies the type of data contained in the network packet.
      */

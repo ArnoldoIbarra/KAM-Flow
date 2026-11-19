@@ -969,7 +969,7 @@ namespace UI {
                         // Resolve the paired server's hostname for display
                         std::string pairedIP = "";
                         std::string pairedHostname = "Unknown";
-                        uint16_t pairedPort = 8080;
+                        uint16_t pairedPort = Network::DEFAULT_SERVER_PORT;
                         bool pairedOnline = false;
                         auto discoveredServers = Network::GetDiscoveredServers();
 

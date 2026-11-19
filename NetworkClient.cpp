@@ -654,15 +654,15 @@ void DiscoveryLoop() {
 
   sockaddr_in localAddr = {0};
   localAddr.sin_family = AF_INET;
-  localAddr.sin_port = htons(8081);
+  localAddr.sin_port = htons(DEFAULT_DISCOVERY_PORT);
   localAddr.sin_addr.s_addr = INADDR_ANY;
 
   if (bind(udpListenerSocket, (sockaddr *)&localAddr, sizeof(localAddr)) ==
       SOCKET_ERROR) {
     if (State::globalDebugMode)
       UI::LogDebug(
-          "[Network Client] UDP Bind failed on port 8081 (WSA Error: %d).",
-          WSAGetLastError());
+          "[Network Client] UDP Bind failed on port %u (WSA Error: %d).",
+          static_cast<unsigned int>(DEFAULT_DISCOVERY_PORT), WSAGetLastError());
     closesocket(udpListenerSocket);
     udpListenerSocket = INVALID_SOCKET;
     return;
@@ -673,7 +673,8 @@ void DiscoveryLoop() {
              sizeof(timeout));
 
   if (State::globalDebugMode)
-    UI::LogDebug("[Network Client] Listening for UDP Beacons on port 8081...");
+    UI::LogDebug("[Network Client] Listening for UDP Beacons on port %u...",
+                 static_cast<unsigned int>(DEFAULT_DISCOVERY_PORT));
 
   while (isDiscoveryRunning) {
     char buffer[1024];

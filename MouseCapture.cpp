@@ -199,9 +199,11 @@ namespace Input {
                 auto sendMousePayload = [&](const Network::MousePayload& payload) {
                     SOCKET ctrl = Network::g_controllingClientSocket.load(std::memory_order_relaxed);
                     if (ctrl != INVALID_SOCKET) {
-                        uint64_t t0 = GetTickCount64();
+                        auto t0 = std::chrono::steady_clock::now();
                         Network::SendToClient(ctrl, Network::MessageType::EVENT_MOUSE, &payload, sizeof(payload));
-                        if ((GetTickCount64() - t0) > 15) {
+                        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+                        if (elapsedMs > 15) {
                             ++slowSends;
                         }
                     }

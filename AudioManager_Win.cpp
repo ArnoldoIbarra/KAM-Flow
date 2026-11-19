@@ -621,7 +621,9 @@ namespace Audio {
             // 7. Main capture streaming loop for this device
             bool deviceInvalidated = false;
             auto lastRealPacketTime = std::chrono::steady_clock::now() - std::chrono::milliseconds(200);
-            auto nextSilenceDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(15);
+            auto nextSilenceDeadline = std::chrono::steady_clock::now();
+            int64_t lastPacketDurationMs = 10;
+            bool silenceActive = false;
             auto capPerfStart = std::chrono::steady_clock::now();
             uint32_t discontinuityCount = 0;
             uint32_t silenceClockSlips = 0;
@@ -637,16 +639,17 @@ namespace Audio {
                 }
                 
                 if (packetLength == 0) {
-                    // When no application is rendering audio on the client, or during natural pauses
-                    // in media/dialogue, WASAPI Loopback returns packetLength == 0.
-                    // Wait 15ms (1.5 WASAPI 10ms engine periods) before synthesizing silence so transient
-                    // inter-buffer gaps during video playback never inject extra frames, then advance
-                    // nextSilenceDeadline by fixed 10ms phase increments (never `= now`) to eliminate
-                    // cumulative ~25% silence clock drift.
+                    // Wait >=30ms (or packetDuration + 15ms) before synthesizing keep-alive silence so normal
+                    // browser/engine packet gaps during active playback never inject extra frames.
                     auto now = std::chrono::steady_clock::now();
                     auto idleDurationMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRealPacketTime).count();
+                    const int64_t idleThresholdMs = ComputeIdleSilenceThresholdMs(lastPacketDurationMs);
 
-                    if (idleDurationMs >= 15) {
+                    if (idleDurationMs >= idleThresholdMs) {
+                        if (!silenceActive) {
+                            silenceActive = true;
+                            nextSilenceDeadline = now;
+                        }
                         static thread_local std::vector<BYTE> idleSilenceBuffer;
                         UINT32 framesPer10ms = targetWaveFormat.nSamplesPerSec / 100;
                         UINT32 dataSize = framesPer10ms * targetWaveFormat.nBlockAlign;
@@ -654,7 +657,7 @@ namespace Audio {
                             idleSilenceBuffer.assign(dataSize, 0);
                         }
                         int sentCount = 0;
-                        while (now >= nextSilenceDeadline && sentCount < 3) {
+                        while (now >= nextSilenceDeadline && sentCount < 2) {
                             Network::SendToServer(Network::MessageType::EVENT_AUDIO_DATA, idleSilenceBuffer.data(), dataSize);
                             nextSilenceDeadline += std::chrono::milliseconds(10);
                             ++sentCount;
@@ -678,9 +681,12 @@ namespace Audio {
                             if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
                                 ++discontinuityCount;
                             }
-                            // Active audio frames captured from WASAPI: update real packet timestamp and phase-locked deadline
+                            int64_t packetDurMs = (targetWaveFormat.nSamplesPerSec > 0)
+                                ? (static_cast<int64_t>(numFramesAvailable) * 1000LL / static_cast<int64_t>(targetWaveFormat.nSamplesPerSec))
+                                : 10LL;
+                            lastPacketDurationMs = (std::max)(packetDurMs, static_cast<int64_t>(10));
                             lastRealPacketTime = std::chrono::steady_clock::now();
-                            nextSilenceDeadline = lastRealPacketTime + std::chrono::milliseconds(10);
+                            silenceActive = false;
 
                             UINT32 dataSize = numFramesAvailable * targetWaveFormat.nBlockAlign;
                             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
@@ -1070,8 +1076,6 @@ namespace Audio {
                                     ? (1000.0f * static_cast<float>(availableBytes) / static_cast<float>(bytesPerSec))
                                     : 0.0f;
                                 float targetMs = static_cast<float>(State::audioJitterBufferMs.load(std::memory_order_relaxed));
-                                float lowDeadbandMs = (std::max)(18.0f, targetMs * 0.65f);
-                                float highDeadbandMs = targetMs * 1.60f + 15.0f;
 
                                 if (availableFrames >= numFramesAvailable) {
                                     sampledBufMs = currentBufferMs;
@@ -1079,8 +1083,8 @@ namespace Audio {
                                     queue->wasBuffering = false;
                                     queue->needsFadeIn = false;
 
-                                    bool insideDeadband = (currentBufferMs >= lowDeadbandMs && currentBufferMs <= highDeadbandMs);
-                                    double rate = (currentBufferMs < lowDeadbandMs) ? 0.9980 : 1.0020;
+                                    const double rate = ComputePlaybackRate(currentBufferMs, targetMs);
+                                    const bool insideDeadband = (rate == 1.0);
                                     size_t maxNeededFrames = static_cast<size_t>(
                                         std::ceil(queue->resamplePhase + static_cast<double>(numFramesAvailable) * rate)) + 3;
 
@@ -2041,32 +2045,43 @@ namespace Audio {
             AudioFormat format;
             if (Network::GetServerAudioFormat(format)) {
                 size_t bytesPerSec = format.sampleRate * format.channels * (format.bitDepth / 8);
-                
+                size_t frameSize = format.channels * (format.bitDepth / 8);
                 float jitterTargetMs = static_cast<float>(State::audioJitterBufferMs);
-                // +12ms hysteresis on buffering exit ensures the very first 10ms WASAPI callback
-                // leaves the queue centered around jitterTargetMs instead of immediately below it.
-                float releaseMs = jitterTargetMs + 12.0f;
-                size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (releaseMs / 1000.0f));
+                const BufferBounds bounds = ComputeBufferBounds(jitterTargetMs);
+
+                size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (bounds.releaseMs / 1000.0f));
+                if (frameSize > 0) {
+                    minBufferThreshold -= (minBufferThreshold % frameSize);
+                }
                 if (g_clientMicQueue.isBuffering && g_clientMicQueue.buffer.Size() >= minBufferThreshold) {
                     g_clientMicQueue.isBuffering = false;
                     g_clientMicQueue.wasBuffering = true;  // Signal fade-in ramp on the next render callback
                 }
 
-                // Target latency maximum: Provide a massive burst ceiling to gracefully absorb network spikes
-                // or CPU contention without forcefully dropping audio packets.
-                const float LATENCY_TARGET_MS = (static_cast<float>(jitterTargetMs) * 3.0f) + 150.0f;
-                size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (LATENCY_TARGET_MS / 1000.0f));
+                // Cap post-starvation burst tail while still waiting for the first render callback,
+                // otherwise an accumulated Wi-Fi packet dump causes immediate overrun/latency spike.
+                size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (bounds.maxBufferMs / 1000.0f));
+                if (frameSize > 0 && g_clientMicQueue.wasBuffering && g_clientMicQueue.buffer.Size() > minBufferThreshold) {
+                    size_t staleExcess = g_clientMicQueue.buffer.Size() - minBufferThreshold;
+                    staleExcess -= (staleExcess % frameSize);
+                    if (staleExcess > 0) {
+                        g_clientMicQueue.buffer.Drop(staleExcess);
+                    }
+                } else if (frameSize > 0 && g_clientMicQueue.buffer.Size() > maxBufferSize) {
+                    size_t trimTargetBytes = static_cast<size_t>(bytesPerSec * (bounds.highDeadbandMs / 1000.0f));
+                    size_t excess = (g_clientMicQueue.buffer.Size() > trimTargetBytes)
+                        ? (g_clientMicQueue.buffer.Size() - trimTargetBytes)
+                        : 0;
+                    excess -= (excess % frameSize);
 
-                if (g_clientMicQueue.buffer.Size() > maxBufferSize) {
-                    size_t excess = g_clientMicQueue.buffer.Size() - maxBufferSize;
-                    size_t frameSize = format.channels * (format.bitDepth / 8);
-                    excess = excess - (excess % frameSize);
-                    
                     if (excess > 0) {
                         droppedOverrun = true;
-                        loggedTargetMs = LATENCY_TARGET_MS;
+                        loggedTargetMs = bounds.maxBufferMs;
                         g_clientMicQueue.overrunCount.fetch_add(1, std::memory_order_relaxed);
                         g_clientMicQueue.buffer.Drop(excess);
+                        g_clientMicQueue.needsFadeIn = true;
+                        g_clientMicQueue.hasHermiteHistory = false;
+                        g_clientMicQueue.resamplePhase = 0.0;
                     }
                 }
             }
@@ -2129,35 +2144,44 @@ namespace Audio {
             // Bounded buffer logic.
             if (g_hasRenderFormat) {
                 size_t bytesPerSec = g_serverRenderFormat.sampleRate * g_serverRenderFormat.channels * (g_serverRenderFormat.bitDepth / 8);
-                
+                size_t frameSize = g_serverRenderFormat.channels * (g_serverRenderFormat.bitDepth / 8);
                 float jitterTargetMs = static_cast<float>(State::audioJitterBufferMs);
-                
-                // +12ms pre-fill hysteresis prevents immediate depletion on the first 10ms render callback
-                float releaseMs = jitterTargetMs + 12.0f;
-                size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (releaseMs / 1000.0f));
+                const BufferBounds bounds = ComputeBufferBounds(jitterTargetMs);
+
+                size_t minBufferThreshold = static_cast<size_t>(bytesPerSec * (bounds.releaseMs / 1000.0f));
+                if (frameSize > 0) {
+                    minBufferThreshold -= (minBufferThreshold % frameSize);
+                }
                 if (pQueue->isBuffering && pQueue->buffer.Size() >= minBufferThreshold) {
                     pQueue->isBuffering = false;
                     pQueue->wasBuffering = true;  // Signal fade-in ramp on the next render callback
                 }
 
-                // Target latency maximum: Provide a massive burst ceiling to gracefully absorb network spikes
-                // or CPU contention without forcefully dropping audio packets.
-                const float LATENCY_TARGET_MS = (static_cast<float>(jitterTargetMs) * 3.0f) + 150.0f;
-                
-                size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (LATENCY_TARGET_MS / 1000.0f));
+                // Fresh-tail cap while waiting for the first render callback after re-buffering:
+                // discards stalled burst backlog so playback resumes on fresh ~releaseMs audio instead of hitting maxBufferMs.
+                size_t maxBufferSize = static_cast<size_t>(bytesPerSec * (bounds.maxBufferMs / 1000.0f));
+                if (frameSize > 0 && pQueue->wasBuffering && pQueue->buffer.Size() > minBufferThreshold) {
+                    size_t staleExcess = pQueue->buffer.Size() - minBufferThreshold;
+                    staleExcess -= (staleExcess % frameSize);
+                    if (staleExcess > 0) {
+                        pQueue->buffer.Drop(staleExcess);
+                    }
+                } else if (frameSize > 0 && pQueue->buffer.Size() > maxBufferSize) {
+                    // Single crossfaded trim back to highDeadbandMs instead of staying pinned at the overrun ceiling.
+                    size_t trimTargetBytes = static_cast<size_t>(bytesPerSec * (bounds.highDeadbandMs / 1000.0f));
+                    size_t excess = (pQueue->buffer.Size() > trimTargetBytes)
+                        ? (pQueue->buffer.Size() - trimTargetBytes)
+                        : 0;
+                    excess -= (excess % frameSize);
 
-                if (pQueue->buffer.Size() > maxBufferSize) {
-                    size_t excess = pQueue->buffer.Size() - maxBufferSize;
-                    
-                    // Align to frame boundaries to prevent static/clipping from split samples
-                    size_t frameSize = g_serverRenderFormat.channels * (g_serverRenderFormat.bitDepth / 8);
-                    excess = excess - (excess % frameSize);
-                    
                     if (excess > 0) {
                         droppedOverrun = true;
-                        loggedTargetMs = LATENCY_TARGET_MS;
+                        loggedTargetMs = bounds.maxBufferMs;
                         pQueue->overrunCount.fetch_add(1, std::memory_order_relaxed);
                         pQueue->buffer.Drop(excess);
+                        pQueue->needsFadeIn = true;
+                        pQueue->hasHermiteHistory = false;
+                        pQueue->resamplePhase = 0.0;
                     }
                 }
             }

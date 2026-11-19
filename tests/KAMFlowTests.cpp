@@ -9,9 +9,11 @@
  * @brief Lightweight deterministic CTest unit test suite for KAM-Flow core utilities.
  */
 
+#include "AudioManager.h"
 #include "DebugLog.h"
 #include "NetworkMessages.h"
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -386,6 +388,86 @@ namespace {
                   DebugLog::Category::Perf);
         EXPECT_EQ(DebugLog::ClassifyMessage("[Session Summary] 'LAPTOP' (192.168.1.5) ended after 120.0s | Transport=UDP | UDP rx=500 lost=0 ooo=0 stale=0 dup=0 | TCP stalls=0"),
                   DebugLog::Category::Perf);
+        return true;
+    }
+
+    // --- AUDIO BURST & PACING TESTS (v3.5.4) ---
+
+    KAM_TEST(Audio_BufferBoundsOrdering) {
+        const float targets[] = { 20.0f, 40.0f, 80.0f, 200.0f };
+        for (float t : targets) {
+            const Audio::BufferBounds b = Audio::ComputeBufferBounds(t);
+            EXPECT_TRUE(b.lowDeadbandMs < t);
+            EXPECT_TRUE(t < b.releaseMs);
+            EXPECT_TRUE(b.releaseMs < b.highDeadbandMs);
+            EXPECT_TRUE(b.highDeadbandMs < b.maxBufferMs);
+        }
+
+        const Audio::BufferBounds b40 = Audio::ComputeBufferBounds(40.0f);
+        EXPECT_TRUE(std::fabs(b40.lowDeadbandMs - 26.0f) < 0.001f);
+        EXPECT_TRUE(std::fabs(b40.releaseMs - 52.0f) < 0.001f);
+        EXPECT_TRUE(std::fabs(b40.highDeadbandMs - 79.0f) < 0.001f);
+        EXPECT_TRUE(std::fabs(b40.maxBufferMs - 200.0f) < 0.001f);
+        return true;
+    }
+
+    KAM_TEST(Audio_PlaybackRateDeadbandBitPerfect) {
+        EXPECT_TRUE(Audio::ComputePlaybackRate(26.0f, 40.0f) == 1.0);
+        EXPECT_TRUE(Audio::ComputePlaybackRate(52.0f, 40.0f) == 1.0);
+        EXPECT_TRUE(Audio::ComputePlaybackRate(79.0f, 40.0f) == 1.0);
+        EXPECT_TRUE(std::fabs(Audio::ComputePlaybackRate(25.9f, 40.0f) - 0.9980) < 1e-9);
+        EXPECT_TRUE(std::fabs(Audio::ComputePlaybackRate(80.0f, 40.0f) - 1.0020) < 1e-9);
+        EXPECT_TRUE(std::fabs(Audio::ComputePlaybackRate(119.0f, 40.0f) - 1.0020) < 1e-9);
+        return true;
+    }
+
+    KAM_TEST(Audio_PlaybackRateTieredBacklogDrain) {
+        const double midRate = Audio::ComputePlaybackRate(159.0f, 40.0f);
+        EXPECT_TRUE(midRate > 1.0020);
+        EXPECT_TRUE(midRate < 1.0075);
+        EXPECT_TRUE(std::fabs(midRate - 1.00475) < 1e-6);
+
+        const double maxEdge = Audio::ComputePlaybackRate(199.0f, 40.0f);
+        const double maxClamped = Audio::ComputePlaybackRate(270.0f, 40.0f);
+        EXPECT_TRUE(std::fabs(maxEdge - 1.0075) < 1e-9);
+        EXPECT_TRUE(std::fabs(maxClamped - 1.0075) < 1e-9);
+        return true;
+    }
+
+    KAM_TEST(Audio_IdleSilenceThresholdAdaptsToPacketDuration) {
+        EXPECT_EQ(Audio::ComputeIdleSilenceThresholdMs(0), static_cast<int64_t>(30));
+        EXPECT_EQ(Audio::ComputeIdleSilenceThresholdMs(10), static_cast<int64_t>(30));
+        EXPECT_EQ(Audio::ComputeIdleSilenceThresholdMs(20), static_cast<int64_t>(35));
+        EXPECT_EQ(Audio::ComputeIdleSilenceThresholdMs(22), static_cast<int64_t>(37));
+        return true;
+    }
+
+    KAM_TEST(NetworkMessages_DefaultPortsValidAndDistinct) {
+        constexpr uint16_t serverPort = Network::DEFAULT_SERVER_PORT;
+        constexpr uint16_t discoveryPort = Network::DEFAULT_DISCOVERY_PORT;
+        constexpr uint16_t transferPort = Network::DEFAULT_FILE_TRANSFER_PORT;
+
+        EXPECT_EQ(serverPort, static_cast<uint16_t>(39240));
+        EXPECT_EQ(discoveryPort, static_cast<uint16_t>(39241));
+        EXPECT_EQ(transferPort, static_cast<uint16_t>(39242));
+
+        EXPECT_TRUE(serverPort != discoveryPort);
+        EXPECT_TRUE(serverPort != transferPort);
+        EXPECT_TRUE(discoveryPort != transferPort);
+
+        const uint16_t ports[] = { serverPort, discoveryPort, transferPort };
+        for (uint16_t p : ports) {
+            EXPECT_TRUE(p >= 1024 && p <= 49151);
+            EXPECT_TRUE(p < 8000 || p > 8999);
+        }
+
+        Network::UDPBeaconPayload beacon{};
+        beacon.tcpPort = serverPort;
+        EXPECT_EQ(beacon.tcpPort, static_cast<uint16_t>(39240));
+
+        Network::FileAcceptPayload accept{};
+        accept.tcpPort = transferPort;
+        EXPECT_EQ(accept.tcpPort, static_cast<uint16_t>(39242));
         return true;
     }
 

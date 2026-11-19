@@ -27,6 +27,7 @@
 
 #include "MouseCapture.h"
 #include "KeyboardCapture.h"
+#include "NetworkMessages.h"
 #include "NetworkServer.h"
 #include "NetworkClient.h"
 #include "StateManager.h"
@@ -286,8 +287,9 @@ int main(int argc, char* argv[]) {
                     ClipboardManager::Start();
                 } else if (State::currentRole == State::AppRole::SERVER) {
                     if (State::globalDebugMode) UI::LogDebug("[Role] SERVER MODE locked in.");
-                    if (!Network::StartServer(8080)) {
-                        UI::LogDebug("[Error] Network::StartServer(8080) failed! Server is not listening.");
+                    if (!Network::StartServer(Network::DEFAULT_SERVER_PORT)) {
+                        UI::LogDebug("[Error] Network::StartServer(%u) failed! Server is not listening.",
+                                     static_cast<unsigned int>(Network::DEFAULT_SERVER_PORT));
                     }
                     // If audio mixing is enabled in the config, start the renderer now.
                     if (State::enableServerAudioMix) {

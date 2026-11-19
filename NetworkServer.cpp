@@ -97,6 +97,8 @@ std::thread udpListenerThread;
 std::mutex serverUdpSendMutex;
 /// Tracks whether StartServer acquired a WinSock reference for this session.
 static std::atomic<bool> g_serverWsaInitialized{false};
+/// Active server TCP/UDP listening port recorded by StartServer.
+static std::atomic<uint16_t> g_serverPort{DEFAULT_SERVER_PORT};
 /// Signals GetConnectedClients() to immediately refresh its cached snapshot after any client list mutation.
 static std::atomic<bool> g_clientsCacheDirty{true};
 /// Monotonic server-wide UDP stats accumulated from disconnected/evicted clients so 30s deltas never underflow.
@@ -349,12 +351,12 @@ void UDPBeaconLoop(uint16_t tcpPort) {
 
   sockaddr_in broadcastAddr;
   broadcastAddr.sin_family = AF_INET;
-  broadcastAddr.sin_port = htons(8081);
+  broadcastAddr.sin_port = htons(DEFAULT_DISCOVERY_PORT);
   broadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
 
   sockaddr_in localhostAddr;
   localhostAddr.sin_family = AF_INET;
-  localhostAddr.sin_port = htons(8081);
+  localhostAddr.sin_port = htons(DEFAULT_DISCOVERY_PORT);
   inet_pton(AF_INET, "127.0.0.1", &localhostAddr.sin_addr);
 
   char hostname[32] = "KAM-Flow-Server";
@@ -392,7 +394,7 @@ void UDPBeaconLoop(uint16_t tcpPort) {
           if (ip != 0 && mask != 0) {
             sockaddr_in subnetBroadcast = {0};
             subnetBroadcast.sin_family = AF_INET;
-            subnetBroadcast.sin_port = htons(8081);
+            subnetBroadcast.sin_port = htons(DEFAULT_DISCOVERY_PORT);
             subnetBroadcast.sin_addr.s_addr = (ip & mask) | (~mask);
             sendto(udpSocket, buffer, sizeof(buffer), 0,
                    (sockaddr *)&subnetBroadcast, sizeof(subnetBroadcast));
@@ -410,8 +412,8 @@ void UDPBeaconLoop(uint16_t tcpPort) {
 
     if (!loggedBeaconStart && State::globalDebugMode) {
       loggedBeaconStart = true;
-      UI::LogDebug("[Network Server] UDP Discovery Beacon active on %d IPv4 interface(s) (port 8081).",
-                   ifaceCount);
+      UI::LogDebug("[Network Server] UDP Discovery Beacon active on %d IPv4 interface(s) (port %u).",
+                   ifaceCount, static_cast<unsigned int>(DEFAULT_DISCOVERY_PORT));
     }
 
     // Fallback global broadcast and loopback for local 1-PC testing
@@ -830,11 +832,12 @@ void AcceptClientsLoop() {
         }
       } else if (header.magic != PACKET_MAGIC) {
         if (State::globalDebugMode) {
-          // Detect common HTTP probes (e.g., 0x20544547 is "GET ", 0x54534F50 is "POST") on port 8080
+          // Detect common HTTP probes (e.g., 0x20544547 is "GET ", 0x54534F50 is "POST")
           // and log them cleanly without alarming "Auth failed" messages.
           if (header.magic == 0x20544547 || header.magic == 0x54534F50) {
-            UI::LogDebug("[Network Server] HTTP probe ignored from %s:%d (received HTTP verb on port 8080).",
-                         clientIpStr, clientPort);
+            UI::LogDebug("[Network Server] HTTP probe ignored from %s:%d (received HTTP verb on port %u).",
+                         clientIpStr, clientPort,
+                         static_cast<unsigned int>(g_serverPort.load(std::memory_order_relaxed)));
           } else {
             UI::LogDebug("[Network Server] Auth failed for %s:%d: bad magic 0x%08X (expected 0x%08X).",
                          clientIpStr, clientPort, header.magic, PACKET_MAGIC);
@@ -891,50 +894,6 @@ void AcceptClientsLoop() {
               if (State::globalDebugMode)
                 UI::LogDebug("[Network Server] Client Authenticated: '%s' from %s:%d.",
                              auth.clientName, clientIpStr, clientPort);
-
-              // Immediately send the server's native audio format directly to
-              // the newly authenticated client. This is a critical handshake
-              // step that establishes the format standard for all network audio
-              // streams (both loopback and mic broadcast), even if Master Mix is
-              // toggled on later. We send it directly instead of broadcasting to
-              // ensure this specific client receives it.
-              {
-                Audio::AudioFormat serverFormat;
-                if (Audio::GetDefaultDeviceFormat(serverFormat)) {
-                  MessageType type = MessageType::EVENT_AUDIO_FORMAT;
-                  const void *payload = &serverFormat;
-                  size_t payloadSize = sizeof(serverFormat);
-
-                  PacketHeader h = {PACKET_MAGIC, type,
-                                    static_cast<uint32_t>(payloadSize),
-                                    ++serverTxSequence};
-                  std::vector<uint8_t> buffer;
-
-                  std::vector<uint8_t> ciphertext;
-                  h.payloadSize = static_cast<uint32_t>(
-                      payloadSize + 28); // 12-byte IV + 16-byte Tag
-                  if (Security::EncryptPayload(payload, payloadSize, &h,
-                                               sizeof(h), ciphertext)) {
-                    buffer.resize(sizeof(h) + ciphertext.size());
-                    memcpy(buffer.data(), &h, sizeof(h));
-                    memcpy(buffer.data() + sizeof(h), ciphertext.data(),
-                           ciphertext.size());
-                  } else if (State::globalDebugMode) {
-                    UI::LogDebug("[Network Server] WARNING: Failed to encrypt audio format handshake for '%s'.",
-                                 auth.clientName);
-                  }
-
-                  if (!buffer.empty()) {
-                    if (!SendExact(clientSocket, buffer.data(), buffer.size()) && State::globalDebugMode) {
-                      UI::LogDebug("[Network Server] WARNING: Failed to send audio format handshake to '%s' (WSA Error: %d).",
-                                   auth.clientName, WSAGetLastError());
-                    }
-                  }
-                } else if (State::globalDebugMode) {
-                  UI::LogDebug("[Network Server] WARNING: GetDefaultDeviceFormat failed; audio format handshake skipped for '%s'.",
-                               auth.clientName);
-                }
-              }
 
               // 10-second timeout gives 5× the heartbeat interval as margin,
               // preventing premature disconnects during gaming CPU stalls.
@@ -1002,6 +961,8 @@ void AcceptClientsLoop() {
                   Config::LoadClientLayout(safeName, targetX, targetY);
               bool usedSavedLayout = false;
 
+              // Register the authenticated session in activeClients BEFORE Slow/Blocking WASAPI
+              // format queries so the Client's immediate UDP handshake packet always matches.
               {
                 std::lock_guard<std::mutex> lock(clientsMutex);
                 bool occupied =
@@ -1065,8 +1026,11 @@ void AcceptClientsLoop() {
                 clientSendMutexes[clientSocket] =
                     std::make_shared<std::mutex>();
                 g_clientsCacheDirty.store(true, std::memory_order_release);
-                Config::SaveClientLayout(safeName, targetX, targetY);
               }
+
+              // Persist layout and initialize lock-free audio state outside clientsMutex.
+              Config::SaveClientLayout(safeName, targetX, targetY);
+              Audio::SetClientAudioState(clientSocket, true, 1.0f);
 
               if (State::globalDebugMode) {
                 UI::LogDebug("[Network Server] Placed '%s' at grid (%d, %d) (%s).",
@@ -1074,8 +1038,22 @@ void AcceptClientsLoop() {
                              usedSavedLayout ? "saved" : "auto-placed");
               }
 
-              // Initialize lock-free audio state outside clientsMutex
-              Audio::SetClientAudioState(clientSocket, true, 1.0f);
+              // Send the server's native audio format via SendToClient (serialized cleanly
+              // with concurrent EVENT_UDP_HANDSHAKE_ACK replies on the client send mutex).
+              {
+                Audio::AudioFormat serverFormat;
+                if (Audio::GetDefaultDeviceFormat(serverFormat)) {
+                  if (!SendToClient(clientSocket, MessageType::EVENT_AUDIO_FORMAT,
+                                    &serverFormat, sizeof(serverFormat)) &&
+                      State::globalDebugMode) {
+                    UI::LogDebug("[Network Server] WARNING: Failed to send audio format handshake to '%s' (WSA Error: %d).",
+                                 safeName, WSAGetLastError());
+                  }
+                } else if (State::globalDebugMode) {
+                  UI::LogDebug("[Network Server] WARNING: GetDefaultDeviceFormat failed; audio format handshake skipped for '%s'.",
+                               safeName);
+                }
+              }
 
               auto threadInfo = std::make_shared<ClientThreadInfo>();
               threadInfo->thread = std::thread(
@@ -1417,6 +1395,7 @@ bool StartServer(uint16_t port) {
   WSAIoctl(serverUdpSocket, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior),
            nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 
+  g_serverPort.store(port, std::memory_order_relaxed);
   isRunning = true;
   serverThread = std::thread([]() {
     ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
