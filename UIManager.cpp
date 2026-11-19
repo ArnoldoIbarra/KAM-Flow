@@ -263,6 +263,12 @@ namespace UI {
     bool g_isMinimizedToTray = false;
     /// Power notification registration handle for Modern Standby (S0ix) resume delivery.
     static HPOWERNOTIFY g_hPowerNotify = nullptr;
+    /// Broadcast message sent by Explorer when the taskbar/notification area is (re)created.
+    static UINT g_wmTaskbarCreated = 0;
+    /// Custom message posted by secondary launches to restore an existing hidden/minimized instance.
+    static UINT g_wmRestoreWindow = 0;
+    /// One-shot timer ID used to re-verify tray icon persistence shortly after system wake.
+    static constexpr UINT_PTR kTimerTrayVerifyAfterWake = 1;
 
     /**
      * @brief Initializes the System Tray icon structure.
@@ -277,7 +283,110 @@ namespace UI {
         g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         g_nid.uCallbackMessage = WM_TRAYICON;
         g_nid.hIcon = ::LoadIcon(GetModuleHandle(nullptr), MAKEINTRESOURCE(IDI_APP_ICON)); // Custom Application Icon
+        if (!g_nid.hIcon) {
+            g_nid.hIcon = ::LoadIcon(nullptr, IDI_APPLICATION);
+        }
         strncpy_s(g_nid.szTip, "KAM-Flow (Click to restore)", _TRUNCATE);
+    }
+
+    /**
+     * @brief Ensures a non-minimized window has a visible title bar on a live monitor work area.
+     * Prevents the window from remaining stranded off-screen after monitor disconnects or sleep/wake.
+     * @param hWnd Handle to the main application window.
+     * @return void
+     */
+    static void EnsureWindowOnScreen(HWND hWnd) {
+        if (!hWnd || ::IsIconic(hWnd)) {
+            return;
+        }
+        RECT rc = {};
+        if (!::GetWindowRect(hWnd, &rc)) {
+            return;
+        }
+        WindowBounds current = { rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top };
+        if (current.width < 300) {
+            current.width = (std::max)(g_windowW, 300);
+        }
+        if (current.height < 300) {
+            current.height = (std::max)(g_windowH, 300);
+        }
+
+        HMONITOR hMon = ::MonitorFromRect(&rc, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (!hMon || !::GetMonitorInfoA(hMon, &mi)) {
+            return;
+        }
+
+        if (!IsWindowTitleBarVisibleInWorkArea(current, mi.rcWork.left, mi.rcWork.top,
+                                               mi.rcWork.right, mi.rcWork.bottom)) {
+            const WindowBounds clamped = ClampWindowBoundsToWorkArea(
+                current, mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom);
+            ::SetWindowPos(hWnd, nullptr, clamped.x, clamped.y, clamped.width, clamped.height,
+                           SWP_NOZORDER | SWP_NOACTIVATE);
+            g_windowX = clamped.x;
+            g_windowY = clamped.y;
+            g_windowW = clamped.width;
+            g_windowH = clamped.height;
+            if (State::globalDebugMode) {
+                UI::LogDebug("[UI] Repositioned off-screen window onto visible monitor (%d,%d %dx%d).",
+                             clamped.x, clamped.y, clamped.width, clamped.height);
+            }
+        }
+    }
+
+    /**
+     * @brief Restores the main window from the system tray or minimized taskbar state and focuses it.
+     * Clears g_isMinimizedToTray before showing the window so synchronous WM_SHOWWINDOW stays consistent.
+     * @param hWnd Handle to the main application window.
+     * @return void
+     */
+    static void RestoreFromTray(HWND hWnd) {
+        if (g_isMinimizedToTray) {
+            ::Shell_NotifyIconA(NIM_DELETE, &g_nid);
+            g_isMinimizedToTray = false;
+        }
+        ::KillTimer(hWnd, kTimerTrayVerifyAfterWake);
+        ::ShowWindow(hWnd, SW_SHOW);
+        if (::IsIconic(hWnd)) {
+            ::ShowWindow(hWnd, SW_RESTORE);
+        }
+        EnsureWindowOnScreen(hWnd);
+        ::SetForegroundWindow(hWnd);
+    }
+
+    /**
+     * @brief Verifies or re-adds the notification tray icon while hidden; restores the window if tray registration fails.
+     * Prevents KAM-Flow from becoming stranded invisibly after Explorer restarts or sleep/wake.
+     * @param hWnd Handle to the main application window.
+     * @param reason Diagnostic label describing the trigger event (e.g., "PowerResume", "TaskbarCreated").
+     * @return void
+     */
+    static void EnsureTrayIconOrRestore(HWND hWnd, const char* reason) {
+        if (!g_isMinimizedToTray) {
+            return;
+        }
+        g_nid.uFlags &= ~NIF_INFO;
+        const bool modOk = (::Shell_NotifyIconA(NIM_MODIFY, &g_nid) != FALSE);
+        const bool addOk = modOk ? false : (::Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE);
+
+        switch (ResolveTrayRecoveryAction(g_isMinimizedToTray, modOk, addOk)) {
+            case TrayRecoveryAction::IconValid:
+                if (!modOk && addOk && State::globalDebugMode) {
+                    UI::LogDebug("[UI] System tray icon re-registered (%s).", reason ? reason : "unknown");
+                }
+                break;
+            case TrayRecoveryAction::RestoreWindow:
+                if (State::globalDebugMode) {
+                    UI::LogDebug("[UI] WARNING: System tray icon recovery failed (%s, err=%lu); restoring main window.",
+                                 reason ? reason : "unknown", ::GetLastError());
+                }
+                RestoreFromTray(hWnd);
+                break;
+            case TrayRecoveryAction::None:
+            default:
+                break;
+        }
     }
 
     /**
@@ -349,6 +458,14 @@ namespace UI {
      */
     LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam)) return true;
+        if (g_wmTaskbarCreated != 0 && msg == g_wmTaskbarCreated) {
+            EnsureTrayIconOrRestore(hWnd, "TaskbarCreated");
+            return 0;
+        }
+        if (g_wmRestoreWindow != 0 && msg == g_wmRestoreWindow) {
+            RestoreFromTray(hWnd);
+            return 0;
+        }
         switch (msg) {
             case WM_DROPFILES: {
                 if (!State::enableFileTransfer) {
@@ -371,19 +488,23 @@ namespace UI {
             }
             case WM_SYSCOMMAND:
                 if ((wParam & 0xFFF0) == SC_MINIMIZE && State::minimizeToTray) {
-                    ::ShowWindow(hWnd, SW_HIDE);
-                    ::Shell_NotifyIconA(NIM_ADD, &g_nid);
-                    g_isMinimizedToTray = true;
-                    return 0; // Handled, prevent default taskbar minimization
+                    g_nid.uFlags &= ~NIF_INFO;
+                    const bool trayAdded = (::Shell_NotifyIconA(NIM_ADD, &g_nid) != FALSE) ||
+                                           (::Shell_NotifyIconA(NIM_MODIFY, &g_nid) != FALSE);
+                    if (trayAdded) {
+                        g_isMinimizedToTray = true;
+                        ::ShowWindow(hWnd, SW_HIDE);
+                        return 0; // Handled, prevent default taskbar minimization
+                    }
+                    if (State::globalDebugMode) {
+                        UI::LogDebug("[UI] WARNING: Shell_NotifyIconA failed on minimize (err=%lu); minimizing to taskbar instead.",
+                                     ::GetLastError());
+                    }
                 }
                 break;
             case WM_TRAYICON:
                 if (lParam == WM_LBUTTONDBLCLK || lParam == WM_LBUTTONUP) {
-                    ::Shell_NotifyIconA(NIM_DELETE, &g_nid);
-                    ::ShowWindow(hWnd, SW_SHOW);
-                    ::ShowWindow(hWnd, SW_RESTORE);
-                    ::SetForegroundWindow(hWnd);
-                    g_isMinimizedToTray = false;
+                    RestoreFromTray(hWnd);
                 } else if (lParam == WM_RBUTTONUP) {
                     POINT pt;
                     ::GetCursorPos(&pt);
@@ -396,19 +517,38 @@ namespace UI {
                     
                     int cmd = ::TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hWnd, nullptr);
                     ::DestroyMenu(hMenu);
+                    ::PostMessageA(hWnd, WM_NULL, 0, 0);
                     
                     if (cmd == ID_TRAY_SHOW) {
-                        ::Shell_NotifyIconA(NIM_DELETE, &g_nid);
-                        ::ShowWindow(hWnd, SW_SHOW);
-                        ::ShowWindow(hWnd, SW_RESTORE);
-                        ::SetForegroundWindow(hWnd);
-                        g_isMinimizedToTray = false;
+                        RestoreFromTray(hWnd);
                     } else if (cmd == ID_TRAY_EXIT) {
                         ::PostQuitMessage(0);
                         isAppRunning = false;
                     }
                 }
                 return 0;
+            case WM_SHOWWINDOW:
+                if (wParam == TRUE && g_isMinimizedToTray) {
+                    ::Shell_NotifyIconA(NIM_DELETE, &g_nid);
+                    g_isMinimizedToTray = false;
+                    ::KillTimer(hWnd, kTimerTrayVerifyAfterWake);
+                    EnsureWindowOnScreen(hWnd);
+                }
+                break;
+            case WM_DISPLAYCHANGE:
+                if (g_isMinimizedToTray) {
+                    EnsureTrayIconOrRestore(hWnd, "DisplayChange");
+                } else if (!::IsIconic(hWnd) && ::IsWindowVisible(hWnd)) {
+                    EnsureWindowOnScreen(hWnd);
+                }
+                break;
+            case WM_TIMER:
+                if (wParam == kTimerTrayVerifyAfterWake) {
+                    ::KillTimer(hWnd, kTimerTrayVerifyAfterWake);
+                    EnsureTrayIconOrRestore(hWnd, "PostWakeVerify");
+                    return 0;
+                }
+                break;
             case WM_HOTKEY:
                 // Universal Safety Override (Ctrl+Alt+M) caught at the OS level
                 if (wParam == 1) {
@@ -433,15 +573,15 @@ namespace UI {
                     }
                 }
                 return 0;
-    case WM_MOVE:
-        if (!IsIconic(hWnd) && !IsZoomed(hWnd)) {
-            RECT rect;
-            if (GetWindowRect(hWnd, &rect)) {
-                g_windowX = rect.left;
-                g_windowY = rect.top;
-            }
-        }
-        break; // Let it fall through to DefWindowProc
+            case WM_MOVE:
+                if (!IsIconic(hWnd) && !IsZoomed(hWnd) && ::IsWindowVisible(hWnd)) {
+                    RECT rect;
+                    if (GetWindowRect(hWnd, &rect)) {
+                        g_windowX = rect.left;
+                        g_windowY = rect.top;
+                    }
+                }
+                break; // Let it fall through to DefWindowProc
             case 0x02E0: // WM_DPICHANGED
                 if (State::globalDebugMode) {
                     UINT newDpi = HIWORD(wParam);
@@ -458,21 +598,24 @@ namespace UI {
                 }
                 return 0;
             case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED && wParam != SIZE_MAXIMIZED) {
-            RECT rect;
-            if (GetWindowRect(hWnd, &rect)) {
-                g_windowW = rect.right - rect.left;
-                g_windowH = rect.bottom - rect.top;
-            }
-        }
+                if (wParam != SIZE_MINIMIZED && wParam != SIZE_MAXIMIZED && ::IsWindowVisible(hWnd)) {
+                    RECT rect;
+                    if (GetWindowRect(hWnd, &rect)) {
+                        g_windowW = rect.right - rect.left;
+                        g_windowH = rect.bottom - rect.top;
+                    }
+                }
                 if (wParam == SIZE_MINIMIZED) return 0;
-                if (pd3dDevice != nullptr) {
+                if (pd3dDevice != nullptr && pSwapChain != nullptr) {
                     CleanupRenderTarget();
                     HRESULT hrResize = pSwapChain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0);
-                    if (FAILED(hrResize) && State::globalDebugMode) {
-                        UI::LogDebug("[UI] ERROR: SwapChain ResizeBuffers failed (0x%08X).", hrResize);
+                    if (FAILED(hrResize)) {
+                        if (State::globalDebugMode) {
+                            UI::LogDebug("[UI] ERROR: SwapChain ResizeBuffers failed (0x%08X).", hrResize);
+                        }
+                    } else {
+                        CreateRenderTarget();
                     }
-                    CreateRenderTarget();
                 }
                 return 0;
             case WM_POWERBROADCAST:
@@ -509,6 +652,15 @@ namespace UI {
 
                     // Recover audio subsystem from WASAPI device invalidation and purge pre-sleep buffers
                     Audio::NotifySystemResumed();
+
+                    // Re-verify tray icon or window bounds after wake (Explorer/displays often reset across sleep).
+                    if (g_isMinimizedToTray) {
+                        EnsureTrayIconOrRestore(hWnd, "PowerResume");
+                        // Re-check 3s later in case Explorer finishes shell/notification re-init asynchronously after wake.
+                        ::SetTimer(hWnd, kTimerTrayVerifyAfterWake, 3000, nullptr);
+                    } else if (!::IsIconic(hWnd) && ::IsWindowVisible(hWnd)) {
+                        EnsureWindowOnScreen(hWnd);
+                    }
                 }
                 return TRUE;
             case WM_DESTROY:
@@ -639,14 +791,40 @@ namespace UI {
         g_windowW = GetPrivateProfileIntA("UI", "WindowW", 450, iniPath.c_str());
         g_windowH = GetPrivateProfileIntA("UI", "WindowH", 480, iniPath.c_str());
 
-        int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        int vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        int vRight = vLeft + GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int vBottom = vTop + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        WindowBounds initialBounds = { g_windowX, g_windowY, g_windowW, g_windowH };
+        if (initialBounds.width < 300) initialBounds.width = 450;
+        if (initialBounds.height < 300) initialBounds.height = 480;
 
-        if (g_windowX < vLeft || g_windowX > vRight - 100) g_windowX = 100;
-        if (g_windowY < vTop || g_windowY > vBottom - 100) g_windowY = 100;
-        if (g_windowW < 300) g_windowW = 450; if (g_windowH < 300) g_windowH = 480;
+        RECT desiredRect = {
+            initialBounds.x,
+            initialBounds.y,
+            initialBounds.x + initialBounds.width,
+            initialBounds.y + initialBounds.height
+        };
+        HMONITOR hInitialMon = ::MonitorFromRect(&desiredRect, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO initialMi = {};
+        initialMi.cbSize = sizeof(initialMi);
+        if (hInitialMon && ::GetMonitorInfoA(hInitialMon, &initialMi)) {
+            if (!IsWindowTitleBarVisibleInWorkArea(initialBounds,
+                                                   initialMi.rcWork.left, initialMi.rcWork.top,
+                                                   initialMi.rcWork.right, initialMi.rcWork.bottom)) {
+                initialBounds = ClampWindowBoundsToWorkArea(initialBounds,
+                                                            initialMi.rcWork.left, initialMi.rcWork.top,
+                                                            initialMi.rcWork.right, initialMi.rcWork.bottom);
+            }
+        } else {
+            int vLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int vRight = vLeft + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            int vBottom = vTop + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if (!IsWindowTitleBarVisibleInWorkArea(initialBounds, vLeft, vTop, vRight, vBottom)) {
+                initialBounds = ClampWindowBoundsToWorkArea(initialBounds, vLeft, vTop, vRight, vBottom);
+            }
+        }
+        g_windowX = initialBounds.x;
+        g_windowY = initialBounds.y;
+        g_windowW = initialBounds.width;
+        g_windowH = initialBounds.height;
 
         hwnd = ::CreateWindow(wc.lpszClassName, "KAM-Flow", WS_OVERLAPPEDWINDOW, g_windowX, g_windowY, g_windowW, g_windowH, nullptr, nullptr, wc.hInstance, nullptr);
         if (!hwnd) {
@@ -677,6 +855,25 @@ namespace UI {
                 UI::LogDebug("[UI] WARNING: ChangeWindowMessageFilterEx failed (err=%lu — drag-and-drop from non-elevated Explorer may be blocked).",
                              ::GetLastError());
             }
+        }
+
+        // Register and whitelist TaskbarCreated (Explorer restart) & single-instance restore past UIPI
+        g_wmTaskbarCreated = ::RegisterWindowMessageA("TaskbarCreated");
+        if (g_wmTaskbarCreated != 0) {
+            if (!::ChangeWindowMessageFilterEx(hwnd, g_wmTaskbarCreated, MSGFLT_ALLOW, nullptr) && State::globalDebugMode) {
+                UI::LogDebug("[UI] WARNING: ChangeWindowMessageFilterEx(TaskbarCreated) failed (err=%lu).", ::GetLastError());
+            }
+        } else if (State::globalDebugMode) {
+            UI::LogDebug("[UI] WARNING: RegisterWindowMessageA(TaskbarCreated) failed (err=%lu).", ::GetLastError());
+        }
+
+        g_wmRestoreWindow = ::RegisterWindowMessageA(kRestoreWindowMessageName);
+        if (g_wmRestoreWindow != 0) {
+            if (!::ChangeWindowMessageFilterEx(hwnd, g_wmRestoreWindow, MSGFLT_ALLOW, nullptr) && State::globalDebugMode) {
+                UI::LogDebug("[UI] WARNING: ChangeWindowMessageFilterEx(RestoreWindow) failed (err=%lu).", ::GetLastError());
+            }
+        } else if (State::globalDebugMode) {
+            UI::LogDebug("[UI] WARNING: RegisterWindowMessageA(RestoreWindow) failed (err=%lu).", ::GetLastError());
         }
 
         DXGI_SWAP_CHAIN_DESC sd;
@@ -1973,10 +2170,22 @@ namespace UI {
             s_lastNotifiedTransferId = 0;
         }
 
-        // Skip D3D rendering completely when minimized to save GPU and CPU wakeups
-        if (g_isMinimizedToTray) {
+        // Skip D3D rendering completely when hidden in tray or minimized to taskbar to save GPU/CPU wakeups
+        if (g_isMinimizedToTray || ::IsIconic(hwnd)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100)); // ~10Hz idle message pump throttle
             return;
+        }
+
+        if (!pd3dDevice || !pd3dDeviceContext || !pSwapChain) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return;
+        }
+        if (!pMainRenderTargetView) {
+            CreateRenderTarget();
+            if (!pMainRenderTargetView) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                return;
+            }
         }
 
         ImGui_ImplDX11_NewFrame();
@@ -1995,10 +2204,18 @@ namespace UI {
         pd3dDeviceContext->ClearRenderTargetView(pMainRenderTargetView, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         HRESULT hrPresent = pSwapChain->Present(1, 0); 
+        if (hrPresent == DXGI_STATUS_OCCLUDED) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            return;
+        }
         if (hrPresent == DXGI_ERROR_DEVICE_REMOVED || hrPresent == DXGI_ERROR_DEVICE_RESET) {
             // DX11 device lost (typically caused by sleep/wake, driver update, or GPU reset).
-            // Rebuild the entire D3D pipeline to recover gracefully instead of crashing.
+            // Shut down the DX11 ImGui backend before releasing old device handles, then
+            // re-bind ImGui to the newly created device so rendering never stays wedged.
             if (State::globalDebugMode) UI::LogDebug("[UI] DX11 Device Lost. Attempting recovery...");
+            if (ImGui::GetIO().BackendRendererUserData != nullptr) {
+                ImGui_ImplDX11_Shutdown();
+            }
             CleanupRenderTarget();
             if (pSwapChain) { pSwapChain->Release(); pSwapChain = nullptr; }
             if (pd3dDeviceContext) { pd3dDeviceContext->Release(); pd3dDeviceContext = nullptr; }
@@ -2027,7 +2244,7 @@ namespace UI {
             }
             if (SUCCEEDED(res)) {
                 CreateRenderTarget();
-                ImGui_ImplDX11_InvalidateDeviceObjects();
+                ImGui_ImplDX11_Init(pd3dDevice, pd3dDeviceContext);
                 ImGui_ImplDX11_CreateDeviceObjects();
                 if (State::globalDebugMode) {
                     UI::LogDebug("[UI] DX11 Device recovered (%s).",
@@ -2058,12 +2275,19 @@ namespace UI {
         WritePrivateProfileStringA("UI", "WindowW", std::to_string(g_windowW).c_str(), iniPath.c_str());
         WritePrivateProfileStringA("UI", "WindowH", std::to_string(g_windowH).c_str(), iniPath.c_str());
 
-        ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext();
+        if (ImGui::GetCurrentContext() != nullptr) {
+            if (ImGui::GetIO().BackendRendererUserData != nullptr) {
+                ImGui_ImplDX11_Shutdown();
+            }
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+        }
         CleanupRenderTarget();
         if (pSwapChain) { pSwapChain->Release(); pSwapChain = nullptr; }
         if (pd3dDeviceContext) { pd3dDeviceContext->Release(); pd3dDeviceContext = nullptr; }
         if (pd3dDevice) { pd3dDevice->Release(); pd3dDevice = nullptr; }
         if (hwnd) { 
+            ::KillTimer(hwnd, kTimerTrayVerifyAfterWake);
             if (g_hPowerNotify) {
                 ::UnregisterSuspendResumeNotification(g_hPowerNotify);
                 g_hPowerNotify = nullptr;

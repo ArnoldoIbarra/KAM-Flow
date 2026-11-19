@@ -13,6 +13,7 @@
 #include "DebugLog.h"
 #include "MouseCapture.h"
 #include "NetworkMessages.h"
+#include "UIManager.h"
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -648,6 +649,128 @@ namespace {
         EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(5000, 0, 1920), 65535);
         EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(100, 0, 1), 0);
         EXPECT_EQ(Input::ComputeAbsoluteVirtualCoord(100, 0, 0), 0);
+        return true;
+    }
+
+    // --- UI WINDOW VISIBILITY & TRAY RECOVERY TESTS (v3.5.7) ---
+
+    KAM_TEST(UI_WindowBoundsClampingAndTitleBarVisibility) {
+        // Standard 1080p work area (40px bottom taskbar)
+        constexpr int wL = 0, wT = 0, wR = 1920, wB = 1040;
+
+        // 1. Normal on-screen window stays visible
+        const UI::WindowBounds normal{100, 100, 841, 643};
+        EXPECT_TRUE(UI::IsWindowTitleBarVisibleInWorkArea(normal, wL, wT, wR, wB));
+
+        // 2. Windows iconic sentinel (-32000, -32000) is off-screen and clamped into work area
+        const UI::WindowBounds iconic{-32000, -32000, 841, 643};
+        EXPECT_TRUE(!UI::IsWindowTitleBarVisibleInWorkArea(iconic, wL, wT, wR, wB));
+        const UI::WindowBounds clampedIconic = UI::ClampWindowBoundsToWorkArea(iconic, wL, wT, wR, wB);
+        EXPECT_EQ(clampedIconic.x, 0);
+        EXPECT_EQ(clampedIconic.y, 0);
+        EXPECT_EQ(clampedIconic.width, 841);
+        EXPECT_EQ(clampedIconic.height, 643);
+        EXPECT_TRUE(UI::IsWindowTitleBarVisibleInWorkArea(clampedIconic, wL, wT, wR, wB));
+
+        // 3. Unplugged secondary monitor to the right (x=2560)
+        const UI::WindowBounds unpluggedRight{2560, 150, 600, 500};
+        EXPECT_TRUE(!UI::IsWindowTitleBarVisibleInWorkArea(unpluggedRight, wL, wT, wR, wB));
+        const UI::WindowBounds clampedRight = UI::ClampWindowBoundsToWorkArea(unpluggedRight, wL, wT, wR, wB);
+        EXPECT_EQ(clampedRight.x, 1920 - 600);
+        EXPECT_EQ(clampedRight.y, 150);
+        EXPECT_TRUE(UI::IsWindowTitleBarVisibleInWorkArea(clampedRight, wL, wT, wR, wB));
+
+        // 4. Title bar above top edge or below taskbar is rejected and clamped back
+        EXPECT_TRUE(!UI::IsWindowTitleBarVisibleInWorkArea({200, -20, 600, 480}, wL, wT, wR, wB));
+        EXPECT_TRUE(!UI::IsWindowTitleBarVisibleInWorkArea({200, 1020, 600, 480}, wL, wT, wR, wB));
+        const UI::WindowBounds clampedBottom = UI::ClampWindowBoundsToWorkArea({200, 1020, 600, 480}, wL, wT, wR, wB);
+        EXPECT_EQ(clampedBottom.y, 1040 - 480);
+        EXPECT_TRUE(UI::IsWindowTitleBarVisibleInWorkArea(clampedBottom, wL, wT, wR, wB));
+
+        // 5. Degenerate 0x0 size resets to 450x480 default
+        const UI::WindowBounds clampedZero = UI::ClampWindowBoundsToWorkArea({50, 50, 0, 0}, wL, wT, wR, wB);
+        EXPECT_EQ(clampedZero.width, 450);
+        EXPECT_EQ(clampedZero.height, 480);
+
+        // 6. Oversized window clamps to small work area (800x600)
+        const UI::WindowBounds clampedSmall = UI::ClampWindowBoundsToWorkArea({50, 50, 1200, 900}, 0, 0, 800, 600);
+        EXPECT_EQ(clampedSmall.x, 0);
+        EXPECT_EQ(clampedSmall.y, 0);
+        EXPECT_EQ(clampedSmall.width, 800);
+        EXPECT_EQ(clampedSmall.height, 600);
+
+        // 7. Negative-coordinate secondary monitor work area (-1920..0, 0..1040)
+        const UI::WindowBounds negMonOn{-1600, 120, 500, 400};
+        EXPECT_TRUE(UI::IsWindowTitleBarVisibleInWorkArea(negMonOn, -1920, 0, 0, 1040));
+        const UI::WindowBounds negMonOff{-2400, 120, 500, 400};
+        EXPECT_TRUE(!UI::IsWindowTitleBarVisibleInWorkArea(negMonOff, -1920, 0, 0, 1040));
+        const UI::WindowBounds clampedNeg = UI::ClampWindowBoundsToWorkArea(negMonOff, -1920, 0, 0, 1040);
+        EXPECT_EQ(clampedNeg.x, -1920);
+        EXPECT_EQ(clampedNeg.y, 120);
+        EXPECT_TRUE(UI::IsWindowTitleBarVisibleInWorkArea(clampedNeg, -1920, 0, 0, 1040));
+        return true;
+    }
+
+    KAM_TEST(UI_TrayRecoveryActionFallbackPolicy) {
+        using Act = UI::TrayRecoveryAction;
+        // Not hidden in tray -> None regardless of Shell_NotifyIcon results
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(false, false, false), Act::None);
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(false, true, false), Act::None);
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(false, false, true), Act::None);
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(false, true, true), Act::None);
+
+        // Hidden in tray with either NIM_MODIFY or NIM_ADD succeeding -> IconValid
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(true, true, false), Act::IconValid);
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(true, false, true), Act::IconValid);
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(true, true, true), Act::IconValid);
+
+        // Hidden in tray when both NIM_MODIFY and NIM_ADD fail -> RestoreWindow
+        EXPECT_EQ(UI::ResolveTrayRecoveryAction(true, false, false), Act::RestoreWindow);
+        return true;
+    }
+
+    KAM_TEST(Audio_ResolvePlaybackRateLiveSliderTargetSeek) {
+        // Steady-state (not seeking): behaves identically to ComputePlaybackRate
+        bool seeking = false;
+        EXPECT_TRUE(Audio::ResolvePlaybackRate(52.0f, 80.0f, seeking) == 1.0);
+        EXPECT_TRUE(Audio::ResolvePlaybackRate(143.0f, 80.0f, seeking) == 1.0);
+        EXPECT_TRUE(std::fabs(Audio::ResolvePlaybackRate(51.9f, 80.0f, seeking) - 0.9980) < 1e-9);
+        EXPECT_TRUE(std::fabs(Audio::ResolvePlaybackRate(143.1f, 80.0f, seeking) - 1.0020) < 1e-9);
+        EXPECT_TRUE(!seeking);
+
+        // Live upward slider change (40ms -> 80ms) when buffer sits at 52ms:
+        // Must seek upward at 0.9940x even though 52ms is inside 80ms's steady-state deadband.
+        seeking = true;
+        EXPECT_TRUE(std::fabs(Audio::ResolvePlaybackRate(52.0f, 80.0f, seeking) - 0.9940) < 1e-9);
+        EXPECT_TRUE(seeking);
+        EXPECT_TRUE(std::fabs(Audio::ResolvePlaybackRate(79.9f, 80.0f, seeking) - 0.9940) < 1e-9);
+        EXPECT_TRUE(seeking);
+        EXPECT_TRUE(Audio::ResolvePlaybackRate(80.0f, 80.0f, seeking) == 1.0);
+        EXPECT_TRUE(!seeking);
+
+        // Live downward slider change (160ms -> 40ms):
+        // Uses at least 1.0060x (or faster ComputePlaybackRate if >119ms bloated), then locks into [40, 55]ms.
+        seeking = true;
+        EXPECT_TRUE(std::fabs(Audio::ResolvePlaybackRate(110.0f, 40.0f, seeking) - 1.0060) < 1e-9);
+        EXPECT_TRUE(seeking);
+        EXPECT_TRUE(std::fabs(Audio::ResolvePlaybackRate(220.0f, 40.0f, seeking) - 1.0075) < 1e-9);
+        EXPECT_TRUE(seeking);
+        EXPECT_TRUE(Audio::ResolvePlaybackRate(55.0f, 40.0f, seeking) == 1.0);
+        EXPECT_TRUE(!seeking);
+        return true;
+    }
+
+    KAM_TEST(Audio_ConcealmentWarningClassifiedAsError) {
+        using Cat = DebugLog::Category;
+        EXPECT_EQ(DebugLog::ClassifyMessage(
+                      "[Audio] WARNING: Transient jitter underrun concealed (buf=0ms, target=80ms) — raise Jitter Buffer if persistent."),
+                  Cat::Error);
+        EXPECT_EQ(DebugLog::ClassifyMessage(
+                      "[Audio] WARNING: Transient mic jitter underrun concealed (target=80ms) — raise Jitter Buffer if persistent."),
+                  Cat::Error);
+        EXPECT_EQ(DebugLog::ClassifyMessage(
+                      "[Audio Perf] 30s Buf: min=10 avg=82 max=94ms (target=80ms) | Conceal=1 Starv=0 Overrun=0 | Hermite=-1/+0 | Jitter>25ms=0 Clip=0"),
+                  Cat::Perf);
         return true;
     }
 

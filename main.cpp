@@ -144,7 +144,20 @@ int main(int argc, char* argv[]) {
         HWND existingWindow = FindWindowA("KAMFlowUIClass", nullptr);
         
         if (existingWindow) {
-            // Healthy instance found — bring it to the foreground and exit.
+            // Grant foreground rights and ask the running instance to execute RestoreFromTray
+            // (which deletes any tray icon, clears g_isMinimizedToTray, and clamps off-screen bounds).
+            DWORD existingPid = 0;
+            ::GetWindowThreadProcessId(existingWindow, &existingPid);
+            if (existingPid != 0) {
+                ::AllowSetForegroundWindow(existingPid);
+            }
+            const UINT wmRestore = ::RegisterWindowMessageA(UI::kRestoreWindowMessageName);
+            DWORD_PTR msgResult = 0;
+            if (wmRestore != 0 &&
+                ::SendMessageTimeoutA(existingWindow, wmRestore, 0, 0, SMTO_ABORTIFHUNG, 1000, &msgResult)) {
+                return 0;
+            }
+            // Fallback if message registration failed or existing UI thread was unresponsive.
             ::ShowWindow(existingWindow, SW_SHOW);
             ::ShowWindow(existingWindow, SW_RESTORE);
             ::SetForegroundWindow(existingWindow);

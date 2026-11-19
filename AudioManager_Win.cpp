@@ -228,6 +228,8 @@ namespace Audio {
         double resamplePhase = 0.0;             // Fractional phase for edge-only 4-point Hermite drift correction
         float prevFramesFloat[3][8] = {{0.0f}}; // Prior 3 frames for C1-continuous 4-point Hermite interpolation
         bool hasHermiteHistory = false;
+        float appliedTargetMs = -1.0f;          // Last observed jitter target (detects live slider adjustments)
+        bool seekingTarget = false;             // True while converging smoothly onto an updated slider target
 
         void ResetStreamState() {
             buffer.Clear();
@@ -237,6 +239,8 @@ namespace Audio {
             starvationCount = 0;
             resamplePhase = 0.0;
             hasHermiteHistory = false;
+            appliedTargetMs = -1.0f;
+            seekingTarget = false;
             std::fill(std::begin(lastFrameFloat), std::end(lastFrameFloat), 0.0f);
             std::fill(std::begin(lastFrameInt16), std::end(lastFrameInt16), static_cast<int16_t>(0));
             for (int i = 0; i < 3; ++i) {
@@ -1076,14 +1080,21 @@ namespace Audio {
                                     ? (1000.0f * static_cast<float>(availableBytes) / static_cast<float>(bytesPerSec))
                                     : 0.0f;
                                 float targetMs = static_cast<float>(State::audioJitterBufferMs.load(std::memory_order_relaxed));
+                                sampledBufMs = currentBufferMs;
+
+                                if (queue->appliedTargetMs < 0.0f) {
+                                    queue->appliedTargetMs = targetMs;
+                                } else if (std::fabs(targetMs - queue->appliedTargetMs) >= 1.0f) {
+                                    queue->appliedTargetMs = targetMs;
+                                    queue->seekingTarget = true;
+                                }
 
                                 if (availableFrames >= numFramesAvailable) {
-                                    sampledBufMs = currentBufferMs;
                                     queue->starvationCount = 0;
                                     queue->wasBuffering = false;
                                     queue->needsFadeIn = false;
 
-                                    const double rate = ComputePlaybackRate(currentBufferMs, targetMs);
+                                    const double rate = ResolvePlaybackRate(currentBufferMs, targetMs, queue->seekingTarget);
                                     const bool insideDeadband = (rate == 1.0);
                                     size_t maxNeededFrames = static_cast<size_t>(
                                         std::ceil(queue->resamplePhase + static_cast<double>(numFramesAvailable) * rate)) + 3;
@@ -1236,6 +1247,21 @@ namespace Audio {
                                 }
                                 UI::LogDebug("[Audio] Buffer depleted: Re-buffering to %dms target%s.",
                                              State::audioJitterBufferMs.load(std::memory_order_relaxed), supBuf);
+                            }
+                        }
+
+                        if (didConceal && State::globalDebugMode) {
+                            static DebugLog::RateLimitState concealRate;
+                            uint32_t suppressed = 0;
+                            if (concealRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                                char supBuf[32] = "";
+                                if (suppressed > 0) {
+                                    snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+                                }
+                                UI::LogDebug("[Audio] WARNING: Transient jitter underrun concealed (buf=%.0fms, target=%dms%s) — raise Jitter Buffer if persistent.",
+                                             sampledBufMs >= 0.0f ? sampledBufMs : 0.0f,
+                                             State::audioJitterBufferMs.load(std::memory_order_relaxed),
+                                             supBuf);
                             }
                         }
 
@@ -1913,6 +1939,20 @@ namespace Audio {
                             if (now - lastMicStarvationLog > 5000) {
                                 UI::LogDebug("[Audio] Mic starvation recovery: Re-buffering stream.");
                                 lastMicStarvationLog = now;
+                            }
+                        }
+
+                        if (didMicConceal && State::globalDebugMode) {
+                            static DebugLog::RateLimitState micConcealRate;
+                            uint32_t suppressed = 0;
+                            if (micConcealRate.TryAcquire(GetTickCount64(), 5000, suppressed)) {
+                                char supBuf[32] = "";
+                                if (suppressed > 0) {
+                                    snprintf(supBuf, sizeof(supBuf), ", +%u suppressed", suppressed);
+                                }
+                                UI::LogDebug("[Audio] WARNING: Transient mic jitter underrun concealed (target=%dms%s) — raise Jitter Buffer if persistent.",
+                                             State::audioJitterBufferMs.load(std::memory_order_relaxed),
+                                             supBuf);
                             }
                         }
 

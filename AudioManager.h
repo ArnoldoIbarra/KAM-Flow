@@ -59,6 +59,23 @@ namespace Audio {
         return 1.0020 + rampFrac * 0.0055;
     }
 
+    /// Computes playback rate, smoothly seeking into [targetMs, targetMs + 15ms] at +/-0.60% after live slider changes.
+    inline double ResolvePlaybackRate(float currentBufferMs, float targetMs, bool& inOutSeekingTarget) {
+        const float safeTarget = (targetMs < 10.0f) ? 10.0f : targetMs;
+        if (inOutSeekingTarget) {
+            const float settleHighMs = safeTarget + 15.0f;
+            if (currentBufferMs >= safeTarget && currentBufferMs <= settleHighMs) {
+                inOutSeekingTarget = false;
+                return 1.0;
+            }
+            if (currentBufferMs < safeTarget) {
+                return 0.9940;
+            }
+            return (std::max)(1.0060, ComputePlaybackRate(currentBufferMs, safeTarget));
+        }
+        return ComputePlaybackRate(currentBufferMs, safeTarget);
+    }
+
     /// Computes the minimum idle gap (in ms) before client loopback capture injects synthetic keep-alive silence.
     inline int64_t ComputeIdleSilenceThresholdMs(int64_t lastPacketDurationMs) {
         const int64_t safeDuration = (lastPacketDurationMs > 0) ? lastPacketDurationMs : 10;
