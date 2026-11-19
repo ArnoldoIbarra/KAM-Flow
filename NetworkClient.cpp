@@ -26,6 +26,7 @@
 #include <bcrypt.h>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -94,6 +95,13 @@ std::thread clientUdpListenerThread;
 std::atomic<bool> isUdpActive{false};
 /// Ensures TCP media fallback is logged once per session rather than permanently silenced.
 std::atomic<bool> g_hasLoggedTcpFallback{false};
+/// Timestamp (GetTickCount64) when post-auth UDP handshake window began.
+std::atomic<uint64_t> g_udpHandshakeStartMs{0};
+/// Timestamp (GetTickCount64) of the last dispatched EVENT_RETURN_CONTROL for edge-burst debouncing.
+std::atomic<uint64_t> g_lastReturnControlTickMs{0};
+/// Synchronizes interruptible waits on the client heartbeat / UDP retry loop.
+std::mutex g_heartbeatCvMutex;
+std::condition_variable g_heartbeatCv;
 
 // UDP Discovery state variables.
 SOCKET udpListenerSocket = INVALID_SOCKET;
@@ -118,7 +126,16 @@ uint64_t connectionStartTime = 0;
 
 /// Exponential backoff delay for auto-reconnect (seconds). Doubles on each
 /// short-lived session, capped at 30s. Resets after a stable connection (>30s).
-int reconnectBackoffSeconds = 5;
+std::atomic<int> reconnectBackoffSeconds{ReconnectPolicy::kInitialDelaySec};
+/// Signals that the OS resumed from sleep/Modern Standby so reconnect skips backoff penalties.
+std::atomic<bool> g_systemJustResumed{false};
+/// Distinguishes non-recoverable errors (missing PIN, crypto/WinSock init) from transient offline retries.
+std::atomic<bool> g_fatalConnectError{false};
+/// Triggers an immediate heartbeat probe on wake to detect dead pre-sleep TCP sockets immediately.
+std::atomic<bool> g_forceImmediateHeartbeat{false};
+/// Synchronizes interruptible exponential-backoff waits in autoReconnectThread.
+std::mutex g_reconnectCvMutex;
+std::condition_variable g_reconnectCv;
 
 /// Tracks WinSock reference ownership independently for discovery and client sessions.
 static std::atomic<bool> g_discoveryWsaInitialized{false};
@@ -227,6 +244,17 @@ bool SendToServer(MessageType type, const void *payload, size_t payloadSize) {
       targetSock = clientUdpSocket;
       targetMutex = &clientUdpSendMutex;
     } else {
+      if (type == MessageType::EVENT_AUDIO_DATA) {
+        uint64_t nowMs = GetTickCount64();
+        uint64_t startMs = g_udpHandshakeStartMs.load(std::memory_order_relaxed);
+        uint64_t elapsedMs = (nowMs >= startMs) ? (nowMs - startMs) : 0;
+        if (ShouldDeferTcpAudioFallback(false, clientUdpSocket != INVALID_SOCKET,
+                                        elapsedMs)) {
+          // Allow the post-auth UDP handshake brief RTT to complete before falling
+          // back to TCP, preventing stale TCP audio from stacking onto UDP.
+          return true;
+        }
+      }
       if (!g_hasLoggedTcpFallback.exchange(true, std::memory_order_relaxed) &&
           State::globalDebugMode) {
         UI::LogDebug("[Network Client] UDP not active. Falling back to TCP for "
@@ -594,9 +622,14 @@ static void EvaluateClientEdgeReturn(const MousePayload &p,
     if (MonitorFromPoint(testPt, MONITOR_DEFAULTTONULL) == NULL) {
       pullBackAccumulator += (exitEdge <= 1) ? abs(p.deltaX) : abs(p.deltaY);
       if (pullBackAccumulator > pullBackThreshold) {
-        ReturnControlPayload retPayload = {exitEdge, normX, normY};
-        SendToServer(MessageType::EVENT_RETURN_CONTROL, &retPayload,
-                     sizeof(retPayload));
+        uint64_t nowMs = GetTickCount64();
+        uint64_t lastMs = g_lastReturnControlTickMs.load(std::memory_order_relaxed);
+        if (CanSendReturnControl(nowMs, lastMs)) {
+          g_lastReturnControlTickMs.store(nowMs, std::memory_order_relaxed);
+          ReturnControlPayload retPayload = {exitEdge, normX, normY};
+          SendToServer(MessageType::EVENT_RETURN_CONTROL, &retPayload,
+                       sizeof(retPayload));
+        }
         pullBackAccumulator = 0;
       }
       return;
@@ -899,6 +932,33 @@ void ClientUDPListenerLoop() {
 }
 
 /**
+ * @brief Sends an encrypted UDP hole-punching handshake packet bound to the current TCP session token.
+ * @return true if the UDP handshake packet was dispatched, false if UDP is unavailable or already active.
+ */
+static bool SendUdpHandshake() {
+  if (!isClientRunning || isUdpActive.load(std::memory_order_relaxed) ||
+      clientUdpSocket == INVALID_SOCKET) {
+    return false;
+  }
+  uint64_t token = g_clientSessionToken.load(std::memory_order_relaxed);
+  if (token == 0) {
+    return false;
+  }
+  char hostname[MAX_COMPUTERNAME_LENGTH + 1] = "KAM-Flow-Client";
+  DWORD size = sizeof(hostname);
+  if (!GetComputerNameA(hostname, &size)) {
+    strncpy_s(hostname, sizeof(hostname), "KAM-Flow-Client", _TRUNCATE);
+  }
+  UDPHandshakePayload udpHandshake;
+  memset(&udpHandshake, 0, sizeof(udpHandshake));
+  udpHandshake.sessionToken = token;
+  strncpy_s(udpHandshake.clientName, sizeof(udpHandshake.clientName),
+            hostname, _TRUNCATE);
+  return SendToServer(MessageType::EVENT_UDP_HANDSHAKE, &udpHandshake,
+                      sizeof(udpHandshake));
+}
+
+/**
  * @brief Background loop for the Client that continually blocks on recv()
  * parsing incoming network packets.
  * @return void
@@ -907,6 +967,7 @@ void ClientLoop() {
   int pullBackAccumulator = 0;
   const int PULL_BACK_THRESHOLD = 150;
   uint32_t rxSequence = 0;
+  bool sentPostAuthUdpHandshake = false;
 
   thread_local std::vector<uint8_t> tls_rawPayload;
   thread_local std::vector<uint8_t> tls_decrypted;
@@ -1028,15 +1089,28 @@ void ClientLoop() {
 
     // Filter high-frequency and routine events BEFORE the generic log
     // to prevent flooding the debug window with heartbeat/input/audio noise.
-    if (h.type == MessageType::EVENT_HEARTBEAT) {
-      continue;
-    } else if (h.type == MessageType::EVENT_UDP_HANDSHAKE_ACK) {
+    if (h.type == MessageType::EVENT_UDP_HANDSHAKE_ACK) {
       isUdpActive.store(true, std::memory_order_relaxed);
       g_sessionUsedUdp.store(true, std::memory_order_relaxed);
       g_hasLoggedTcpFallback.store(false, std::memory_order_relaxed);
       if (State::globalDebugMode)
         UI::LogDebug(
             "[Network Client] UDP Connection fully established with Server.");
+      continue;
+    }
+
+    // Fire the initial UDP handshake only after receiving the Server's first
+    // authenticated packet (e.g. EVENT_AUDIO_FORMAT), guaranteeing the Server
+    // has already registered our session token in activeClients.
+    if (isEncrypted && !sentPostAuthUdpHandshake &&
+        !isUdpActive.load(std::memory_order_relaxed) &&
+        clientUdpSocket != INVALID_SOCKET) {
+      sentPostAuthUdpHandshake = true;
+      g_udpHandshakeStartMs.store(GetTickCount64(), std::memory_order_relaxed);
+      SendUdpHandshake();
+    }
+
+    if (h.type == MessageType::EVENT_HEARTBEAT) {
       continue;
     }
 
@@ -1106,6 +1180,7 @@ void ClientLoop() {
           SetCursorPos(tx, ty);
         }
         pullBackAccumulator = 0;
+        g_lastReturnControlTickMs.store(0, std::memory_order_relaxed);
       }
     } else if (h.type == MessageType::EVENT_STATE) {
       if (finalSize == sizeof(StatePayload)) {
@@ -1195,6 +1270,10 @@ void ClientLoop() {
     }
   }
   isClientRunning = false;
+  {
+    std::lock_guard<std::mutex> cvLock(g_heartbeatCvMutex);
+  }
+  g_heartbeatCv.notify_all();
   ReleaseStuckModifiers(); // Catch all hard disconnects or timeouts
   if (State::globalDebugMode)
     UI::LogDebug("[Network Client] Listener Thread exiting.");
@@ -1223,32 +1302,29 @@ void ClientLoop() {
 
   if (!isIntentionalDisconnect && !g_authRejected.load(std::memory_order_relaxed) &&
       State::enableClientAutoReconnect && !isAutoReconnecting) {
-    // Reset backoff if the connection was stable for >30 seconds
-    if (sessionDuration > 30000) {
-      reconnectBackoffSeconds = 5;
-    }
+    const bool resumed = g_systemJustResumed.exchange(false, std::memory_order_acq_rel);
+    const int nextBackoff = ReconnectPolicy::NextDelayAfterDisconnect(
+        reconnectBackoffSeconds.load(std::memory_order_relaxed),
+        isCurrentSessionAutoReconnected.load(std::memory_order_relaxed),
+        sessionDuration,
+        resumed);
+    reconnectBackoffSeconds.store(nextBackoff, std::memory_order_relaxed);
 
-    if (isCurrentSessionAutoReconnected && sessionDuration < 10000) {
-      // Increase backoff on rapid failures: 5 -> 10 -> 20 -> 30 (cap)
-      reconnectBackoffSeconds = (std::min)(reconnectBackoffSeconds * 2, 30);
-      State::SetClientStatus("Auto-reconnect failed. Retrying in " +
-                             std::to_string(reconnectBackoffSeconds) + "s...");
+    if (!resumed && isCurrentSessionAutoReconnected &&
+        sessionDuration < ReconnectPolicy::kShortSessionMs) {
       if (State::globalDebugMode)
         UI::LogDebug("[Network Client] Short-lived session (%llums). "
                      "Increasing backoff to %ds.",
-                     (unsigned long long)sessionDuration,
-                     reconnectBackoffSeconds);
-    } else {
-      reconnectBackoffSeconds =
-          5; // First failure after a stable connection starts at 5s
+                     (unsigned long long)sessionDuration, nextBackoff);
     }
 
-    isAutoReconnecting = true;
+    isAutoReconnecting.store(true, std::memory_order_release);
     State::SetClientStatus("Connection dropped. Auto-reconnecting in " +
-                           std::to_string(reconnectBackoffSeconds) + "s...");
+                           std::to_string(nextBackoff) + "s...");
     if (State::globalDebugMode)
       UI::LogDebug("[Network Client] Connection dropped unintentionally. "
-                   "Preparing to auto-reconnect...");
+                   "Preparing to auto-reconnect in %ds...",
+                   nextBackoff);
 
     // Stop audio capture/mic receiver before reconnecting to prevent stale
     // threads from accumulating across reconnect cycles.
@@ -1261,28 +1337,73 @@ void ClientLoop() {
 
     std::string capturedIp = lastConnectedIp;
     uint16_t capturedPort = lastConnectedPort;
-    int capturedBackoff = reconnectBackoffSeconds;
+    int initialDelaySec = nextBackoff;
     autoReconnectThread = std::thread([capturedIp, capturedPort,
-                                       capturedBackoff]() {
-      int totalSlices = capturedBackoff * 10;
-      for (int i = 0; i < totalSlices && !isIntentionalDisconnect &&
-                      State::enableClientAutoReconnect;
-           ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      }
-      if (!isIntentionalDisconnect && State::enableClientAutoReconnect) {
-        if (State::globalDebugMode)
-          UI::LogDebug("[Network Client] Attempting auto-reconnect to %s:%u...",
-                       capturedIp.c_str(), capturedPort);
-        if (!StartClient(capturedIp, capturedPort, true)) {
-          State::SetClientStatus("Auto-reconnect failed. Server unreachable.");
-          if (State::globalDebugMode) {
-            UI::LogDebug("[Network Client] Auto-reconnect failed for %s:%u; stopping retries.",
-                         capturedIp.c_str(), capturedPort);
+                                       initialDelaySec]() {
+      int delaySec = initialDelaySec;
+      while (!isIntentionalDisconnect.load(std::memory_order_acquire) &&
+             !g_authRejected.load(std::memory_order_relaxed) &&
+             State::enableClientAutoReconnect.load(std::memory_order_relaxed)) {
+        auto wakeAt = std::chrono::steady_clock::now() + std::chrono::seconds(delaySec);
+        {
+          std::unique_lock<std::mutex> rkLock(g_reconnectCvMutex);
+          g_reconnectCv.wait_until(rkLock, wakeAt, []() {
+            return isIntentionalDisconnect.load(std::memory_order_acquire) ||
+                   g_authRejected.load(std::memory_order_relaxed) ||
+                   !State::enableClientAutoReconnect.load(std::memory_order_relaxed) ||
+                   g_systemJustResumed.load(std::memory_order_acquire);
+          });
+        }
+
+        if (isIntentionalDisconnect.load(std::memory_order_acquire) ||
+            g_authRejected.load(std::memory_order_relaxed) ||
+            !State::enableClientAutoReconnect.load(std::memory_order_relaxed)) {
+          break;
+        }
+
+        if (g_systemJustResumed.exchange(false, std::memory_order_acq_rel)) {
+          delaySec = ReconnectPolicy::kWakeDelaySec;
+          auto wakeRetryAt = std::chrono::steady_clock::now() + std::chrono::seconds(delaySec);
+          std::unique_lock<std::mutex> rkLock(g_reconnectCvMutex);
+          g_reconnectCv.wait_until(rkLock, wakeRetryAt, []() {
+            return isIntentionalDisconnect.load(std::memory_order_acquire) ||
+                   g_authRejected.load(std::memory_order_relaxed) ||
+                   !State::enableClientAutoReconnect.load(std::memory_order_relaxed);
+          });
+          if (isIntentionalDisconnect.load(std::memory_order_acquire) ||
+              g_authRejected.load(std::memory_order_relaxed) ||
+              !State::enableClientAutoReconnect.load(std::memory_order_relaxed)) {
+            break;
           }
         }
+
+        if (State::globalDebugMode) {
+          UI::LogDebug("[Network Client] Attempting auto-reconnect to %s:%u...",
+                       capturedIp.c_str(), capturedPort);
+        }
+        if (StartClient(capturedIp, capturedPort, true)) {
+          // StartClient clears isAutoReconnecting before spawning the new ClientLoop.
+          return;
+        }
+
+        if (g_fatalConnectError.load(std::memory_order_acquire) ||
+            isIntentionalDisconnect.load(std::memory_order_acquire) ||
+            g_authRejected.load(std::memory_order_relaxed) ||
+            !State::enableClientAutoReconnect.load(std::memory_order_relaxed)) {
+          break;
+        }
+
+        delaySec = ReconnectPolicy::NextDelayAfterConnectFailure(
+            delaySec, g_systemJustResumed.exchange(false, std::memory_order_acq_rel));
+        reconnectBackoffSeconds.store(delaySec, std::memory_order_relaxed);
+        State::SetClientStatus("Server unreachable. Retrying in " +
+                               std::to_string(delaySec) + "s...");
+        if (State::globalDebugMode) {
+          UI::LogDebug("[Network Client] Auto-reconnect failed for %s:%u; retrying in %ds.",
+                       capturedIp.c_str(), capturedPort, delaySec);
+        }
       }
-      isAutoReconnecting = false;
+      isAutoReconnecting.store(false, std::memory_order_release);
     });
   }
 }
@@ -1295,12 +1416,20 @@ void ClientLoop() {
  * @return true if connected successfully, false otherwise.
  */
 bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
+  g_fatalConnectError.store(false, std::memory_order_relaxed);
   if (!isAutoReconnect) {
     isIntentionalDisconnect = true;
+    {
+      std::lock_guard<std::mutex> rkLock(g_reconnectCvMutex);
+    }
+    g_reconnectCv.notify_all();
     if (autoReconnectThread.joinable()) {
       autoReconnectThread.join();
     }
     isAutoReconnecting = false;
+    isIntentionalDisconnect = false;
+  } else if (isIntentionalDisconnect.load(std::memory_order_acquire)) {
+    return false;
   }
 
   if (isClientRunning)
@@ -1308,7 +1437,6 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
   g_hasServerAudioFormat =
       false; // Reset audio format state for the new connection.
 
-  isIntentionalDisconnect = false;
   g_authRejected.store(false, std::memory_order_relaxed);
   lastConnectedIp = ip;
   lastConnectedPort = port;
@@ -1323,6 +1451,8 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
   udpRxReplayMask = 0;
   isUdpActive.store(false, std::memory_order_relaxed);
   g_hasLoggedTcpFallback.store(false, std::memory_order_relaxed);
+  g_udpHandshakeStartMs.store(GetTickCount64(), std::memory_order_relaxed);
+  g_lastReturnControlTickMs.store(0, std::memory_order_relaxed);
 
   if (clientThread.joinable()) {
     if (State::globalDebugMode)
@@ -1366,6 +1496,7 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
   std::string targetPin;
   std::string targetName = "KAMFlow_Server_" + ip;
   if (!CredentialManager::LoadSecret(targetName, targetPin)) {
+    g_fatalConnectError.store(true, std::memory_order_release);
     State::SetClientStatus("Authentication Failed (No PIN).");
     if (State::globalDebugMode)
       UI::LogDebug("[Security] No paired PIN found for %s. Please pair via UI.",
@@ -1380,6 +1511,7 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
   // fail.
   Security::Shutdown();
   if (!Security::Initialize(targetPin.c_str())) {
+    g_fatalConnectError.store(true, std::memory_order_release);
     State::SetClientStatus("Security Initialization Failed.");
     if (State::globalDebugMode)
       UI::LogDebug(
@@ -1392,6 +1524,7 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
     int wsaErr = WSAStartup(MAKEWORD(2, 2), &wsa);
     if (wsaErr != 0) {
       g_clientWsaInitialized.store(false);
+      g_fatalConnectError.store(true, std::memory_order_release);
       State::SetClientStatus("Connection Failed (WinSock Error).");
       if (State::globalDebugMode) {
         UI::LogDebug("[Network Client] ERROR: WSAStartup failed (%d).", wsaErr);
@@ -1422,6 +1555,12 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
     closesocket(clientSocket);
     // Reset the handle so the stale-socket cleanup at the top of the next
     // StartClient() call cannot close a recycled descriptor owned by another socket.
+    clientSocket = INVALID_SOCKET;
+    return false;
+  }
+
+  if (isAutoReconnect && isIntentionalDisconnect.load(std::memory_order_acquire)) {
+    closesocket(clientSocket);
     clientSocket = INVALID_SOCKET;
     return false;
   }
@@ -1556,18 +1695,14 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
       if (hMmcss)
         AvRevertMmThreadCharacteristics(hMmcss);
     });
-
-    // Send Hole-punching payload to Server
-    UDPHandshakePayload udpHandshake;
-    memset(&udpHandshake, 0, sizeof(udpHandshake));
-    udpHandshake.sessionToken = sessionToken;
-    strncpy_s(udpHandshake.clientName, sizeof(udpHandshake.clientName),
-              hostname, _TRUNCATE);
-    SendToServer(MessageType::EVENT_UDP_HANDSHAKE, &udpHandshake,
-                 sizeof(udpHandshake));
   }
 
   State::SetClientStatus("Connected");
+
+  if (isAutoReconnect) {
+    // Clear before spawning ClientLoop so an instant early disconnect can re-arm auto-reconnect.
+    isAutoReconnecting.store(false, std::memory_order_release);
+  }
 
   clientThread = std::thread([]() {
     // Elevate thread priority to prevent starvation from the OS scheduler
@@ -1579,39 +1714,62 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
     ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     bool wasLocked = false;
     int heartbeatCycles = 0;
-    int udpWaitCycles = 0;
+    uint32_t udpRetryAttempt = 0;
     UdpReplayStats prevStats = {};
+
+    const auto sessionStart = std::chrono::steady_clock::now();
+    auto lastLoopTick = sessionStart;
+    auto nextHeartbeat = sessionStart + std::chrono::milliseconds(2000);
+    auto nextUdpRetry = sessionStart + std::chrono::milliseconds(ComputeUdpHandshakeRetryDelayMs(0));
+
     while (isClientRunning) {
-      for (int i = 0; i < 20 && isClientRunning; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      bool udpActiveNow = isUdpActive.load(std::memory_order_relaxed);
+      bool hasUdpSocket = (clientUdpSocket != INVALID_SOCKET);
+      auto wakeTarget = (!udpActiveNow && hasUdpSocket)
+                            ? (std::min)(nextHeartbeat, nextUdpRetry)
+                            : nextHeartbeat;
+
+      {
+        std::unique_lock<std::mutex> cvLock(g_heartbeatCvMutex);
+        g_heartbeatCv.wait_until(cvLock, wakeTarget, []() {
+          return !isClientRunning.load(std::memory_order_relaxed) ||
+                 g_forceImmediateHeartbeat.load(std::memory_order_acquire);
+        });
       }
       if (!isClientRunning) break;
 
-      SendHeartbeatToSocket(clientSocket, clientSendMutex);
+      auto now = std::chrono::steady_clock::now();
+      // Fallback standby detector if OEM power policy suppresses WM_POWERBROADCAST.
+      if ((now - lastLoopTick) > std::chrono::seconds(3) &&
+          isClientRunning.load(std::memory_order_relaxed)) {
+        g_systemJustResumed.store(true, std::memory_order_release);
+        g_forceImmediateHeartbeat.store(true, std::memory_order_release);
+      }
+      lastLoopTick = now;
 
-      if (!isUdpActive.load(std::memory_order_relaxed) &&
-          clientUdpSocket != INVALID_SOCKET) {
-        ++udpWaitCycles;
-        if (udpWaitCycles >= 5 &&
+      udpActiveNow = isUdpActive.load(std::memory_order_relaxed);
+      hasUdpSocket = (clientUdpSocket != INVALID_SOCKET);
+
+      if (udpActiveNow) {
+        udpRetryAttempt = 0;
+      } else if (hasUdpSocket && now >= nextUdpRetry) {
+        if ((now - sessionStart) >= std::chrono::seconds(10) &&
             !g_loggedUdpTimeout.exchange(true, std::memory_order_relaxed) &&
             State::globalDebugMode) {
           UI::LogDebug("[Network Client] WARNING: UDP handshake unacknowledged after 10s (firewall/NAT?); running in TCP fallback mode.");
         }
-        char hName[MAX_COMPUTERNAME_LENGTH + 1];
-        DWORD sSize = sizeof(hName);
-        if (GetComputerNameA(hName, &sSize)) {
-          UDPHandshakePayload udpHandshake;
-          memset(&udpHandshake, 0, sizeof(udpHandshake));
-          udpHandshake.sessionToken =
-              g_clientSessionToken.load(std::memory_order_relaxed);
-          strncpy_s(udpHandshake.clientName, sizeof(udpHandshake.clientName),
-                    hName, _TRUNCATE);
-          SendToServer(MessageType::EVENT_UDP_HANDSHAKE, &udpHandshake,
-                       sizeof(udpHandshake));
-        }
-      } else if (isUdpActive.load(std::memory_order_relaxed)) {
-        udpWaitCycles = 0;
+        SendUdpHandshake();
+        ++udpRetryAttempt;
+        nextUdpRetry = now + std::chrono::milliseconds(ComputeUdpHandshakeRetryDelayMs(udpRetryAttempt));
       }
+
+      const bool forceHb = g_forceImmediateHeartbeat.exchange(false, std::memory_order_acq_rel);
+      if (!forceHb && now < nextHeartbeat) {
+        continue;
+      }
+      nextHeartbeat = now + std::chrono::milliseconds(2000);
+
+      SendHeartbeatToSocket(clientSocket, clientSendMutex);
 
       // Secure desktop and UAC prompt failsafe.
       bool isLocked = false;
@@ -1684,7 +1842,17 @@ bool StartClient(const std::string &ip, uint16_t port, bool isAutoReconnect) {
  * @return void
  */
 void NotifySystemResumed() {
-  reconnectBackoffSeconds = 1;
+  g_systemJustResumed.store(true, std::memory_order_release);
+  reconnectBackoffSeconds.store(ReconnectPolicy::kWakeDelaySec, std::memory_order_relaxed);
+  g_forceImmediateHeartbeat.store(true, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> rkLock(g_reconnectCvMutex);
+  }
+  g_reconnectCv.notify_all();
+  {
+    std::lock_guard<std::mutex> hbLock(g_heartbeatCvMutex);
+  }
+  g_heartbeatCv.notify_all();
   if (State::globalDebugMode)
     UI::LogDebug("[Network Client] System resumed from sleep. Reconnect backoff "
                  "reset to 1s for instant recovery.");
@@ -1698,12 +1866,34 @@ void StopClient() {
   isIntentionalDisconnect = true;
   State::SetClientStatus("Idle");
   isClientRunning = false;
+  {
+    std::lock_guard<std::mutex> rkLock(g_reconnectCvMutex);
+  }
+  g_reconnectCv.notify_all();
+  {
+    std::lock_guard<std::mutex> cvLock(g_heartbeatCvMutex);
+  }
+  g_heartbeatCv.notify_all();
   isUdpActive.store(false, std::memory_order_relaxed);
   // Ensure audio capture streams are always stopped on disconnect.
   Audio::StopLoopbackCapture();
   Audio::StopMicReceiver();
 
   // Signal graceful abort on the TCP socket to unblock recv() in ClientLoop
+  if (clientSocket != INVALID_SOCKET) {
+    shutdown(clientSocket, SD_BOTH);
+  }
+
+  // Join autoReconnectThread first so no concurrent StartClient() call can race
+  // against joining/closing sockets below.
+  if (autoReconnectThread.joinable())
+    autoReconnectThread.join();
+
+  isClientRunning = false;
+  {
+    std::lock_guard<std::mutex> cvLock(g_heartbeatCvMutex);
+  }
+  g_heartbeatCv.notify_all();
   if (clientSocket != INVALID_SOCKET) {
     shutdown(clientSocket, SD_BOTH);
   }
@@ -1716,8 +1906,6 @@ void StopClient() {
     clientUdpListenerThread.join();
   if (clientHeartbeatThread.joinable())
     clientHeartbeatThread.join();
-  if (autoReconnectThread.joinable())
-    autoReconnectThread.join();
 
   // Clean up socket descriptors now that all network threads have safely exited
   if (clientSocket != INVALID_SOCKET) {

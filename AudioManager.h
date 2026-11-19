@@ -116,6 +116,9 @@ namespace Audio {
     /// Called by the network layer to purge a disconnected or disabled client's audio buffer.
     void ClearClientAudioQueue(uintptr_t clientIdentifier);
 
+    /// Resets a client's audio jitter buffer state on transport switchover while preserving enable/volume atomics.
+    void ResetClientAudioQueue(uintptr_t clientIdentifier);
+
     /// Notifies the audio subsystem that the system resumed from sleep or hibernate.
     void NotifySystemResumed();
 }

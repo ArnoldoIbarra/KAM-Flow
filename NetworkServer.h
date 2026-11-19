@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -25,6 +26,12 @@
 /// Namespace managing network server operations and incoming client connections.
 namespace Network {
     
+    /// Lock-free per-client transport flags shared across TCP and UDP threads without locking clientsMutex.
+    struct ClientTransportState {
+        std::atomic<bool> udpActive{false};   ///< True once UDP handshake succeeds for this session.
+        std::atomic<bool> sawTcpAudio{false}; ///< True if TCP audio fallback frames were queued before UDP.
+    };
+
     /// Structure containing information about an actively connected client.
     struct ConnectedClientInfo {
         SOCKET socket;           ///< The TCP socket handle.
@@ -45,6 +52,7 @@ namespace Network {
         uint32_t tcpStallCount = 0;         ///< Count of TCP writes to this client exceeding 200ms.
         uint32_t consecutiveHbSkips = 0;    ///< Consecutive heartbeat try_lock skips due to TCP send saturation.
         uint64_t connectTickMs = 0;         ///< GetTickCount64() timestamp when this client authenticated.
+        std::shared_ptr<ClientTransportState> transportState; ///< Lock-free transport flags shared with ClientListenerLoop.
     };
 
     /// Initializes WinSock2 and starts the background listening thread.

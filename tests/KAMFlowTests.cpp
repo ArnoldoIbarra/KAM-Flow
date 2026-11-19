@@ -471,6 +471,99 @@ namespace {
         return true;
     }
 
+    // --- MILESTONE 1 TESTS (v3.5.5: UDP STARTUP & AUDIO SWITCHOVER) ---
+
+    KAM_TEST(UdpHandshake_RetryScheduleRampsToHeartbeat) {
+        EXPECT_EQ(Network::ComputeUdpHandshakeRetryDelayMs(0), static_cast<uint32_t>(150));
+        EXPECT_EQ(Network::ComputeUdpHandshakeRetryDelayMs(1), static_cast<uint32_t>(200));
+        EXPECT_EQ(Network::ComputeUdpHandshakeRetryDelayMs(2), static_cast<uint32_t>(350));
+        EXPECT_EQ(Network::ComputeUdpHandshakeRetryDelayMs(3), static_cast<uint32_t>(600));
+        EXPECT_EQ(Network::ComputeUdpHandshakeRetryDelayMs(4), static_cast<uint32_t>(2000));
+        EXPECT_EQ(Network::ComputeUdpHandshakeRetryDelayMs(5), static_cast<uint32_t>(2000));
+        EXPECT_EQ(Network::ComputeUdpHandshakeRetryDelayMs(6), static_cast<uint32_t>(2000));
+        return true;
+    }
+
+    KAM_TEST(UdpHandshake_DeferTcpAudioFallbackOnlyDuringGraceWindow) {
+        EXPECT_TRUE(Network::ShouldDeferTcpAudioFallback(false, true, 0));
+        EXPECT_TRUE(Network::ShouldDeferTcpAudioFallback(false, true, 499));
+        EXPECT_TRUE(!Network::ShouldDeferTcpAudioFallback(false, true, 500));
+        EXPECT_TRUE(!Network::ShouldDeferTcpAudioFallback(false, true, 1000));
+        EXPECT_TRUE(!Network::ShouldDeferTcpAudioFallback(true, true, 0));
+        EXPECT_TRUE(!Network::ShouldDeferTcpAudioFallback(false, false, 0));
+        return true;
+    }
+
+    KAM_TEST(ServerAudio_DropsTcpAudioOnceUdpActive) {
+        EXPECT_TRUE(Network::ShouldAcceptTcpAudioPacket(false));
+        EXPECT_TRUE(!Network::ShouldAcceptTcpAudioPacket(true));
+        return true;
+    }
+
+    // --- MILESTONE 2 TESTS (v3.5.5: RECONNECT POLICY & PRE-AUTH TIMEOUT) ---
+
+    KAM_TEST(ReconnectPolicy_WakeOverridesBackoffToOneSecond) {
+        using RP = Network::ReconnectPolicy;
+        // Stable session + wake -> 1s
+        EXPECT_EQ(RP::NextDelayAfterDisconnect(20, true, 120000, true), 1);
+        // Short-lived auto-reconnect session + wake -> 1s
+        EXPECT_EQ(RP::NextDelayAfterDisconnect(10, true, 2700, true), 1);
+        // Connect failure + wake -> 1s
+        EXPECT_EQ(RP::NextDelayAfterConnectFailure(20, true), 1);
+        return true;
+    }
+
+    KAM_TEST(ReconnectPolicy_EscalationAndCap) {
+        using RP = Network::ReconnectPolicy;
+        // Escalation across repeated short-lived disconnects: 1 -> 5 -> 10 -> 20 -> 30 -> 30
+        int d = RP::NextDelayAfterDisconnect(1, true, 2700, false);
+        EXPECT_EQ(d, 5);
+        d = RP::NextDelayAfterDisconnect(d, true, 2700, false);
+        EXPECT_EQ(d, 10);
+        d = RP::NextDelayAfterDisconnect(d, true, 2700, false);
+        EXPECT_EQ(d, 20);
+        d = RP::NextDelayAfterDisconnect(d, true, 2700, false);
+        EXPECT_EQ(d, 30);
+        d = RP::NextDelayAfterDisconnect(d, true, 2700, false);
+        EXPECT_EQ(d, 30);
+
+        // Escalation across repeated connect failures: 1 -> 5 -> 10 -> 20 -> 30 -> 30
+        int c = RP::NextDelayAfterConnectFailure(1, false);
+        EXPECT_EQ(c, 5);
+        c = RP::NextDelayAfterConnectFailure(c, false);
+        EXPECT_EQ(c, 10);
+        c = RP::NextDelayAfterConnectFailure(c, false);
+        EXPECT_EQ(c, 20);
+        c = RP::NextDelayAfterConnectFailure(c, false);
+        EXPECT_EQ(c, 30);
+        c = RP::NextDelayAfterConnectFailure(c, false);
+        EXPECT_EQ(c, 30);
+
+        // Stable session (>30s) resets backoff to initial 5s
+        EXPECT_EQ(RP::NextDelayAfterDisconnect(30, true, 30001, false), 5);
+        // Manual (non-auto) short session starts at 5s
+        EXPECT_EQ(RP::NextDelayAfterDisconnect(30, false, 1500, false), 5);
+        return true;
+    }
+
+    KAM_TEST(NetworkMessages_PreAuthTimeoutAccommodatesWifiRetransmit) {
+        EXPECT_EQ(Network::PRE_AUTH_RECV_TIMEOUT_MS, static_cast<uint32_t>(5000));
+        return true;
+    }
+
+    // --- MILESTONE 3 TESTS (v3.5.5: EDGE-RETURN DEBOUNCE) ---
+
+    KAM_TEST(EdgeReturnDebounce_SuppressesBurstAndAllowsReset) {
+        constexpr uint64_t t0 = 10000;
+        EXPECT_TRUE(Network::CanSendReturnControl(t0, 0));
+        EXPECT_TRUE(!Network::CanSendReturnControl(t0 + 27, t0));
+        EXPECT_TRUE(!Network::CanSendReturnControl(t0 + 199, t0));
+        EXPECT_TRUE(Network::CanSendReturnControl(t0 + 200, t0));
+        // Resetting lastSentMs on EVENT_SYNC_CURSOR immediately re-arms edge return.
+        EXPECT_TRUE(Network::CanSendReturnControl(t0 + 10, 0));
+        return true;
+    }
+
 } // namespace
 
 /**

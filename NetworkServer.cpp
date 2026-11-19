@@ -481,10 +481,12 @@ static bool SendExact(SOCKET sock, const void *buffer, size_t length) {
  * @param initialRxSequence The initial TCP sequence number received during authentication.
  * @param clientName Authenticated client hostname for diagnostics.
  * @param clientIp Authenticated client IPv4 address for diagnostics.
+ * @param transportState Lock-free per-session transport flags shared with UDPListenerLoop.
  * @return void
  */
 void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence,
-                        std::string clientName, std::string clientIp) {
+                        std::string clientName, std::string clientIp,
+                        std::shared_ptr<ClientTransportState> transportState) {
   uint32_t rxSequence = initialRxSequence;
   static DebugLog::RateLimitState tcpReplayRate;
   static DebugLog::RateLimitState tcpDecryptRate;
@@ -585,8 +587,17 @@ void ClientListenerLoop(SOCKET clientSocket, uint32_t initialRxSequence,
     }
 
     if (header.type == MessageType::EVENT_AUDIO_DATA) {
-      // Pass the raw PCM data to the audio manager for mixing and playback.
-      Audio::HandleAudioData(clientSocket, finalPayload, finalSize);
+      // Discard late in-flight TCP audio packets once UDP is active so stale TCP backlog
+      // cannot interleave or stack onto live UDP audio frames.
+      const bool udpActive =
+          transportState && transportState->udpActive.load(std::memory_order_acquire);
+      if (ShouldAcceptTcpAudioPacket(udpActive)) {
+        if (transportState) {
+          transportState->sawTcpAudio.store(true, std::memory_order_relaxed);
+        }
+        // Pass the raw PCM data to the audio manager for mixing and playback.
+        Audio::HandleAudioData(clientSocket, finalPayload, finalSize);
+      }
     } else if (header.type == MessageType::EVENT_CLIPBOARD) {
       if (finalSize > 0 && State::enableClipboardSync) {
         bool clientClipboardAllowed = false;
@@ -806,7 +817,8 @@ void AcceptClientsLoop() {
         accept(serverSocket, (sockaddr *)&clientAddr, &clientAddrSize);
 
     if (clientSocket != INVALID_SOCKET) {
-      DWORD timeout = 2000;
+      // Allow 5s for encrypted AUTH to absorb post-wake Wi-Fi TCP retransmissions.
+      DWORD timeout = PRE_AUTH_RECV_TIMEOUT_MS;
       setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
                  sizeof(timeout));
 
@@ -963,6 +975,7 @@ void AcceptClientsLoop() {
 
               // Register the authenticated session in activeClients BEFORE Slow/Blocking WASAPI
               // format queries so the Client's immediate UDP handshake packet always matches.
+              auto transportState = std::make_shared<ClientTransportState>();
               {
                 std::lock_guard<std::mutex> lock(clientsMutex);
                 bool occupied =
@@ -1022,6 +1035,7 @@ void AcceptClientsLoop() {
                                          ipStr, safeName, 1.0f, true, true,
                                          targetX, targetY, 0, 0, auth.sessionToken});
                 activeClients.back().connectTickMs = GetTickCount64();
+                activeClients.back().transportState = transportState;
                 g_hasClients.store(true, std::memory_order_relaxed);
                 clientSendMutexes[clientSocket] =
                     std::make_shared<std::mutex>();
@@ -1058,10 +1072,12 @@ void AcceptClientsLoop() {
               auto threadInfo = std::make_shared<ClientThreadInfo>();
               threadInfo->thread = std::thread(
                   [clientSocket, seq = header.sequenceNumber, threadInfo,
-                   nameStr = std::string(safeName), ipCopy = std::string(ipStr)]() {
+                   nameStr = std::string(safeName), ipCopy = std::string(ipStr),
+                   transportState]() {
                     ::SetThreadPriority(::GetCurrentThread(),
                                         THREAD_PRIORITY_TIME_CRITICAL);
-                    ClientListenerLoop(clientSocket, seq, nameStr, ipCopy);
+                    ClientListenerLoop(clientSocket, seq, nameStr, ipCopy,
+                                       transportState);
                     threadInfo->isFinished = true;
                   });
 
@@ -1156,6 +1172,8 @@ void UDPListenerLoop() {
         inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIpStr, INET_ADDRSTRLEN);
 
         SOCKET ackSocket = INVALID_SOCKET;
+        bool wasUdpActive = false;
+        std::shared_ptr<ClientTransportState> matchedTransport;
         {
           std::lock_guard<std::mutex> lock(clientsMutex);
           for (auto &c : activeClients) {
@@ -1169,8 +1187,13 @@ void UDPListenerLoop() {
                                          c.udpReplayMask, &c.udpStats)) {
                 break;
               }
+              wasUdpActive = c.hasUdp;
+              matchedTransport = c.transportState;
               c.udpAddr = senderAddr;
               c.hasUdp = true;
+              if (matchedTransport) {
+                matchedTransport->udpActive.store(true, std::memory_order_release);
+              }
               ackSocket = c.socket;
               if (State::globalDebugMode)
                 UI::LogDebug("[Network Server] UDP Stream Handshake matched "
@@ -1179,9 +1202,14 @@ void UDPListenerLoop() {
               break;
             }
           }
-        } // Release mutex before calling SendToClient
+        } // Release mutex before calling ResetClientAudioQueue / SendToClient
 
         if (ackSocket != INVALID_SOCKET) {
+          // Flush any pre-UDP TCP fallback audio backlog before switching to live UDP frames.
+          if (!wasUdpActive && matchedTransport &&
+              matchedTransport->sawTcpAudio.exchange(false, std::memory_order_acq_rel)) {
+            Audio::ResetClientAudioQueue(ackSocket);
+          }
           SendToClient(ackSocket, MessageType::EVENT_UDP_HANDSHAKE_ACK, nullptr,
                        0);
         } else if (State::globalDebugMode) {

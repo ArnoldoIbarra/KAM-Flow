@@ -261,6 +261,8 @@ namespace UI {
     #define ID_TRAY_EXIT 2002
     NOTIFYICONDATAA g_nid = {};
     bool g_isMinimizedToTray = false;
+    /// Power notification registration handle for Modern Standby (S0ix) resume delivery.
+    static HPOWERNOTIFY g_hPowerNotify = nullptr;
 
     /**
      * @brief Initializes the System Tray icon structure.
@@ -475,6 +477,15 @@ namespace UI {
                 return 0;
             case WM_POWERBROADCAST:
                 if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+                    // Modern Standby / S3 often delivers PBT_APMRESUMEAUTOMATIC and
+                    // PBT_APMRESUMESUSPEND back-to-back; debounce within 2s so resume runs once.
+                    static uint64_t s_lastResumeTick = 0;
+                    uint64_t nowResumeTick = ::GetTickCount64();
+                    if (s_lastResumeTick != 0 && (nowResumeTick - s_lastResumeTick) < 2000) {
+                        return TRUE;
+                    }
+                    s_lastResumeTick = nowResumeTick;
+
                     if (State::globalDebugMode) UI::LogDebug("[System] Resumed from sleep/hibernate.");
 
                     // Drain all stale mouse events that accumulated while the system was
@@ -641,6 +652,12 @@ namespace UI {
         if (!hwnd) {
             if (State::globalDebugMode) UI::LogDebug("[UI] ERROR: CreateWindow failed (err=%lu).", ::GetLastError());
             return false;
+        }
+
+        // Register for Modern Standby (S0ix) suspend/resume broadcasts delivered via WM_POWERBROADCAST.
+        g_hPowerNotify = ::RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
+        if (!g_hPowerNotify && State::globalDebugMode) {
+            UI::LogDebug("[UI] WARNING: RegisterSuspendResumeNotification failed (err=%lu).", ::GetLastError());
         }
 
         // Register the Global Hotkeys for Emergency Override and Game Mode
@@ -2047,6 +2064,10 @@ namespace UI {
         if (pd3dDeviceContext) { pd3dDeviceContext->Release(); pd3dDeviceContext = nullptr; }
         if (pd3dDevice) { pd3dDevice->Release(); pd3dDevice = nullptr; }
         if (hwnd) { 
+            if (g_hPowerNotify) {
+                ::UnregisterSuspendResumeNotification(g_hPowerNotify);
+                g_hPowerNotify = nullptr;
+            }
             ::UnregisterHotKey(hwnd, 1);
             ::UnregisterHotKey(hwnd, 2);
             ::DestroyWindow(hwnd); 

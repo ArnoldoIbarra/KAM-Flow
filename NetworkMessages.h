@@ -318,4 +318,83 @@ namespace Network {
     inline bool VerifyUdpReplayWindow(uint32_t seq, uint32_t& maxSeq, uint64_t& windowMask) {
         return VerifyUdpReplayWindow(seq, maxSeq, windowMask, nullptr);
     }
+
+    /// Grace period (ms) before audio falls back to TCP while initial UDP handshake completes.
+    constexpr uint64_t UDP_HANDSHAKE_AUDIO_GRACE_MS = 500;
+
+    /// Returns the retry delay (ms) before the next client UDP handshake attempt.
+    inline uint32_t ComputeUdpHandshakeRetryDelayMs(uint32_t attemptIndex) {
+        switch (attemptIndex) {
+            case 0: return 150;
+            case 1: return 200;
+            case 2: return 350;
+            case 3: return 600;
+            default: return 2000;
+        }
+    }
+
+    /// Returns true while client loopback audio should wait for UDP handshake instead of flooding TCP.
+    inline bool ShouldDeferTcpAudioFallback(bool isUdpActive, bool hasUdpSocket, uint64_t elapsedSinceHandshakeStartMs) {
+        return !isUdpActive && hasUdpSocket && (elapsedSinceHandshakeStartMs < UDP_HANDSHAKE_AUDIO_GRACE_MS);
+    }
+
+    /// Returns true when the server should accept TCP audio fallback frames for a client.
+    inline bool ShouldAcceptTcpAudioPacket(bool isUdpActive) {
+        return !isUdpActive;
+    }
+
+    /// Pre-authentication TCP recv timeout (ms) accommodating post-wake Wi-Fi retransmits.
+    constexpr uint32_t PRE_AUTH_RECV_TIMEOUT_MS = 5000;
+
+    /// Pure exponential-backoff reconnect timing policy for client sessions.
+    struct ReconnectPolicy {
+        static constexpr int kWakeDelaySec = 1;
+        static constexpr int kInitialDelaySec = 5;
+        static constexpr int kMaxDelaySec = 30;
+        static constexpr uint64_t kStableSessionMs = 30000;
+        static constexpr uint64_t kShortSessionMs = 10000;
+
+        /// Computes the reconnect delay (seconds) after an active session disconnects.
+        static inline int NextDelayAfterDisconnect(int currentBackoffSec,
+                                                   bool wasAutoReconnect,
+                                                   uint64_t sessionDurationMs,
+                                                   bool systemJustResumed) {
+            if (systemJustResumed) {
+                return kWakeDelaySec;
+            }
+            if (sessionDurationMs > kStableSessionMs) {
+                return kInitialDelaySec;
+            }
+            if (wasAutoReconnect && sessionDurationMs < kShortSessionMs) {
+                if (currentBackoffSec < kInitialDelaySec) {
+                    return kInitialDelaySec;
+                }
+                const int doubled = currentBackoffSec * 2;
+                return (doubled < kMaxDelaySec) ? doubled : kMaxDelaySec;
+            }
+            return kInitialDelaySec;
+        }
+
+        /// Computes the next reconnect delay (seconds) after a failed TCP connection attempt.
+        static inline int NextDelayAfterConnectFailure(int currentBackoffSec,
+                                                       bool systemJustResumed) {
+            if (systemJustResumed) {
+                return kWakeDelaySec;
+            }
+            if (currentBackoffSec < kInitialDelaySec) {
+                return kInitialDelaySec;
+            }
+            const int doubled = currentBackoffSec * 2;
+            return (doubled < kMaxDelaySec) ? doubled : kMaxDelaySec;
+        }
+    };
+
+    /// Minimum cooldown (ms) between consecutive client edge-return notifications.
+    constexpr uint64_t RETURN_CONTROL_COOLDOWN_MS = 200;
+
+    /// Returns true if enough time has elapsed since the previous RETURN_CONTROL event.
+    inline bool CanSendReturnControl(uint64_t nowMs, uint64_t lastSentMs,
+                                     uint64_t cooldownMs = RETURN_CONTROL_COOLDOWN_MS) {
+        return (lastSentMs == 0) || (nowMs >= lastSentMs && (nowMs - lastSentMs) >= cooldownMs);
+    }
 }

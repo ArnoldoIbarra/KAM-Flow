@@ -2214,6 +2214,28 @@ namespace Audio {
     }
 
     /**
+     * @brief Resets a client's audio jitter buffer and resampling state without erasing its queue entry.
+     * Preserves lock-free enable and volume atomics across TCP-to-UDP transport switchover so stale
+     * TCP audio backlog never stacks onto newly arriving UDP packets.
+     * @param clientIdentifier The socket handle representing the client.
+     * @return void
+     */
+    void ResetClientAudioQueue(uintptr_t clientIdentifier) {
+        std::shared_ptr<ClientAudioQueue> pQueue;
+        {
+            std::shared_lock<std::shared_mutex> mapLock(g_queuesMutex);
+            auto it = g_clientAudioQueues.find(clientIdentifier);
+            if (it != g_clientAudioQueues.end()) {
+                pQueue = it->second;
+            }
+        }
+        if (pQueue) {
+            std::lock_guard<std::mutex> qLock(pQueue->mtx);
+            pQueue->ResetStreamState();
+        }
+    }
+
+    /**
      * @brief Notifies the audio subsystem that the system resumed from sleep or hibernate.
      * Unblocks the server render loop, purges stale audio/mic buffers, and triggers device re-acquisition.
      * @return void
